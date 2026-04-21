@@ -1,0 +1,20 @@
+[project]
+name = "tg-cli-relay"
+version = "0.1.0"
+description = "Telegram（或其他入口）與本機 CLI 代理（Cursor agent、Codex 等）之間的中繼與 session 對照"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+telegram = ["python-telegram-bot>=21.0"]
+
+[project.scripts]
+tg-cli-relay = "tg_cli_relay.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

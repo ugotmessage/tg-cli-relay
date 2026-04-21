@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram（或其他觸發）與本機 CLI 代理中繼（tg-cli-relay）
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/tg-cli-relay
+EnvironmentFile=-/srv/tg-cli-relay/.env
+# 確保能找到 agent / codex（依實際安裝路徑調整）
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/root/.local/bin:/root/.nvm/versions/node/v22.22.1/bin
+ExecStart=/srv/tg-cli-relay/.venv/bin/python3 -m tg_cli_relay bot
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
