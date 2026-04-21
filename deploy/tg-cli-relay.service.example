@@ -4,6 +4,8 @@ After=network-online.target
 
 [Service]
 Type=simple
+# Cursor OAuth（agent login）憑證綁在登入者的家目錄；User= 必須與當初執行 agent login 的使用者一致
+# User=youruser
 WorkingDirectory=/srv/tg-cli-relay
 # 可擇一：專案根 .env，或 cp deploy/env.group1-cursor.example deploy/env.group1-cursor 後改下列路徑
 EnvironmentFile=-/srv/tg-cli-relay/.env

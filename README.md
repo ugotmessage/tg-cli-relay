@@ -42,7 +42,9 @@ deploy/               systemd 範例（背景常駐）
 - `TGR_CURSOR_AGENT_BIN`：Cursor Agent CLI，預設 `agent`
 - `TGR_CODEX_BIN`：OpenAI **Codex** CLI，預設 `codex`；僅在 `TGR_BACKEND=codex` 時會用到（與 Cursor 無關）
 
-Cursor 認證請使用官方文件建議的方式（例如 `CURSOR_API_KEY`）；Codex 使用 `codex login` 或該工具支援的環境變數／設定檔。
+**Cursor 認證**：常見為在執行 bot 的同一使用者環境下執行過 **`agent login`**（OAuth／瀏覽器登入）；亦可依官方文件使用 **`CURSOR_API_KEY`**（腳本／CI 較常見）。常駐服務請確認 systemd 的 `User=` 與你當初 `agent login` 的是同一帳號與家目錄，否則讀不到已登入狀態。
+
+**Codex 認證**：`codex login` 或該工具支援的設定檔／環境變數。
 
 ## 安裝（可編輯模式）
 
