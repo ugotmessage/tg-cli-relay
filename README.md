@@ -39,8 +39,8 @@ deploy/               systemd 範例（背景常駐）
 
 - `TGR_SESSION_DB`：SQLite 路徑，預設 `./data/sessions.sqlite3`
 - `TGR_DEFAULT_WORKSPACE`：預設工作目錄（git 專案根）
-- `TGR_CURSOR_AGENT_BIN`：預設 `agent`
-- `TGR_CODEX_BIN`：預設 `codex`
+- `TGR_CURSOR_AGENT_BIN`：Cursor Agent CLI，預設 `agent`
+- `TGR_CODEX_BIN`：OpenAI **Codex** CLI，預設 `codex`；僅在 `TGR_BACKEND=codex` 時會用到（與 Cursor 無關）
 
 Cursor 認證請使用官方文件建議的方式（例如 `CURSOR_API_KEY`）；Codex 使用 `codex login` 或該工具支援的環境變數／設定檔。
 
