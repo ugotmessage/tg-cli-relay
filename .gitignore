@@ -1,4 +1,5 @@
 .env
+deploy/env.group1-cursor
 .venv/
 __pycache__/
 *.py[cod]
