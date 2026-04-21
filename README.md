@@ -74,6 +74,15 @@ python3 -m tg_cli_relay bot
 
 參考 `deploy/tg-cli-relay.service.example`：以 systemd 固定 `User`、`WorkingDirectory`、`EnvironmentFile`，並把 `PATH` 指到裝有 `agent` / `codex` 的位置。
 
+若先用簡單腳本管理背景程序（不走 systemd），可用專案根目錄：
+
+```bash
+./start_bot.sh
+./stop_bot.sh
+```
+
+腳本會使用 `run/bot.pid` 記錄程序，日誌寫入 `bot.log`。
+
 ## 免責與安全
 
 - Bot Token、API key、可寫入的工作目錄都屬於高風險權限；務必限制誰能對機器人下指令（例如白名單 `user_id`）。

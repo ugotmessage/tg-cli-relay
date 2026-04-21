@@ -1,6 +1,8 @@
 .env
 deploy/env.group1-cursor
 .venv/
+bot.log
+run/
 __pycache__/
 *.py[cod]
 *.sqlite3

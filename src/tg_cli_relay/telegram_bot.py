@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 from pathlib import Path
@@ -53,6 +55,16 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         await update.effective_chat.send_message("請傳送純文字訊息。")
         return
 
+    # 先顯示 typing，讓使用者知道訊息已收到且正在處理。
+    from telegram.constants import ChatAction
+
+    async def _typing_loop() -> None:
+        while True:
+            await msg.chat.send_action(action=ChatAction.TYPING)
+            await asyncio.sleep(4)
+
+    typing_task = asyncio.create_task(_typing_loop())
+
     chat = update.effective_chat
     thread_id = msg.message_thread_id
     key = telegram_thread_key(chat_type=str(chat.type), ids=TelegramIds(chat.id, thread_id))
@@ -60,7 +72,10 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
     store = SessionStore(store_path)
     try:
-        res = relay_turn(
+        # relay_turn 內部會跑 subprocess，改放到 thread 避免阻塞 event loop，
+        # 才能持續送出 Telegram typing 狀態。
+        res = await asyncio.to_thread(
+            relay_turn,
             thread_key=key,
             backend=_backend(),
             prompt=msg.text.strip(),
@@ -70,6 +85,10 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         log.exception("relay_turn 失敗 thread=%s", key)
         await msg.reply_text("執行失敗，請查看伺服器日誌。")
         return
+    finally:
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await typing_task
 
     out = res.stdout or ""
     err = res.stderr or ""
