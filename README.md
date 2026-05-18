@@ -1,89 +1,133 @@
 # tg-cli-relay
 
-在 **Telegram（之後也可換成其他觸發來源）** 與 **本機 CLI 編碼代理** 之間做中繼：統一處理「對話 thread 怎麼定義」、「各後端的 session / 歷史怎麼接續」，後端不限於 **Cursor `agent`**，也包含 **OpenAI `codex`**。
+透過 **Telegram** 對本機 **CLI 編碼代理**下指令的中繼橋接器。統一處理對話 thread 的定義、各後端的 session 接續，以及常用 bot 指令（重置、切換模型等）。
 
-## 核心概念
+支援後端：**Cursor `agent`**、**OpenAI `codex`**、**Claude Code `claude`**
 
-### 1) Thread key（外部對話的唯一鍵）
+---
 
-建議用來對應「同一串聊天」：
-
-| 情境 | Thread key 組成 |
-|------|------------------|
-| 私聊 | `private:{chat_id}` |
-| 群組 | `group:{chat_id}` |
-| 論壇話題 | `topic:{chat_id}:{message_thread_id}` |
-
-程式內以字串儲存；之後不論走 Cursor 或 Codex，都用同一個 key 查「該 thread 在各後端的 session id」。
-
-### 2) 後端 session（各 CLI 自己的對話室）
-
-- **Cursor**：`agent create-chat` 取得 UUID → 之後每次 `agent --print --resume <uuid> ...` 接續。多人服務時不要用 `--continue` 當主流程，避免搶到別人的「上一個 session」。
-- **Codex**：第一次用 `codex exec`（預設會落地 session）；後續用 `codex exec resume <SESSION_ID> ...`。也可用 `codex exec --json` 讓 stdout 變成 JSONL，方便腳本解析事件與取得 session id（實際欄位請以你安裝版本輸出為準）。
-
-### 3) 自己要不要存「全文歷史」
-
-- **最小做法**：只存 `thread_key → session_id` 對照表，上下文交給各 CLI。
-- **加強做法**：另存最近 N 則、摘要、審計 log；當 session 遺失或要遷移時，用摘要 + 新 session 重建。
-
-## 目錄說明
+## 架構概覽
 
 ```
-src/tg_cli_relay/     共用邏輯（SQLite 對照、subprocess 包裝）
-deploy/               systemd 範例（背景常駐）
+Telegram 訊息
+    │
+    ▼
+telegram_bot.py   ← 解析 thread key、處理指令、顯示回覆
+    │
+    ▼
+relay.py          ← 查 session、呼叫 provider、存回 session
+    │
+    ▼
+providers/        ← 各 CLI 的 subprocess 包裝
+    │
+    ▼
+SQLite            ← sessions 表（thread_key → session_id）
+                     preferences 表（thread_key → model 等偏好）
 ```
 
-## 環境變數
+**歷史紀錄由各 CLI 本身維護**；本專案只存 session ID，不存對話內容。
 
-複製 `env.example` 為 `.env` 後載入（或直接用 export）：
+---
 
-- `TGR_SESSION_DB`：SQLite 路徑，預設 `./data/sessions.sqlite3`
-- `TGR_DEFAULT_WORKSPACE`：預設工作目錄（git 專案根）
-- `TGR_CURSOR_AGENT_BIN`：Cursor Agent CLI，預設 `agent`
-- `TGR_CODEX_BIN`：OpenAI **Codex** CLI，預設 `codex`；僅在 `TGR_BACKEND=codex` 時會用到（與 Cursor 無關）
+## 支援後端
 
-**Cursor 認證**：常見為在執行 bot 的同一使用者環境下執行過 **`agent login`**（OAuth／瀏覽器登入）；亦可依官方文件使用 **`CURSOR_API_KEY`**（腳本／CI 較常見）。常駐服務請確認 systemd 的 `User=` 與你當初 `agent login` 的是同一帳號與家目錄，否則讀不到已登入狀態。
+| 後端 | CLI | Session 接續方式 | Model flag |
+|------|-----|-----------------|-----------|
+| `cursor` | `agent` | `agent create-chat` → `--resume <id>` | `--model` |
+| `codex` | `codex` | `codex exec` → `codex exec resume <id>` | `-m` |
+| `claude` | `claude` | `claude --resume <id>` | `--model` |
 
-**Codex 認證**：`codex login` 或該工具支援的設定檔／環境變數。
+---
 
-## 安裝（可編輯模式）
+## Telegram 指令
+
+| 指令 | 後端 | 說明 |
+|------|------|------|
+| `/reset` `/new` | 全部 | 清除 session，下一則訊息開啟新對話 |
+| `/status` | 全部 | 顯示後端、工作目錄、session 狀態 |
+| `/model` | 全部 | 列出常用模型清單 |
+| `/model <id>` | 全部 | 切換模型（下一輪起生效） |
+| `/help` | 全部 | 顯示可用指令 |
+
+> `/model` 對 Claude 有嚴格驗證；Cursor 和 Codex 為 pass-through（由 CLI 本身回報錯誤）。
+
+---
+
+## 安裝
 
 ```bash
-cd /srv/tg-cli-relay
 python3 -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e ".[telegram]"
 ```
 
-開發時若尚未 `pip install -e .`，可暫用：
+---
+
+## 環境變數
+
+複製 `env.example` 為 `.env`：
 
 ```bash
-PYTHONPATH=src python3 -m tg_cli_relay doctor
+cp env.example .env
 ```
 
-## CLI 小工具（本專案）
+| 變數 | 預設值 | 說明 |
+|------|--------|------|
+| `TGR_BACKEND` | `cursor` | 使用的後端：`cursor` / `codex` / `claude` |
+| `TGR_SESSION_DB` | `./data/sessions.sqlite3` | SQLite 路徑 |
+| `TGR_DEFAULT_WORKSPACE` | （必填） | 代理操作的 git 工作目錄 |
+| `TGR_CURSOR_AGENT_BIN` | `agent` | Cursor Agent CLI 路徑 |
+| `TGR_CODEX_BIN` | `codex` | OpenAI Codex CLI 路徑 |
+| `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
+| `TGR_CLAUDE_SKIP_PERMISSIONS` | （未設定） | 設為 `1` 啟用 `--dangerously-skip-permissions` |
+| `TELEGRAM_BOT_TOKEN` | （必填） | BotFather 取得的 token |
+| `TGR_ALLOWED_TELEGRAM_USER_IDS` | （留空不限制） | 允許使用的 Telegram user ID，逗號分隔 |
+
+---
+
+## 認證
+
+**Cursor**：在執行 bot 的同一使用者環境下執行 `agent login`（OAuth）；或設定 `CURSOR_API_KEY`。systemd 的 `User=` 必須與執行 `agent login` 的帳號一致。
+
+**Codex**：執行 `codex login` 或依 CLI 文件設定。
+
+**Claude**：執行 `claude login` 或設定 `ANTHROPIC_API_KEY`。
+
+---
+
+## 使用
 
 ```bash
-python3 -m tg_cli_relay --help
+# 檢查環境設定
 python3 -m tg_cli_relay doctor
-python3 -m tg_cli_relay run cursor 'private:123456' '幫我檢查這個 repo 的 README'
+
+# 單次測試（不啟動 bot）
+python3 -m tg_cli_relay run claude 'private:123456' '幫我檢查這個 repo 的 README'
+
+# 啟動 bot
 python3 -m tg_cli_relay bot
-```
 
-## 背景執行
-
-參考 `deploy/tg-cli-relay.service.example`：以 systemd 固定 `User`、`WorkingDirectory`、`EnvironmentFile`，並把 `PATH` 指到裝有 `agent` / `codex` 的位置。
-
-若先用簡單腳本管理背景程序（不走 systemd），可用專案根目錄：
-
-```bash
+# 或用腳本（Linux/macOS）
 ./start_bot.sh
 ./stop_bot.sh
 ```
 
-腳本會使用 `run/bot.pid` 記錄程序，日誌寫入 `bot.log`。
+---
 
-## 免責與安全
+## 背景常駐（Linux）
 
-- Bot Token、API key、可寫入的工作目錄都屬於高風險權限；務必限制誰能對機器人下指令（例如白名單 `user_id`）。
-- `codex exec` 的 `--dangerously-bypass-approvals-and-sandbox` 與 Cursor 的 `--yolo` / 寬鬆權限模式僅適合已在外層隔離的環境。
+參考 `deploy/tg-cli-relay.service.example` 設定 systemd：
+
+```bash
+sudo cp deploy/tg-cli-relay.service.example /etc/systemd/system/tg-cli-relay.service
+# 編輯 User=、EnvironmentFile=、PATH 後：
+sudo systemctl enable --now tg-cli-relay
+```
+
+---
+
+## 安全注意事項
+
+- 務必設定 `TGR_ALLOWED_TELEGRAM_USER_IDS` 限制可操作的使用者。
+- `TGR_CLAUDE_SKIP_PERMISSIONS=1` 會讓 Claude CLI 跳過所有工具授權確認，僅適合已隔離的環境。
+- Bot Token 與 API key 具有高風險寫入權限，請勿提交至版本控制。
