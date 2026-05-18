@@ -224,7 +224,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     if model:
         footer_parts.append(model)
     if sid:
-        footer_parts.append(f"session:{sid[:8]}…")
+        footer_parts.append(f"session:{sid}")
     footer = "\n\n— " + " · ".join(footer_parts) if footer_parts else ""
 
     chunks = _chunk_reply(body)
