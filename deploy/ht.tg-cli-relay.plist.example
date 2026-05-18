@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent 範本（使用者層級，登入後自動啟動）
+  放置位置：~/Library/LaunchAgents/ht.tg-cli-relay.plist
+
+  載入：
+    launchctl load ~/Library/LaunchAgents/ht.tg-cli-relay.plist
+
+  停用：
+    launchctl unload ~/Library/LaunchAgents/ht.tg-cli-relay.plist
+
+  查看狀態：
+    launchctl list | grep tg-cli-relay
+
+  查看 log：
+    tail -f /tmp/tg-cli-relay-stderr.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ht.tg-cli-relay</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- 替換為你的 venv python3 路徑 -->
+    <string>/Users/YOUR_USERNAME/path/to/tg_cli_relay/.venv/bin/python3</string>
+    <string>-m</string>
+    <string>tg_cli_relay</string>
+    <string>bot</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <!-- 替換為專案根目錄 -->
+  <string>/Users/YOUR_USERNAME/path/to/tg_cli_relay</string>
+
+  <!-- 環境變數：直接在此設定，或改用 EnvironmentVariables 讀取 .env 內容 -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TGR_BACKEND</key>
+    <string>claude</string>
+
+    <key>TGR_DEFAULT_WORKSPACE</key>
+    <string>/Users/YOUR_USERNAME/path/to/your-repo</string>
+
+    <key>TGR_SESSION_DB</key>
+    <string>/Users/YOUR_USERNAME/path/to/tg_cli_relay/data/sessions.sqlite3</string>
+
+    <key>TGR_CLAUDE_SKIP_PERMISSIONS</key>
+    <string>1</string>
+
+    <!-- Claude OAuth 透過 Keychain 驗證，不需要 ANTHROPIC_API_KEY -->
+    <!-- 若改用 API Key 模式，取消下方註解並填入金鑰 -->
+    <!-- <key>ANTHROPIC_API_KEY</key>
+    <string>sk-ant-...</string> -->
+
+    <key>TELEGRAM_BOT_TOKEN</key>
+    <string>你的 Bot Token</string>
+
+    <key>TGR_ALLOWED_TELEGRAM_USER_IDS</key>
+    <string>你的 Telegram user ID</string>
+
+    <!-- claude / agent 等 CLI 的安裝路徑（homebrew / nvm 等） -->
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/Users/YOUR_USERNAME/.nvm/versions/node/current/bin</string>
+
+    <!-- LaunchAgent 預設不帶 HOME，claude Keychain OAuth 需要 -->
+    <key>HOME</key>
+    <string>/Users/YOUR_USERNAME</string>
+
+    <!-- agent login 憑證存於 ~/.cursor；USER / LOGNAME 確保 CLI 找到正確家目錄 -->
+    <key>USER</key>
+    <string>YOUR_USERNAME</string>
+
+    <key>LOGNAME</key>
+    <string>YOUR_USERNAME</string>
+  </dict>
+
+  <!-- 開機 / 登入後自動啟動 -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- 異常退出後自動重啟 -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/tg-cli-relay-stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/tg-cli-relay-stderr.log</string>
+</dict>
+</plist>

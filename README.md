@@ -99,10 +99,12 @@ cp env.example .env
 
 | 方式 | 步驟 | 適合情境 |
 |------|------|---------|
-| **OAuth** | 執行 `claude login`（瀏覽器）；systemd `User=` 需與登入帳號一致 | 個人使用、Claude.ai 訂閱 |
+| **OAuth** | 執行 `claude login`（瀏覽器）；憑證存於 Keychain | 個人使用、Claude.ai 訂閱 |
 | **API Key** | 設定 `ANTHROPIC_API_KEY=sk-ant-...` | Server 部署、無人值守（建議） |
 
 部署範本參考 `deploy/env.claude.example`。
+
+> **macOS 注意**：Claude Code OAuth 憑證存放在系統 Keychain。請勿將 `oat01-` 格式的 OAuth token 設為 `ANTHROPIC_API_KEY`（例如透過 `launchctl setenv` 全域注入）——claude CLI 會把它當 API key 呼叫，導致 "Invalid API key" 錯誤。本專案的 `claude_cli.py` 會自動偵測並移除 `oat01-` 格式的值，讓 CLI 回到 Keychain 路徑；真正的 API key（`sk-ant-` 開頭）不受影響。
 
 ---
 
@@ -125,7 +127,33 @@ python3 -m tg_cli_relay bot
 
 ---
 
-## 背景常駐（Linux）
+## 背景常駐（macOS LaunchAgent）
+
+參考 `deploy/ht.tg-cli-relay.plist.example`：
+
+```bash
+cp deploy/ht.tg-cli-relay.plist.example ~/Library/LaunchAgents/ht.tg-cli-relay.plist
+# 編輯 ProgramArguments（python3 路徑）、WorkingDirectory、YOUR_USERNAME
+launchctl load ~/Library/LaunchAgents/ht.tg-cli-relay.plist
+```
+
+**重要**：plist 的 `EnvironmentVariables` 須明確設定 `HOME`、`USER`、`LOGNAME` 與 `PATH`，LaunchAgent 預設環境很精簡，缺少這些值會導致 CLI 找不到 Keychain 憑證或可執行檔。
+
+查看 log：
+
+```bash
+tail -f /tmp/tg-cli-relay-stderr.log
+```
+
+停用：
+
+```bash
+launchctl unload ~/Library/LaunchAgents/ht.tg-cli-relay.plist
+```
+
+---
+
+## 背景常駐（Linux systemd）
 
 參考 `deploy/tg-cli-relay.service.example` 設定 systemd：
 

@@ -42,13 +42,21 @@ class ClaudeCliProvider:
         if session_id:
             cmd.extend(["--resume", session_id])
         cmd.append(prompt)
+        env = os.environ.copy()
+        # macOS Keychain OAuth token（oat01-…）被全域注入時，claude CLI 會把它當 API key
+        # 導致 "Invalid API key" 錯誤；偵測到 OAuth 格式就移除，讓 CLI 走 Keychain 路徑。
+        # 真正的 API key（sk-ant-…）不受影響。
+        api_key = env.get("ANTHROPIC_API_KEY", "")
+        if api_key.startswith("oat01-"):
+            env.pop("ANTHROPIC_API_KEY", None)
+
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             check=False,
             cwd=workspace,
-            env=os.environ.copy(),
+            env=env,
         )
         return RunResult(stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode)
 
