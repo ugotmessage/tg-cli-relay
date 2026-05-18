@@ -87,11 +87,22 @@ cp env.example .env
 
 ## 認證
 
-**Cursor**：在執行 bot 的同一使用者環境下執行 `agent login`（OAuth）；或設定 `CURSOR_API_KEY`。systemd 的 `User=` 必須與執行 `agent login` 的帳號一致。
+### Cursor
+- **OAuth（建議）**：在執行 bot 的同一使用者環境下執行 `agent login`，憑證存於家目錄。systemd 的 `User=` 必須與登入帳號一致。
+- **API Key**：設定 `CURSOR_API_KEY` 環境變數。
 
-**Codex**：執行 `codex login` 或依 CLI 文件設定。
+### Codex
+執行 `codex login` 或依 CLI 文件設定 API Key。
 
-**Claude**：執行 `claude login` 或設定 `ANTHROPIC_API_KEY`。
+### Claude
+兩種方式擇一：
+
+| 方式 | 步驟 | 適合情境 |
+|------|------|---------|
+| **OAuth** | 執行 `claude login`（瀏覽器）；systemd `User=` 需與登入帳號一致 | 個人使用、Claude.ai 訂閱 |
+| **API Key** | 設定 `ANTHROPIC_API_KEY=sk-ant-...` | Server 部署、無人值守（建議） |
+
+部署範本參考 `deploy/env.claude.example`。
 
 ---
 
