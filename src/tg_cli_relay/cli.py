@@ -30,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run", help="對單一 thread_key 送出一輪 prompt（Cursor 或 Codex）")
-    run.add_argument("backend", choices=["cursor", "codex"])
+    run.add_argument("backend", choices=["cursor", "codex", "claude"])
     run.add_argument("thread_key", help="例如 private:123456")
     run.add_argument("prompt", help="要送給代理的文字")
     run.add_argument("--workspace", help="覆寫 TGR_DEFAULT_WORKSPACE")
@@ -47,6 +47,9 @@ def main(argv: list[str] | None = None) -> int:
         print("TGR_DEFAULT_WORKSPACE =", ws or "(未設定)")
         print("TGR_CURSOR_AGENT_BIN =", os.environ.get("TGR_CURSOR_AGENT_BIN", "agent"))
         print("TGR_CODEX_BIN =", os.environ.get("TGR_CODEX_BIN", "codex"))
+        print("TGR_CLAUDE_BIN =", os.environ.get("TGR_CLAUDE_BIN", "claude"))
+        skip = os.environ.get("TGR_CLAUDE_SKIP_PERMISSIONS", "").strip().lower() in ("1", "true", "yes")
+        print("TGR_CLAUDE_SKIP_PERMISSIONS =", "已啟用（--dangerously-skip-permissions）" if skip else "未啟用")
         print("TELEGRAM_BOT_TOKEN =", "(已設定)" if os.environ.get("TELEGRAM_BOT_TOKEN") else "(未設定)")
         print("TGR_BACKEND =", os.environ.get("TGR_BACKEND", "cursor"))
         return 0

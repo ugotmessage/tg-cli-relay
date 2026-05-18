@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Literal
 
-Backend = Literal["cursor", "codex"]
+Backend = Literal["cursor", "codex", "claude"]
 
 
 class SessionStore:
@@ -37,6 +37,17 @@ class SessionStore:
                     workspace TEXT,
                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                     PRIMARY KEY (thread_key, backend)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS preferences (
+                    thread_key TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (thread_key, key)
                 )
                 """
             )
@@ -75,4 +86,32 @@ class SessionStore:
             conn.execute(
                 "DELETE FROM sessions WHERE thread_key = ? AND backend = ?",
                 (thread_key, backend),
+            )
+
+    def get_pref(self, thread_key: str, key: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM preferences WHERE thread_key = ? AND key = ?",
+                (thread_key, key),
+            ).fetchone()
+            return str(row[0]) if row else None
+
+    def set_pref(self, thread_key: str, key: str, value: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO preferences (thread_key, key, value, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(thread_key, key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (thread_key, key, value),
+            )
+
+    def delete_pref(self, thread_key: str, key: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM preferences WHERE thread_key = ? AND key = ?",
+                (thread_key, key),
             )

@@ -7,12 +7,24 @@ from dataclasses import dataclass
 
 from tg_cli_relay.providers.base import RunResult
 
+# 完整清單執行 `codex models status` 或查官方文件
+CODEX_MODELS: list[str] = [
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-oss-20b",
+    "gpt-oss-120b",
+]
+
 
 @dataclass(slots=True)
 class CodexCliProvider:
     """包裝本機 `codex exec` / `codex exec resume`。"""
 
     codex_bin: str = "codex"
+    model: str | None = None
     name: str = "codex"
 
     def run_turn(
@@ -22,19 +34,13 @@ class CodexCliProvider:
         session_id: str | None,
         prompt: str,
     ) -> RunResult:
+        base: list[str] = [self.codex_bin]
+        if self.model:
+            base.extend(["-m", self.model])
         if session_id:
-            cmd: list[str] = [
-                self.codex_bin,
-                "exec",
-                "-C",
-                workspace,
-                "--json",
-                "resume",
-                session_id,
-                prompt,
-            ]
+            cmd: list[str] = base + ["exec", "-C", workspace, "--json", "resume", session_id, prompt]
         else:
-            cmd = [self.codex_bin, "exec", "-C", workspace, "--json", prompt]
+            cmd = base + ["exec", "-C", workspace, "--json", prompt]
         proc = subprocess.run(
             cmd,
             capture_output=True,

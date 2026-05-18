@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from tg_cli_relay.providers.base import RunResult
+from tg_cli_relay.providers.claude_cli import ClaudeCliProvider, parse_claude_output
 from tg_cli_relay.providers.codex_cli import CodexCliProvider, parse_session_id_from_jsonl
 from tg_cli_relay.providers.cursor_agent import CursorAgentProvider
 from tg_cli_relay.session_store import Backend, SessionStore
@@ -40,6 +41,8 @@ def relay_turn(
         return _relay_cursor(st, thread_key, ws, prompt)
     if backend == "codex":
         return _relay_codex(st, thread_key, ws, prompt)
+    if backend == "claude":
+        return _relay_claude(st, thread_key, ws, prompt)
     raise ValueError(f"未知後端: {backend}")
 
 
@@ -47,7 +50,8 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
     import os
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
-    prov = CursorAgentProvider(agent_bin=bin_name)
+    model = store.get_pref(thread_key, "model")
+    prov = CursorAgentProvider(agent_bin=bin_name, model=model)
     sid = store.get(thread_key, "cursor")
     if not sid:
         sid = prov.create_session()
@@ -55,11 +59,27 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
     return prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
 
 
+def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
+    import os
+
+    bin_name = os.environ.get("TGR_CLAUDE_BIN", "claude").strip() or "claude"
+    skip_perms = os.environ.get("TGR_CLAUDE_SKIP_PERMISSIONS", "").strip().lower() in ("1", "true", "yes")
+    model = store.get_pref(thread_key, "model")
+    prov = ClaudeCliProvider(claude_bin=bin_name, dangerously_skip_permissions=skip_perms, model=model)
+    sid = store.get(thread_key, "claude")
+    raw = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
+    display_text, new_sid = parse_claude_output(raw.stdout)
+    if new_sid and new_sid != sid:
+        store.upsert(thread_key, "claude", new_sid, workspace=workspace)
+    return RunResult(stdout=display_text, stderr=raw.stderr, returncode=raw.returncode)
+
+
 def _relay_codex(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
     import os
 
     bin_name = os.environ.get("TGR_CODEX_BIN", "codex").strip() or "codex"
-    prov = CodexCliProvider(codex_bin=bin_name)
+    model = store.get_pref(thread_key, "model")
+    prov = CodexCliProvider(codex_bin=bin_name, model=model)
     sid = store.get(thread_key, "codex")
     res = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
     if sid is None:
