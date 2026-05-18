@@ -216,8 +216,20 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     out = res.stdout or ""
     err = res.stderr or ""
     body = out if res.returncode == 0 else f"{out}\n\n--- stderr ---\n{err}".strip()
-    for part in _chunk_reply(body):
-        await msg.reply_text(part)
+
+    backend = _backend()
+    sid = store.get(key, backend)
+    model = store.get_pref(key, "model")
+    footer_parts = []
+    if model:
+        footer_parts.append(model)
+    if sid:
+        footer_parts.append(f"session:{sid[:8]}…")
+    footer = "\n\n— " + " · ".join(footer_parts) if footer_parts else ""
+
+    chunks = _chunk_reply(body)
+    for i, part in enumerate(chunks):
+        await msg.reply_text(part + (footer if i == len(chunks) - 1 else ""))
 
 
 def run_bot() -> None:
