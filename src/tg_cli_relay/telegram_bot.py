@@ -30,9 +30,9 @@ def _allowed_ids() -> set[int] | None:
 
 def _backend() -> Backend:
     b = os.environ.get("TGR_BACKEND", "cursor").strip().lower()
-    if b in ("cursor", "codex", "claude"):
+    if b in ("cursor", "codex", "claude", "opencode"):
         return b  # type: ignore[return-value]
-    raise RuntimeError("TGR_BACKEND 必須是 cursor、codex 或 claude")
+    raise RuntimeError("TGR_BACKEND 必須是 cursor、codex、claude 或 opencode")
 
 
 def _get_store() -> SessionStore:
@@ -140,6 +140,21 @@ async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
         store.set_pref(key, "model", chosen)
         await update.message.reply_text(f"模型已切換至 {chosen}（下一輪起生效）。")
 
+    elif backend == "opencode":
+        from tg_cli_relay.providers.opencode_cli import OPENCODE_MODELS
+
+        if not args:
+            current = store.get_pref(key, "model") or "(預設)"
+            model_list = "\n".join(f"  {m}" for m in OPENCODE_MODELS)
+            await update.message.reply_text(
+                f"目前模型: {current}\n\n可用模型:\n{model_list}\n\n"
+                f"用法: /model <provider/model-name>"
+            )
+            return
+        chosen = args[0]
+        store.set_pref(key, "model", chosen)
+        await update.message.reply_text(f"模型已切換至 {chosen}（下一輪起生效）。")
+
     else:
         await update.message.reply_text(f"此後端（{backend}）不支援 /model 指令。")
 
@@ -153,7 +168,7 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
         "/status — 查看目前後端與 session 狀態",
         "/help — 顯示此說明",
     ]
-    if backend in ("claude", "cursor", "codex"):
+    if backend in ("claude", "cursor", "codex", "opencode"):
         lines.insert(2, "/model [名稱] — 查看或切換模型")
     await update.message.reply_text("\n".join(lines))
 

@@ -6,6 +6,7 @@ from tg_cli_relay.providers.base import RunResult
 from tg_cli_relay.providers.claude_cli import ClaudeCliProvider, parse_claude_output
 from tg_cli_relay.providers.codex_cli import CodexCliProvider, parse_session_id_from_jsonl
 from tg_cli_relay.providers.cursor_agent import CursorAgentProvider
+from tg_cli_relay.providers.opencode_cli import OpencodeCliProvider, parse_opencode_output
 from tg_cli_relay.session_store import Backend, SessionStore
 
 
@@ -43,6 +44,8 @@ def relay_turn(
         return _relay_codex(st, thread_key, ws, prompt)
     if backend == "claude":
         return _relay_claude(st, thread_key, ws, prompt)
+    if backend == "opencode":
+        return _relay_opencode(st, thread_key, ws, prompt)
     raise ValueError(f"未知後端: {backend}")
 
 
@@ -71,6 +74,22 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
     display_text, new_sid = parse_claude_output(raw.stdout)
     if new_sid and new_sid != sid:
         store.upsert(thread_key, "claude", new_sid, workspace=workspace)
+    return RunResult(stdout=display_text, stderr=raw.stderr, returncode=raw.returncode)
+
+
+def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
+    import os
+
+    bin_name = os.environ.get("TGR_OPENCODE_BIN", "opencode").strip() or "opencode"
+    model = store.get_pref(thread_key, "model")
+    prov = OpencodeCliProvider(opencode_bin=bin_name, model=model)
+    sid = store.get(thread_key, "opencode")
+    raw = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
+    display_text, new_sid = parse_opencode_output(raw.stdout)
+    # 優先存真正的 session id；若 JSON 沒有則存 marker 讓下次加 -c
+    stored_sid = new_sid or "active"
+    if stored_sid != sid:
+        store.upsert(thread_key, "opencode", stored_sid, workspace=workspace)
     return RunResult(stdout=display_text, stderr=raw.stderr, returncode=raw.returncode)
 
 

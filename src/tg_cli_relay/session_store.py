@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Literal
 
-Backend = Literal["cursor", "codex", "claude"]
+Backend = Literal["cursor", "codex", "claude", "opencode"]
 
 
 class SessionStore:
