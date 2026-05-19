@@ -2,7 +2,7 @@
 
 透過 **Telegram** 對本機 **CLI 編碼代理**下指令的中繼橋接器。統一處理對話 thread 的定義、各後端的 session 接續，以及常用 bot 指令（重置、切換模型等）。
 
-支援後端：**Cursor `agent`**、**OpenAI `codex`**、**Claude Code `claude`**
+支援後端：**Cursor `agent`**、**OpenAI `codex`**、**Claude Code `claude`**、**OpenCode `opencode`**
 
 ---
 
@@ -36,6 +36,9 @@ SQLite            ← sessions 表（thread_key → session_id）
 | `cursor` | `agent` | `agent create-chat` → `--resume <id>` | `--model` |
 | `codex` | `codex` | `codex exec` → `codex exec resume <id>` | `-m` |
 | `claude` | `claude` | `claude --resume <id>` | `--model` |
+| `opencode` | `opencode` | `opencode run -c`（續最後一個，靠 workspace 隔離） | `-m` |
+
+> **OpenCode 限制**：無法指定 session ID 接續，同一 workspace 下多個 Telegram thread 會共用同一個 session。建議一個 thread 對應一個 workspace。
 
 ---
 
@@ -49,7 +52,7 @@ SQLite            ← sessions 表（thread_key → session_id）
 | `/model <id>` | 全部 | 切換模型（下一輪起生效） |
 | `/help` | 全部 | 顯示可用指令 |
 
-> `/model` 對 Claude 有嚴格驗證；Cursor 和 Codex 為 pass-through（由 CLI 本身回報錯誤）。
+> `/model` 對 Claude 有嚴格驗證；Cursor、Codex、OpenCode 為 pass-through（由 CLI 本身回報錯誤）。OpenCode 的模型格式為 `provider/model-name`，例如 `anthropic/claude-sonnet-4-6`。
 
 ---
 
@@ -73,13 +76,14 @@ cp env.example .env
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
-| `TGR_BACKEND` | `cursor` | 使用的後端：`cursor` / `codex` / `claude` |
+| `TGR_BACKEND` | `cursor` | 使用的後端：`cursor` / `codex` / `claude` / `opencode` |
 | `TGR_SESSION_DB` | `./data/sessions.sqlite3` | SQLite 路徑 |
 | `TGR_DEFAULT_WORKSPACE` | （必填） | 代理操作的 git 工作目錄 |
 | `TGR_CURSOR_AGENT_BIN` | `agent` | Cursor Agent CLI 路徑 |
 | `TGR_CODEX_BIN` | `codex` | OpenAI Codex CLI 路徑 |
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
 | `TGR_CLAUDE_SKIP_PERMISSIONS` | （未設定） | 設為 `1` 啟用 `--dangerously-skip-permissions` |
+| `TGR_OPENCODE_BIN` | `opencode` | OpenCode CLI 路徑 |
 | `TELEGRAM_BOT_TOKEN` | （必填） | BotFather 取得的 token |
 | `TGR_ALLOWED_TELEGRAM_USER_IDS` | （留空不限制） | 允許使用的 Telegram user ID，逗號分隔 |
 
@@ -93,6 +97,9 @@ cp env.example .env
 
 ### Codex
 執行 `codex login` 或依 CLI 文件設定 API Key。
+
+### OpenCode
+執行 `opencode` 並依互動式設定完成各 AI provider 的 API key 配置；或直接在環境變數設定對應 provider 的 key（如 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`）。
 
 ### Claude
 兩種方式擇一：
