@@ -47,12 +47,15 @@ SQLite            ← sessions 表（thread_key → session_id）
 | 指令 | 後端 | 說明 |
 |------|------|------|
 | `/reset` `/new` | 全部 | 清除 session，下一則訊息開啟新對話 |
-| `/status` | 全部 | 顯示後端、工作目錄、session 狀態 |
-| `/model` | 全部 | 列出常用模型清單 |
-| `/model <id>` | 全部 | 切換模型（下一輪起生效） |
+| `/status` | 全部 | 顯示目前 provider、工作目錄、session 狀態 |
+| `/provider` | 全部 | 列出可切換的 CLI provider |
+| `/provider <id>` | 全部 | 切換 provider（例如 `claude`、`codex`） |
+| `/model` | 全部 | 依 provider 列出常用模型清單 |
+| `/model <id>` | 全部 | 切換目前 provider 的模型（下一輪起生效） |
+| `/model <provider> <id>` | 全部 | 切換 provider 並設定該 provider 的模型 |
 | `/help` | 全部 | 顯示可用指令 |
 
-> `/model` 對 Claude 有嚴格驗證；Cursor、Codex、OpenCode 為 pass-through（由 CLI 本身回報錯誤）。OpenCode 的模型格式為 `provider/model-name`，例如 `anthropic/claude-sonnet-4-6`。
+> 每個 Telegram thread 會保存自己的 provider。模型偏好也依 provider 分開保存，例如 Claude 與 Codex 各自保留自己的模型設定。
 
 ---
 
@@ -77,6 +80,7 @@ cp env.example .env
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
 | `TGR_BACKEND` | `cursor` | 使用的後端：`cursor` / `codex` / `claude` / `opencode` |
+| `TGR_ENABLED_BACKENDS` | 全部支援後端 | Telegram 中可切換的 provider 清單，逗號分隔，例如 `claude,codex` |
 | `TGR_SESSION_DB` | `./data/sessions.sqlite3` | SQLite 路徑 |
 | `TGR_DEFAULT_WORKSPACE` | （必填） | 代理操作的 git 工作目錄 |
 | `TGR_CURSOR_AGENT_BIN` | `agent` | Cursor Agent CLI 路徑 |

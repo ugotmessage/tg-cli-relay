@@ -26,6 +26,10 @@ def _default_workspace() -> str:
     return w
 
 
+def _model_pref_key(backend: Backend) -> str:
+    return f"model:{backend}"
+
+
 def relay_turn(
     *,
     thread_key: str,
@@ -53,7 +57,7 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
     import os
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
-    model = store.get_pref(thread_key, "model")
+    model = store.get_pref(thread_key, _model_pref_key("cursor")) or store.get_pref(thread_key, "model")
     prov = CursorAgentProvider(agent_bin=bin_name, model=model)
     sid = store.get(thread_key, "cursor")
     if not sid:
@@ -67,7 +71,7 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
 
     bin_name = os.environ.get("TGR_CLAUDE_BIN", "claude").strip() or "claude"
     skip_perms = os.environ.get("TGR_CLAUDE_SKIP_PERMISSIONS", "").strip().lower() in ("1", "true", "yes")
-    model = store.get_pref(thread_key, "model")
+    model = store.get_pref(thread_key, _model_pref_key("claude")) or store.get_pref(thread_key, "model")
     prov = ClaudeCliProvider(claude_bin=bin_name, dangerously_skip_permissions=skip_perms, model=model)
     sid = store.get(thread_key, "claude")
     raw = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
@@ -81,7 +85,7 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
     import os
 
     bin_name = os.environ.get("TGR_OPENCODE_BIN", "opencode").strip() or "opencode"
-    model = store.get_pref(thread_key, "model")
+    model = store.get_pref(thread_key, _model_pref_key("opencode")) or store.get_pref(thread_key, "model")
     prov = OpencodeCliProvider(opencode_bin=bin_name, model=model)
     sid = store.get(thread_key, "opencode")
     raw = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
@@ -97,7 +101,7 @@ def _relay_codex(store: SessionStore, thread_key: str, workspace: str, prompt: s
     import os
 
     bin_name = os.environ.get("TGR_CODEX_BIN", "codex").strip() or "codex"
-    model = store.get_pref(thread_key, "model")
+    model = store.get_pref(thread_key, _model_pref_key("codex")) or store.get_pref(thread_key, "model")
     prov = CodexCliProvider(codex_bin=bin_name, model=model)
     sid = store.get(thread_key, "codex")
     res = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)

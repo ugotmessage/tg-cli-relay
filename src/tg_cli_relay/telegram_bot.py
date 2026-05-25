@@ -14,6 +14,7 @@ log = logging.getLogger(__name__)
 
 TG_CHUNK = 3800
 _BOT_LOCK_FILE = None
+SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
 
 
 def _allowed_ids() -> set[int] | None:
@@ -29,11 +30,81 @@ def _allowed_ids() -> set[int] | None:
     return out
 
 
-def _backend() -> Backend:
-    b = os.environ.get("TGR_BACKEND", "cursor").strip().lower()
-    if b in ("cursor", "codex", "claude", "opencode"):
+def _parse_backend(raw: str) -> Backend | None:
+    b = raw.strip().lower()
+    if b in SUPPORTED_BACKENDS:
         return b  # type: ignore[return-value]
-    raise RuntimeError("TGR_BACKEND 必須是 cursor、codex、claude 或 opencode")
+    return None
+
+
+def _enabled_backends() -> tuple[Backend, ...]:
+    raw = os.environ.get("TGR_ENABLED_BACKENDS", "").strip()
+    if raw:
+        backends = tuple(
+            b for b in (_parse_backend(part) for part in raw.split(",")) if b is not None
+        )
+        if backends:
+            return backends
+    return SUPPORTED_BACKENDS
+
+
+def _default_backend() -> Backend:
+    backend = _parse_backend(os.environ.get("TGR_BACKEND", "cursor"))
+    if backend is None:
+        raise RuntimeError("TGR_BACKEND 必須是 cursor、codex、claude 或 opencode")
+    return backend
+
+
+def _backend_for_thread(store: SessionStore, thread_key: str) -> Backend:
+    saved = store.get_pref(thread_key, "backend")
+    backend = _parse_backend(saved or "")
+    enabled = _enabled_backends()
+    if backend in enabled:
+        return backend
+    default = _default_backend()
+    return default if default in enabled else enabled[0]
+
+
+def _model_pref_key(backend: Backend) -> str:
+    return f"model:{backend}"
+
+
+def _models_for_backend(backend: Backend) -> list[str]:
+    if backend == "claude":
+        from tg_cli_relay.providers.claude_cli import CLAUDE_MODELS
+
+        return CLAUDE_MODELS
+    if backend == "cursor":
+        from tg_cli_relay.providers.cursor_agent import CURSOR_MODELS
+
+        return CURSOR_MODELS
+    if backend == "codex":
+        from tg_cli_relay.providers.codex_cli import CODEX_MODELS
+
+        return CODEX_MODELS
+    if backend == "opencode":
+        from tg_cli_relay.providers.opencode_cli import OPENCODE_MODELS
+
+        return OPENCODE_MODELS
+    return []
+
+
+def _format_model_catalog(store: SessionStore, thread_key: str, active_backend: Backend) -> str:
+    lines = [f"目前 provider: {active_backend}", ""]
+    for backend in _enabled_backends():
+        marker = "*" if backend == active_backend else "-"
+        current = store.get_pref(thread_key, _model_pref_key(backend)) or "(預設)"
+        lines.append(f"{marker} {backend} 目前模型: {current}")
+        models = _models_for_backend(backend)
+        if models:
+            lines.extend(f"  {model}" for model in models)
+        else:
+            lines.append("  (未提供模型清單，可直接輸入 model id)")
+        lines.append("")
+    lines.append("用法: /provider <provider>")
+    lines.append("用法: /model <model>")
+    lines.append("用法: /model <provider> <model>")
+    return "\n".join(lines).strip()
 
 
 def _get_store() -> SessionStore:
@@ -59,8 +130,9 @@ async def _cmd_reset(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
     key = _get_thread_key(update)
-    backend = _backend()
-    _get_store().delete(key, backend)
+    store = _get_store()
+    backend = _backend_for_thread(store, key)
+    store.delete(key, backend)
     await update.message.reply_text(f"對話已重置，下一則訊息將開啟新的 {backend} session。")
 
 
@@ -68,109 +140,101 @@ async def _cmd_status(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
     key = _get_thread_key(update)
-    backend = _backend()
     store = _get_store()
+    backend = _backend_for_thread(store, key)
     sid = store.get(key, backend)
     ws = os.environ.get("TGR_DEFAULT_WORKSPACE", "(未設定)")
     lines = [
-        f"後端: {backend}",
+        f"Provider: {backend}",
         f"工作目錄: {ws}",
         f"Session: {(sid[:8] + '...') if sid else '（尚未建立）'}",
+        f"模型: {store.get_pref(key, _model_pref_key(backend)) or '(預設)'}",
+        f"可用 providers: {', '.join(_enabled_backends())}",
     ]
-    if backend == "claude":
-        model = store.get_pref(key, "model") or "(預設)"
-        lines.append(f"模型: {model}")
     await update.message.reply_text("\n".join(lines))
+
+
+async def _cmd_provider(update, context) -> None:  # type: ignore[no-untyped-def]
+    if not _check_auth(update):
+        return
+
+    key = _get_thread_key(update)
+    store = _get_store()
+    args: list[str] = context.args or []
+    enabled = _enabled_backends()
+    current = _backend_for_thread(store, key)
+
+    if not args:
+        lines = [f"目前 provider: {current}", "", "可用 providers:"]
+        lines.extend(f"  {backend}" for backend in enabled)
+        lines.append("")
+        lines.append("用法: /provider <provider>")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    chosen = _parse_backend(args[0])
+    if chosen is None or chosen not in enabled:
+        await update.message.reply_text(
+            f"不支援的 provider: {args[0]}\n可用: {', '.join(enabled)}"
+        )
+        return
+
+    store.set_pref(key, "backend", chosen)
+    await update.message.reply_text(f"Provider 已切換至 {chosen}（下一輪起生效）。")
 
 
 async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
 
-    backend = _backend()
     key = _get_thread_key(update)
     store = _get_store()
+    backend = _backend_for_thread(store, key)
     args: list[str] = context.args or []
 
-    if backend == "claude":
-        from tg_cli_relay.providers.claude_cli import CLAUDE_MODELS
+    if not args:
+        await update.message.reply_text(_format_model_catalog(store, key, backend))
+        return
 
-        if not args:
-            current = store.get_pref(key, "model") or "(預設)"
-            model_list = "\n".join(f"  {m}" for m in CLAUDE_MODELS)
+    maybe_backend = _parse_backend(args[0])
+    if maybe_backend is not None:
+        if maybe_backend not in _enabled_backends():
             await update.message.reply_text(
-                f"目前模型: {current}\n\n可用模型:\n{model_list}\n\n用法: /model <模型名稱>"
+                f"不支援的 provider: {args[0]}\n可用: {', '.join(_enabled_backends())}"
             )
             return
-        chosen = args[0]
-        if chosen not in CLAUDE_MODELS:
+        backend = maybe_backend
+        store.set_pref(key, "backend", backend)
+        if len(args) == 1:
+            current = store.get_pref(key, _model_pref_key(backend)) or "(預設)"
+            models = "\n".join(f"  {m}" for m in _models_for_backend(backend))
             await update.message.reply_text(
-                f"不支援的模型: {chosen}\n可用: {', '.join(CLAUDE_MODELS)}"
+                f"Provider 已切換至 {backend}\n目前模型: {current}\n\n可用模型:\n{models}"
             )
             return
-        store.set_pref(key, "model", chosen)
-        await update.message.reply_text(f"模型已切換至 {chosen}（下一輪起生效）。")
-
-    elif backend == "cursor":
-        from tg_cli_relay.providers.cursor_agent import CURSOR_MODELS
-
-        if not args:
-            current = store.get_pref(key, "model") or "(預設 auto)"
-            model_list = "\n".join(f"  {m}" for m in CURSOR_MODELS)
-            await update.message.reply_text(
-                f"目前模型: {current}\n\n常用模型（精選）:\n{model_list}\n\n"
-                f"完整清單執行 `agent --list-models`\n用法: /model <model-id>"
-            )
-            return
-        chosen = args[0]
-        store.set_pref(key, "model", chosen)
-        await update.message.reply_text(f"模型已切換至 {chosen}（下一輪起生效）。")
-
-    elif backend == "codex":
-        from tg_cli_relay.providers.codex_cli import CODEX_MODELS
-
-        if not args:
-            current = store.get_pref(key, "model") or "(預設)"
-            model_list = "\n".join(f"  {m}" for m in CODEX_MODELS)
-            await update.message.reply_text(
-                f"目前模型: {current}\n\n可用模型:\n{model_list}\n\n"
-                f"用法: /model <model-name>"
-            )
-            return
-        chosen = args[0]
-        store.set_pref(key, "model", chosen)
-        await update.message.reply_text(f"模型已切換至 {chosen}（下一輪起生效）。")
-
-    elif backend == "opencode":
-        from tg_cli_relay.providers.opencode_cli import OPENCODE_MODELS
-
-        if not args:
-            current = store.get_pref(key, "model") or "(預設)"
-            model_list = "\n".join(f"  {m}" for m in OPENCODE_MODELS)
-            await update.message.reply_text(
-                f"目前模型: {current}\n\n可用模型:\n{model_list}\n\n"
-                f"用法: /model <provider/model-name>"
-            )
-            return
-        chosen = args[0]
-        store.set_pref(key, "model", chosen)
-        await update.message.reply_text(f"模型已切換至 {chosen}（下一輪起生效）。")
-
+        chosen = args[1]
     else:
-        await update.message.reply_text(f"此後端（{backend}）不支援 /model 指令。")
+        chosen = args[0]
+
+    models = _models_for_backend(backend)
+    if models and chosen not in models:
+        await update.message.reply_text(f"不支援的模型: {chosen}\n可用: {', '.join(models)}")
+        return
+
+    store.set_pref(key, _model_pref_key(backend), chosen)
+    await update.message.reply_text(f"{backend} 模型已切換至 {chosen}（下一輪起生效）。")
 
 
 async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
-    backend = _backend()
     lines = [
         "/reset — 清除對話，開啟新 session",
         "/status — 查看目前後端與 session 狀態",
+        "/provider [名稱] — 查看或切換 CLI provider",
+        "/model [provider] [名稱] — 查看或切換模型",
         "/help — 顯示此說明",
     ]
-    if backend in ("claude", "cursor", "codex", "opencode"):
-        lines.insert(2, "/model [名稱] — 查看或切換模型")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -210,13 +274,14 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
 
     store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
     store = SessionStore(store_path)
+    backend = _backend_for_thread(store, key)
     try:
         # relay_turn 內部會跑 subprocess，改放到 thread 避免阻塞 event loop，
         # 才能持續送出 Telegram typing 狀態。
         res = await asyncio.to_thread(
             relay_turn,
             thread_key=key,
-            backend=_backend(),
+            backend=backend,
             prompt=msg.text.strip(),
             store=store,
         )
@@ -238,10 +303,10 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     else:
         body = out
 
-    backend = _backend()
     sid = store.get(key, backend)
-    model = store.get_pref(key, "model")
+    model = store.get_pref(key, _model_pref_key(backend))
     footer_parts = []
+    footer_parts.append(backend)
     if model:
         footer_parts.append(model)
     if sid:
@@ -317,8 +382,9 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("reset", _cmd_reset))
     app.add_handler(CommandHandler("new", _cmd_reset))
     app.add_handler(CommandHandler("status", _cmd_status))
+    app.add_handler(CommandHandler("provider", _cmd_provider))
     app.add_handler(CommandHandler("model", _cmd_model))
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_message))
-    log.info("啟動 Telegram bot（backend=%s）", _backend())
+    log.info("啟動 Telegram bot（default_backend=%s）", _default_backend())
     app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
