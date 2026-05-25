@@ -41,7 +41,6 @@ class ClaudeCliProvider:
             cmd.extend(["--model", self.model])
         if session_id:
             cmd.extend(["--resume", session_id])
-        cmd.append(prompt)
         env = os.environ.copy()
         # macOS Keychain OAuth token（oat01-…）被全域注入時，claude CLI 會把它當 API key
         # 導致 "Invalid API key" 錯誤；偵測到 OAuth 格式就移除，讓 CLI 走 Keychain 路徑。
@@ -52,16 +51,17 @@ class ClaudeCliProvider:
 
         proc = subprocess.run(
             cmd,
+            input=prompt,
             capture_output=True,
             text=True,
             check=False,
             cwd=workspace,
             env=env,
         )
-        return RunResult(stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode)
+        return RunResult(stdout=proc.stdout or "", stderr=proc.stderr or "", returncode=proc.returncode)
 
 
-def parse_claude_output(blob: str) -> tuple[str, str | None]:
+def parse_claude_output(blob: str | None) -> tuple[str, str | None]:
     """解析 `claude --output-format json` 的輸出。
 
     Returns:
@@ -69,6 +69,8 @@ def parse_claude_output(blob: str) -> tuple[str, str | None]:
         display_text：要顯示給使用者的回覆文字。
         session_id：若解析成功則為 str，否則為 None。
     """
+    if not blob:
+        return "", None
     raw = blob.strip()
     if not raw:
         return "", None

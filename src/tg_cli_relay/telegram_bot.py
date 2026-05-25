@@ -13,6 +13,7 @@ from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
 log = logging.getLogger(__name__)
 
 TG_CHUNK = 3800
+_BOT_LOCK_FILE = None
 
 
 def _allowed_ids() -> set[int] | None:
@@ -230,7 +231,12 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
 
     out = res.stdout or ""
     err = res.stderr or ""
-    body = out if res.returncode == 0 else f"{out}\n\n--- stderr ---\n{err}".strip()
+    if res.returncode == 0:
+        body = out
+    elif err.strip():
+        body = f"{out}\n\n--- stderr ---\n{err}".strip()
+    else:
+        body = out
 
     backend = _backend()
     sid = store.get(key, backend)
@@ -247,12 +253,63 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         await msg.reply_text(part + (footer if i == len(chunks) - 1 else ""))
 
 
+def _acquire_bot_singleton() -> None:
+    """避免多個 polling 實例搶同一 token（Telegram 409 Conflict）。"""
+    global _BOT_LOCK_FILE
+
+    lock_path = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3")).parent / "bot.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("w")
+
+    import sys
+
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as e:
+                raise RuntimeError(
+                    "已有另一個 tg_cli_relay bot 在執行。"
+                    "請先結束舊程序再啟動，否則 Telegram 會回 409 Conflict。"
+                ) from e
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as e:
+                raise RuntimeError("已有另一個 tg_cli_relay bot 在執行。") from e
+    except Exception:
+        lock_file.close()
+        raise
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    _BOT_LOCK_FILE = lock_file
+
+
 def run_bot() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("請設定 TELEGRAM_BOT_TOKEN")
 
-    logging.basicConfig(level=os.environ.get("TGR_LOG_LEVEL", "INFO"))
+    _acquire_bot_singleton()
+
+    log_level = os.environ.get("TGR_LOG_LEVEL", "INFO")
+    log_dir = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3")).parent
+    log_file = log_dir / "bot.log"
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
 
     from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters
 
@@ -264,4 +321,4 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_message))
     log.info("啟動 Telegram bot（backend=%s）", _backend())
-    app.run_polling(allowed_updates=["message"])
+    app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
