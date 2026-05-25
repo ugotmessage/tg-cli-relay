@@ -101,8 +101,17 @@ def _relay_codex(store: SessionStore, thread_key: str, workspace: str, prompt: s
     import os
 
     bin_name = os.environ.get("TGR_CODEX_BIN", "codex").strip() or "codex"
+    bypass = os.environ.get("TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     model = store.get_pref(thread_key, _model_pref_key("codex")) or store.get_pref(thread_key, "model")
-    prov = CodexCliProvider(codex_bin=bin_name, model=model)
+    prov = CodexCliProvider(
+        codex_bin=bin_name,
+        dangerously_bypass_approvals_and_sandbox=bypass,
+        model=model,
+    )
     sid = store.get(thread_key, "codex")
     res = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
     if sid is None:

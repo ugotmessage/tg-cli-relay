@@ -85,6 +85,7 @@ cp env.example .env
 | `TGR_DEFAULT_WORKSPACE` | （必填） | 代理操作的 git 工作目錄 |
 | `TGR_CURSOR_AGENT_BIN` | `agent` | Cursor Agent CLI 路徑 |
 | `TGR_CODEX_BIN` | `codex` | OpenAI Codex CLI 路徑 |
+| `TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX` | （未設定） | 設為 `1` 啟用 `--dangerously-bypass-approvals-and-sandbox` |
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
 | `TGR_CLAUDE_SKIP_PERMISSIONS` | （未設定） | 設為 `1` 啟用 `--dangerously-skip-permissions` |
 | `TGR_OPENCODE_BIN` | `opencode` | OpenCode CLI 路徑 |
@@ -179,5 +180,6 @@ sudo systemctl enable --now tg-cli-relay
 ## 安全注意事項
 
 - 務必設定 `TGR_ALLOWED_TELEGRAM_USER_IDS` 限制可操作的使用者。
+- `TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX=1` 會讓 Codex 跳過核准與 sandbox，僅適合已隔離的環境。
 - `TGR_CLAUDE_SKIP_PERMISSIONS=1` 會讓 Claude CLI 跳過所有工具授權確認，僅適合已隔離的環境。
 - Bot Token 與 API key 具有高風險寫入權限，請勿提交至版本控制。
