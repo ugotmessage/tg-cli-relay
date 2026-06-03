@@ -52,11 +52,14 @@ class CodexCliProvider:
             check=False,
             env=os.environ.copy(),
         )
-        return RunResult(stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode)
+        text = parse_text_from_jsonl(proc.stdout)
+        stdout = text if text is not None else proc.stdout
+        return RunResult(stdout=stdout, stderr=proc.stderr, returncode=proc.returncode)
 
 
-def parse_session_id_from_jsonl(blob: str) -> str | None:
-    """從 `codex exec --json` 的 stdout 嘗試找出 session / conversation id。"""
+def parse_text_from_jsonl(blob: str) -> str | None:
+    """從 `codex exec --json` 的 JSONL stdout 提取 agent 回覆文字。"""
+    parts: list[str] = []
     for line in blob.splitlines():
         line = line.strip()
         if not line:
@@ -67,13 +70,32 @@ def parse_session_id_from_jsonl(blob: str) -> str | None:
             continue
         if not isinstance(obj, dict):
             continue
-        for key in (
-            "session_id",
-            "sessionId",
-            "conversation_id",
-            "conversationId",
-            "id",
-        ):
+        if obj.get("type") == "item.completed":
+            item = obj.get("item", {})
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text", "")
+                if text:
+                    parts.append(text)
+    return "\n".join(parts) if parts else None
+
+
+def parse_session_id_from_jsonl(blob: str) -> str | None:
+    """從 `codex exec --json` 的 stdout 找出 thread id（用於 resume）。"""
+    for line in blob.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "thread.started":
+            val = obj.get("thread_id")
+            if isinstance(val, str) and val:
+                return val
+        for key in ("session_id", "sessionId", "conversation_id", "conversationId"):
             val = obj.get(key)
             if isinstance(val, str) and val:
                 return val
