@@ -25,6 +25,7 @@ class ClaudeCliProvider:
     claude_bin: str = "claude"
     dangerously_skip_permissions: bool = False
     model: str | None = None
+    timeout_seconds: int = 1800
     name: str = "claude"
 
     def run_turn(
@@ -42,22 +43,33 @@ class ClaudeCliProvider:
         if session_id:
             cmd.extend(["--resume", session_id])
         env = os.environ.copy()
-        # macOS Keychain OAuth token（oat01-…）被全域注入時，claude CLI 會把它當 API key
-        # 導致 "Invalid API key" 錯誤；偵測到 OAuth 格式就移除，讓 CLI 走 Keychain 路徑。
-        # 真正的 API key（sk-ant-…）不受影響。
+        # TG relay 固定走 Claude Code 訂閱／Keychain OAuth（claude --print），不吃 API key。
+        # 全域 launchctl setenv（例如 ai.openclaw.setenv-ai-keys）可能注入 sk-ant-oat01-…（OAuth token
+        # 誤當 API key），若留著會變成 HTTP API 路線並出現 Invalid API key。
         api_key = env.get("ANTHROPIC_API_KEY", "")
-        if api_key.startswith("oat01-"):
+        if not api_key or api_key.startswith("oat01-") or api_key.startswith("sk-ant-oat01-"):
             env.pop("ANTHROPIC_API_KEY", None)
 
-        proc = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=workspace,
-            env=env,
-        )
+        timeout = self.timeout_seconds if self.timeout_seconds > 0 else None
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=workspace,
+                env=env,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            err = (exc.stderr or "").strip()
+            msg = f"claude 執行逾時（>{self.timeout_seconds} 秒）"
+            return RunResult(
+                stdout=exc.stdout or "",
+                stderr=f"{err}\n{msg}".strip() if err else msg,
+                returncode=124,
+            )
         return RunResult(stdout=proc.stdout or "", stderr=proc.stderr or "", returncode=proc.returncode)
 
 
