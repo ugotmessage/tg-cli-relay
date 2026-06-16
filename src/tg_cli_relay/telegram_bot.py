@@ -263,7 +263,10 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
 
     async def _typing_loop() -> None:
         while True:
-            await msg.chat.send_action(action=ChatAction.TYPING)
+            try:
+                await msg.chat.send_action(action=ChatAction.TYPING)
+            except Exception as exc:
+                log.warning("Telegram typing action failed; continuing without typing indicator: %s", exc)
             await asyncio.sleep(4)
 
     typing_task = asyncio.create_task(_typing_loop())
@@ -291,7 +294,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         return
     finally:
         typing_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await typing_task
 
     out = res.stdout or ""
@@ -387,4 +390,4 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_message))
     log.info("啟動 Telegram bot（default_backend=%s）", _default_backend())
-    app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
+    app.run_polling(allowed_updates=["message"], drop_pending_updates=True, bootstrap_retries=-1)
