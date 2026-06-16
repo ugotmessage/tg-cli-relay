@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 
@@ -73,27 +74,165 @@ class ClaudeCliProvider:
         return RunResult(stdout=proc.stdout or "", stderr=proc.stderr or "", returncode=proc.returncode)
 
 
+_BG_PROC_PREFIX_RE = re.compile(
+    r"^\[Background process proc_[a-f0-9]+ finished with exit code \d+\]?~?\s*",
+    re.IGNORECASE,
+)
+_BG_FINAL_OUTPUT_RE = re.compile(r"Here's the final output:\s*", re.IGNORECASE)
+
+_JSON_NOISE_MARKERS = (
+    '"modelUsage"',
+    '"terminal_reason"',
+    '"total_cost_usd"',
+    '"cache_read_input_tokens"',
+    '"permission_denials"',
+    '"subagent_type"',
+    '"parent_tool_use_id"',
+    '"server_tool_use"',
+)
+
+
+def _looks_like_json_noise(text: str) -> bool:
+    t = text.strip()
+    if not t:
+        return True
+    if t.startswith("{") and any(marker in t for marker in _JSON_NOISE_MARKERS):
+        return True
+    if any(marker in t for marker in _JSON_NOISE_MARKERS) and (
+        t.startswith('"') or '":{' in t[:120] or t.startswith("tool_use")
+    ):
+        return True
+    return False
+
+
+def _sanitize_claude_display_text(text: str) -> str:
+    t = text.strip()
+    if not t or _looks_like_json_noise(t):
+        return ""
+
+    if t.startswith("[Background process proc_"):
+        t = _BG_PROC_PREFIX_RE.sub("", t, count=1)
+        t = _BG_FINAL_OUTPUT_RE.sub("", t, count=1).strip()
+        if not t or _looks_like_json_noise(t):
+            return ""
+
+    return t
+
+
+def _try_parse_json_object(line: str) -> dict | None:
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    start = line.find("{")
+    if start < 0:
+        return None
+    try:
+        obj = json.loads(line[start:])
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_claude_session_id(obj: dict) -> str | None:
+    sid_raw = obj.get("session_id") or obj.get("sessionId")
+    return str(sid_raw) if sid_raw else None
+
+
+def _extract_claude_display_text(obj: dict) -> str | None:
+    """從單一 Claude JSON 事件取出可顯示給使用者的文字。"""
+    if not isinstance(obj, dict):
+        return None
+
+    typ = obj.get("type")
+    if typ == "result":
+        result = obj.get("result")
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+        return None
+
+    # 單一 JSON 結果（舊版 --output-format json）
+    for key in ("result", "content", "text"):
+        val = obj.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # stream-json：assistant 訊息
+    if typ == "assistant":
+        message = obj.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        t = block.get("text", "")
+                        if isinstance(t, str) and t.strip():
+                            parts.append(t.strip())
+                if parts:
+                    return "\n".join(parts)
+
+    return None
+
+
 def parse_claude_output(blob: str | None) -> tuple[str, str | None]:
-    """解析 `claude --output-format json` 的輸出。
+    """解析 `claude --print --output-format json` 的輸出。
+
+    新版 Claude Code 在 subagent / stream 情境可能輸出多行 JSONL；
+    僅提取最終 `result` 或 assistant 文字，不把內部事件轉發到 TG。
 
     Returns:
         (display_text, session_id)
-        display_text：要顯示給使用者的回覆文字。
-        session_id：若解析成功則為 str，否則為 None。
     """
     if not blob:
         return "", None
     raw = blob.strip()
     if not raw:
         return "", None
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw, None
-    if not isinstance(obj, dict):
-        return raw, None
 
-    text = obj.get("result") or obj.get("content") or obj.get("text") or ""
-    sid_raw = obj.get("session_id") or obj.get("sessionId")
-    session_id = str(sid_raw) if sid_raw else None
-    return str(text), session_id
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    session_id: str | None = None
+    display_parts: list[str] = []
+
+    def ingest(obj: dict) -> None:
+        nonlocal session_id
+        sid = _extract_claude_session_id(obj)
+        if sid:
+            session_id = sid
+        text = _extract_claude_display_text(obj)
+        if text:
+            cleaned = _sanitize_claude_display_text(text)
+            if cleaned:
+                display_parts.append(cleaned)
+
+    if len(lines) == 1:
+        obj = _try_parse_json_object(lines[0])
+        if obj is not None:
+            ingest(obj)
+            if display_parts:
+                return display_parts[-1], session_id
+
+        cleaned = _sanitize_claude_display_text(raw)
+        if cleaned:
+            return cleaned, None
+        return "", None
+
+    for line in lines:
+        obj = _try_parse_json_object(line)
+        if obj is not None:
+            ingest(obj)
+
+    if display_parts:
+        return display_parts[-1], session_id
+
+    cleaned = _sanitize_claude_display_text(raw)
+    if cleaned:
+        return cleaned, session_id
+    return "", session_id

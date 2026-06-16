@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 from pathlib import Path
 
 from tg_cli_relay.relay import relay_turn
 from tg_cli_relay.session_store import Backend, SessionStore
+from tg_cli_relay.telegram_app import build_resilient_application
 from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
 
 log = logging.getLogger(__name__)
@@ -245,6 +247,32 @@ def _chunk_reply(text: str) -> list[str]:
     return [t[i : i + TG_CHUNK] for i in range(0, len(t), TG_CHUNK)]
 
 
+def _is_transient_telegram_error(exc: Exception) -> bool:
+    try:
+        from telegram.error import NetworkError, TimedOut
+
+        if isinstance(exc, (TimedOut, NetworkError)):
+            return True
+    except Exception:
+        pass
+    message = str(exc).lower()
+    return "timed out" in message or "bad gateway" in message or "502" in message
+
+
+async def _reply_text_with_retry(message, text: str, retries: int = 2, delay_seconds: float = 2.0) -> None:  # type: ignore[no-untyped-def]
+    attempt = 0
+    while True:
+        try:
+            await message.reply_text(text)
+            return
+        except Exception as exc:
+            if attempt >= retries or not _is_transient_telegram_error(exc):
+                raise
+            attempt += 1
+            log.warning("reply_text 暫時失敗，%s 秒後重試 (%s/%s): %s", delay_seconds, attempt, retries, exc)
+            await asyncio.sleep(delay_seconds)
+
+
 async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     if update.effective_user is None or update.effective_chat is None:
         return
@@ -290,7 +318,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         )
     except Exception:
         log.exception("relay_turn 失敗 thread=%s", key)
-        await msg.reply_text("執行失敗，請查看伺服器日誌。")
+        await _reply_text_with_retry(msg, "執行失敗，請查看伺服器日誌。")
         return
     finally:
         typing_task.cancel()
@@ -318,14 +346,30 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
 
     chunks = _chunk_reply(body)
     for i, part in enumerate(chunks):
-        await msg.reply_text(part + (footer if i == len(chunks) - 1 else ""))
+        await _reply_text_with_retry(msg, part + (footer if i == len(chunks) - 1 else ""))
 
 
-def _acquire_bot_singleton() -> None:
+def _bot_singleton_lock_path(token: str) -> Path:
+    """Return a per-bot lock path so multiple relay bots can share one data dir.
+
+    The singleton guard is meant to prevent two polling processes from using the
+    same Telegram bot token (409 Conflict). It must not block separate bots such
+    as Claude and Cursor when their session DBs live in the same directory.
+    """
+    explicit = os.environ.get("TGR_BOT_LOCK_PATH", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+
+    base_dir = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3")).parent
+    fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+    return base_dir / f"bot-{fingerprint}.lock"
+
+
+def _acquire_bot_singleton(token: str) -> None:
     """避免多個 polling 實例搶同一 token（Telegram 409 Conflict）。"""
     global _BOT_LOCK_FILE
 
-    lock_path = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3")).parent / "bot.lock"
+    lock_path = _bot_singleton_lock_path(token)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("w")
 
@@ -365,7 +409,7 @@ def run_bot() -> None:
     if not token:
         raise RuntimeError("請設定 TELEGRAM_BOT_TOKEN")
 
-    _acquire_bot_singleton()
+    _acquire_bot_singleton(token)
 
     log_level = os.environ.get("TGR_LOG_LEVEL", "INFO")
     log_dir = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3")).parent
@@ -379,9 +423,9 @@ def run_bot() -> None:
         ],
     )
 
-    from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters
+    from telegram.ext import CommandHandler, MessageHandler, filters
 
-    app: Application = ApplicationBuilder().token(token).build()
+    app = build_resilient_application(token)
     app.add_handler(CommandHandler("reset", _cmd_reset))
     app.add_handler(CommandHandler("new", _cmd_reset))
     app.add_handler(CommandHandler("status", _cmd_status))
