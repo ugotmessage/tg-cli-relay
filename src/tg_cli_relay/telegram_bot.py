@@ -7,7 +7,7 @@ import logging
 import os
 from pathlib import Path
 
-from tg_cli_relay.relay import relay_turn
+from tg_cli_relay.relay import relay_turn, resolve_cursor_model
 from tg_cli_relay.session_store import Backend, SessionStore
 from tg_cli_relay.telegram_app import build_resilient_application
 from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
@@ -71,6 +71,12 @@ def _model_pref_key(backend: Backend) -> str:
     return f"model:{backend}"
 
 
+def _get_model(store: SessionStore, thread_key: str, backend: Backend) -> str | None:
+    if backend == "cursor":
+        return resolve_cursor_model(store, thread_key)
+    return store.get_pref(thread_key, _model_pref_key(backend))
+
+
 def _models_for_backend(backend: Backend) -> list[str]:
     if backend == "claude":
         from tg_cli_relay.providers.claude_cli import CLAUDE_MODELS
@@ -95,7 +101,7 @@ def _format_model_catalog(store: SessionStore, thread_key: str, active_backend: 
     lines = [f"目前 provider: {active_backend}", ""]
     for backend in _enabled_backends():
         marker = "*" if backend == active_backend else "-"
-        current = store.get_pref(thread_key, _model_pref_key(backend)) or "(預設)"
+        current = _get_model(store, thread_key, backend) or "(預設)"
         lines.append(f"{marker} {backend} 目前模型: {current}")
         models = _models_for_backend(backend)
         if models:
@@ -150,7 +156,7 @@ async def _cmd_status(update, context) -> None:  # type: ignore[no-untyped-def]
         f"Provider: {backend}",
         f"工作目錄: {ws}",
         f"Session: {(sid[:8] + '...') if sid else '（尚未建立）'}",
-        f"模型: {store.get_pref(key, _model_pref_key(backend)) or '(預設)'}",
+        f"模型: {_get_model(store, key, backend) or '(預設)'}",
         f"可用 providers: {', '.join(_enabled_backends())}",
     ]
     await update.message.reply_text("\n".join(lines))
@@ -208,7 +214,7 @@ async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
         backend = maybe_backend
         store.set_pref(key, "backend", backend)
         if len(args) == 1:
-            current = store.get_pref(key, _model_pref_key(backend)) or "(預設)"
+            current = _get_model(store, key, backend) or "(預設)"
             models = "\n".join(f"  {m}" for m in _models_for_backend(backend))
             await update.message.reply_text(
                 f"Provider 已切換至 {backend}\n目前模型: {current}\n\n可用模型:\n{models}"
@@ -335,7 +341,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         body = out
 
     sid = store.get(key, backend)
-    model = store.get_pref(key, _model_pref_key(backend))
+    model = _get_model(store, key, backend)
     footer_parts = []
     footer_parts.append(backend)
     if model:

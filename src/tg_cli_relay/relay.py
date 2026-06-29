@@ -30,6 +30,28 @@ def _model_pref_key(backend: Backend) -> str:
     return f"model:{backend}"
 
 
+def resolve_cursor_model(store: SessionStore, thread_key: str) -> str:
+    """Resolve Cursor Agent model without reading generic model prefs.
+
+    Cursor CLI persists the last --model globally, so relay must always pass an
+    explicit model. Only the cursor-specific preference/env may override auto.
+    """
+    import os
+
+    from tg_cli_relay.providers.cursor_agent import CURSOR_DEFAULT_MODEL
+
+    model = store.get_pref(thread_key, _model_pref_key("cursor"))
+    if not model:
+        model = os.environ.get("TGR_CURSOR_MODEL", "").strip()
+    return model or CURSOR_DEFAULT_MODEL
+
+
+def _get_model(store: SessionStore, thread_key: str, backend: Backend) -> str | None:
+    if backend == "cursor":
+        return resolve_cursor_model(store, thread_key)
+    return store.get_pref(thread_key, _model_pref_key(backend))
+
+
 def relay_turn(
     *,
     thread_key: str,
@@ -57,8 +79,10 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
     import os
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
-    model = store.get_pref(thread_key, _model_pref_key("cursor")) or store.get_pref(thread_key, "model")
-    prov = CursorAgentProvider(agent_bin=bin_name, model=model)
+    timeout_raw = os.environ.get("TGR_CURSOR_TIMEOUT", "600").strip() or "600"
+    timeout_seconds = int(timeout_raw)
+    model = _get_model(store, thread_key, "cursor")
+    prov = CursorAgentProvider(agent_bin=bin_name, model=model, timeout_seconds=timeout_seconds)
     sid = store.get(thread_key, "cursor")
     if not sid:
         sid = prov.create_session()
@@ -73,7 +97,7 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
     skip_perms = os.environ.get("TGR_CLAUDE_SKIP_PERMISSIONS", "").strip().lower() in ("1", "true", "yes")
     timeout_raw = os.environ.get("TGR_CLAUDE_TIMEOUT", "1800").strip() or "1800"
     timeout_seconds = int(timeout_raw)
-    model = store.get_pref(thread_key, _model_pref_key("claude")) or store.get_pref(thread_key, "model")
+    model = _get_model(store, thread_key, "claude")
     prov = ClaudeCliProvider(
         claude_bin=bin_name,
         dangerously_skip_permissions=skip_perms,
@@ -92,7 +116,7 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
     import os
 
     bin_name = os.environ.get("TGR_OPENCODE_BIN", "opencode").strip() or "opencode"
-    model = store.get_pref(thread_key, _model_pref_key("opencode")) or store.get_pref(thread_key, "model")
+    model = _get_model(store, thread_key, "opencode")
     prov = OpencodeCliProvider(opencode_bin=bin_name, model=model)
     sid = store.get(thread_key, "opencode")
     raw = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
@@ -113,7 +137,7 @@ def _relay_codex(store: SessionStore, thread_key: str, workspace: str, prompt: s
         "true",
         "yes",
     )
-    model = store.get_pref(thread_key, _model_pref_key("codex")) or store.get_pref(thread_key, "model")
+    model = _get_model(store, thread_key, "codex")
     prov = CodexCliProvider(
         codex_bin=bin_name,
         dangerously_bypass_approvals_and_sandbox=bypass,
