@@ -1,5 +1,5 @@
 [Unit]
-Description=tg-cli-relay 第一組（Telegram → Cursor，工作目錄見環境檔）
+Description=tg-cli-relay 第一組（Telegram → Cursor）
 After=network-online.target
 
 [Service]

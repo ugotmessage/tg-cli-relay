@@ -1,0 +1,20 @@
+[Unit]
+Description=tg-cli-relay 第二組（Telegram → Cursor）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/srv/tg-cli-relay
+EnvironmentFile=-/srv/tg-cli-relay/deploy/env.group2-claude-codex
+EnvironmentFile=-/srv/tg-cli-relay/deploy/env.group2.secrets
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/root/.local/bin:/root/.nvm/versions/node/v22.22.1/bin
+Environment=HOME=/root
+ExecStartPre=/srv/tg-cli-relay/deploy/check-group2-ready.sh
+ExecStart=/srv/tg-cli-relay/.venv/bin/python3 -m tg_cli_relay bot
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

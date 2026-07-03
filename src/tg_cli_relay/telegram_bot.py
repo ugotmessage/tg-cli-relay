@@ -6,7 +6,7 @@ import logging
 import os
 from pathlib import Path
 
-from tg_cli_relay.relay import relay_turn
+from tg_cli_relay.relay import effective_model_for_backend, relay_turn
 from tg_cli_relay.session_store import Backend, SessionStore
 from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
 
@@ -93,7 +93,7 @@ def _format_model_catalog(store: SessionStore, thread_key: str, active_backend: 
     lines = [f"目前 provider: {active_backend}", ""]
     for backend in _enabled_backends():
         marker = "*" if backend == active_backend else "-"
-        current = store.get_pref(thread_key, _model_pref_key(backend)) or "(預設)"
+        current = effective_model_for_backend(store, thread_key, backend)
         lines.append(f"{marker} {backend} 目前模型: {current}")
         models = _models_for_backend(backend)
         if models:
@@ -148,7 +148,7 @@ async def _cmd_status(update, context) -> None:  # type: ignore[no-untyped-def]
         f"Provider: {backend}",
         f"工作目錄: {ws}",
         f"Session: {(sid[:8] + '...') if sid else '（尚未建立）'}",
-        f"模型: {store.get_pref(key, _model_pref_key(backend)) or '(預設)'}",
+        f"模型: {effective_model_for_backend(store, key, backend)}",
         f"可用 providers: {', '.join(_enabled_backends())}",
     ]
     await update.message.reply_text("\n".join(lines))
@@ -206,7 +206,7 @@ async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
         backend = maybe_backend
         store.set_pref(key, "backend", backend)
         if len(args) == 1:
-            current = store.get_pref(key, _model_pref_key(backend)) or "(預設)"
+            current = effective_model_for_backend(store, key, backend)
             models = "\n".join(f"  {m}" for m in _models_for_backend(backend))
             await update.message.reply_text(
                 f"Provider 已切換至 {backend}\n目前模型: {current}\n\n可用模型:\n{models}"
@@ -238,10 +238,20 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
     await update.message.reply_text("\n".join(lines))
 
 
+def _sanitize_text(text: str) -> str:
+    """清理文字以避免 Telegram API 因控制字元拒絕發送。"""
+    if not text:
+        return ""
+    cleaned = text.encode("utf-8", "ignore").decode("utf-8")
+    return "".join(char for char in cleaned if ord(char) >= 32 or char in "\n\r\t")
+
+
 def _chunk_reply(text: str) -> list[str]:
-    t = text or ""
+    t = _sanitize_text(text or "").strip()
+    if not t:
+        return ["(無輸出)"]
     if len(t) <= TG_CHUNK:
-        return [t] if t else ["(無輸出)"]
+        return [t]
     return [t[i : i + TG_CHUNK] for i in range(0, len(t), TG_CHUNK)]
 
 
@@ -304,10 +314,10 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         body = out
 
     sid = store.get(key, backend)
-    model = store.get_pref(key, _model_pref_key(backend))
+    model = effective_model_for_backend(store, key, backend)
     footer_parts = []
     footer_parts.append(backend)
-    if model:
+    if model and model != "(預設)":
         footer_parts.append(model)
     if sid:
         footer_parts.append(f"session:{sid}")
@@ -315,7 +325,18 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
 
     chunks = _chunk_reply(body)
     for i, part in enumerate(chunks):
-        await msg.reply_text(part + (footer if i == len(chunks) - 1 else ""))
+        payload = part + (footer if i == len(chunks) - 1 else "")
+        try:
+            await msg.reply_text(payload)
+        except Exception as e:
+            log.error("發送訊息失敗 (part %d/%d): %s", i + 1, len(chunks), e)
+            try:
+                await msg.reply_text(
+                    f"⚠️ 回覆發送失敗 (第 {i + 1}/{len(chunks)} 部分): {str(e)[:100]}"
+                )
+            except Exception:
+                log.error("連錯誤訊息都無法發送")
+                break
 
 
 def _acquire_bot_singleton() -> None:

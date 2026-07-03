@@ -30,6 +30,25 @@ def _model_pref_key(backend: Backend) -> str:
     return f"model:{backend}"
 
 
+def resolve_cursor_model(store: SessionStore, thread_key: str) -> str:
+    """Cursor relay 使用的模型；預設 auto，僅 thread 或 env 明確指定時才覆寫。"""
+    import os
+
+    explicit = store.get_pref(thread_key, _model_pref_key("cursor"))
+    if not explicit:
+        explicit = os.environ.get("TGR_CURSOR_MODEL", "").strip()
+    if not explicit:
+        return "auto"
+    return "auto" if explicit.upper() == "AUTO" else explicit
+
+
+def effective_model_for_backend(store: SessionStore, thread_key: str, backend: Backend) -> str:
+    if backend == "cursor":
+        return resolve_cursor_model(store, thread_key)
+    model = store.get_pref(thread_key, _model_pref_key(backend))
+    return model or "(預設)"
+
+
 def relay_turn(
     *,
     thread_key: str,
@@ -57,7 +76,7 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
     import os
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
-    model = store.get_pref(thread_key, _model_pref_key("cursor")) or store.get_pref(thread_key, "model")
+    model = resolve_cursor_model(store, thread_key)
     prov = CursorAgentProvider(agent_bin=bin_name, model=model)
     sid = store.get(thread_key, "cursor")
     if not sid:
@@ -73,10 +92,12 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
     skip_perms = os.environ.get("TGR_CLAUDE_SKIP_PERMISSIONS", "").strip().lower() in ("1", "true", "yes")
     timeout_raw = os.environ.get("TGR_CLAUDE_TIMEOUT", "1800").strip() or "1800"
     timeout_seconds = int(timeout_raw)
-    model = store.get_pref(thread_key, _model_pref_key("claude")) or store.get_pref(thread_key, "model")
+    run_as = os.environ.get("TGR_CLAUDE_RUN_AS", "").strip() or None
+    model = store.get_pref(thread_key, _model_pref_key("claude"))
     prov = ClaudeCliProvider(
         claude_bin=bin_name,
         dangerously_skip_permissions=skip_perms,
+        run_as_user=run_as,
         model=model,
         timeout_seconds=timeout_seconds,
     )
@@ -92,7 +113,7 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
     import os
 
     bin_name = os.environ.get("TGR_OPENCODE_BIN", "opencode").strip() or "opencode"
-    model = store.get_pref(thread_key, _model_pref_key("opencode")) or store.get_pref(thread_key, "model")
+    model = store.get_pref(thread_key, _model_pref_key("opencode"))
     prov = OpencodeCliProvider(opencode_bin=bin_name, model=model)
     sid = store.get(thread_key, "opencode")
     raw = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
@@ -113,7 +134,7 @@ def _relay_codex(store: SessionStore, thread_key: str, workspace: str, prompt: s
         "true",
         "yes",
     )
-    model = store.get_pref(thread_key, _model_pref_key("codex")) or store.get_pref(thread_key, "model")
+    model = store.get_pref(thread_key, _model_pref_key("codex"))
     prov = CodexCliProvider(
         codex_bin=bin_name,
         dangerously_bypass_approvals_and_sandbox=bypass,

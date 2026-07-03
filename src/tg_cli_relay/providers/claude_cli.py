@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 from tg_cli_relay.providers.base import RunResult
 
@@ -24,6 +25,7 @@ class ClaudeCliProvider:
 
     claude_bin: str = "claude"
     dangerously_skip_permissions: bool = False
+    run_as_user: str | None = None
     model: str | None = None
     timeout_seconds: int = 1800
     name: str = "claude"
@@ -42,6 +44,9 @@ class ClaudeCliProvider:
             cmd.extend(["--model", self.model])
         if session_id:
             cmd.extend(["--resume", session_id])
+        knowledge_dir = os.environ.get("TGR_KNOWLEDGE_DIR", "/srv/docker/knowledge").strip()
+        if knowledge_dir and Path(knowledge_dir).is_dir():
+            cmd.extend(["--add-dir", knowledge_dir])
         env = os.environ.copy()
         # TG relay 固定走 Claude Code 訂閱／Keychain OAuth（claude --print），不吃 API key。
         # 全域 launchctl setenv（例如 ai.openclaw.setenv-ai-keys）可能注入 sk-ant-oat01-…（OAuth token
@@ -49,6 +54,11 @@ class ClaudeCliProvider:
         api_key = env.get("ANTHROPIC_API_KEY", "")
         if not api_key or api_key.startswith("oat01-") or api_key.startswith("sk-ant-oat01-"):
             env.pop("ANTHROPIC_API_KEY", None)
+
+        if self.run_as_user and os.geteuid() == 0:
+            for key in ("HOME", "USER", "LOGNAME", "SUDO_USER"):
+                env.pop(key, None)
+            cmd = ["sudo", "-n", "-u", self.run_as_user, "-H", "--", *cmd]
 
         timeout = self.timeout_seconds if self.timeout_seconds > 0 else None
         try:

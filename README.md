@@ -55,7 +55,7 @@ SQLite            ← sessions 表（thread_key → session_id）
 | `/model <provider> <id>` | 全部 | 切換 provider 並設定該 provider 的模型 |
 | `/help` | 全部 | 顯示可用指令 |
 
-> 每個 Telegram thread 會保存自己的 provider。模型偏好也依 provider 分開保存，例如 Claude 與 Codex 各自保留自己的模型設定。
+> 每個 Telegram thread 會保存自己的 provider。模型偏好依 provider 分開保存（`model:cursor`、`model:claude` 等）。**Cursor relay 預設一律 `--model auto`**，除非你透過 `/model` 或 `TGR_CURSOR_MODEL` 明確指定；不會沿用舊版通用 `model` 偏好或其它程式的 CLI 指定。
 
 ---
 
@@ -84,6 +84,7 @@ cp env.example .env
 | `TGR_SESSION_DB` | `./data/sessions.sqlite3` | SQLite 路徑 |
 | `TGR_DEFAULT_WORKSPACE` | （必填） | 代理操作的 git 工作目錄 |
 | `TGR_CURSOR_AGENT_BIN` | `agent` | Cursor Agent CLI 路徑 |
+| `TGR_CURSOR_MODEL` | `auto` | Cursor relay 預設模型；僅影響本 relay，不受其它 CLI 呼叫或舊版 `model` 偏好影響。可用 Telegram `/model <id>` 或 `model:cursor` 覆寫 |
 | `TGR_CODEX_BIN` | `codex` | OpenAI Codex CLI 路徑 |
 | `TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX` | （未設定） | 設為 `1` 啟用 `--dangerously-bypass-approvals-and-sandbox` |
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |

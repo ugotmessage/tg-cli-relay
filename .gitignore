@@ -1,5 +1,7 @@
 .env
 deploy/env.group1-cursor
+deploy/env.group2-claude-codex
+deploy/env.group2.secrets
 .venv/
 bot.log
 run/
