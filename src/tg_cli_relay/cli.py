@@ -39,6 +39,9 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("bot", help="啟動 Telegram bot（需安裝 extras: telegram）")
 
+    cleanup = sub.add_parser("cleanup-uploads", help="清理超過保留期限的 Telegram 上傳暫存")
+    cleanup.add_argument("--dry-run", action="store_true", help="僅顯示設定，不刪除")
+
     args = p.parse_args(argv)
     if args.cmd == "doctor":
         db = os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3"))
@@ -68,6 +71,18 @@ def main(argv: list[str] | None = None) -> int:
         from tg_cli_relay.telegram_bot import run_bot
 
         run_bot()
+        return 0
+
+    if args.cmd == "cleanup-uploads":
+        from tg_cli_relay.attachments import AttachmentConfig, cleanup_upload_dirs
+
+        cfg = AttachmentConfig.from_env()
+        if args.dry_run:
+            print("TGR_UPLOAD_DIR =", cfg.upload_dir)
+            print("TGR_UPLOAD_RETENTION_HOURS =", cfg.upload_retention_hours)
+            return 0
+        removed = cleanup_upload_dirs(cfg)
+        print(f"已清理 {removed} 個過期 upload 目錄")
         return 0
 
     assert args.cmd == "run"

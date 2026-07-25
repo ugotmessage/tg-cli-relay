@@ -7,6 +7,19 @@ import logging
 import os
 from pathlib import Path
 
+from tg_cli_relay.attachments import (
+    AttachmentConfig,
+    DownloadedAttachment,
+    build_attachment_prompt,
+    cleanup_upload_dirs,
+    download_attachment_to_path,
+    extract_incoming_attachment,
+    is_mime_allowed,
+    is_transient_telegram_error,
+    parse_tgr_file_markers,
+    prepare_download_path,
+    resolve_outbound_files,
+)
 from tg_cli_relay.relay import relay_turn, resolve_cursor_model
 from tg_cli_relay.session_store import Backend, SessionStore
 from tg_cli_relay.telegram_app import build_resilient_application
@@ -236,12 +249,19 @@ async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
 async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
+    cfg = _attachment_config()
     lines = [
         "/reset — 清除對話，開啟新 session",
         "/status — 查看目前後端與 session 狀態",
         "/provider [名稱] — 查看或切換 CLI provider",
         "/model [provider] [名稱] — 查看或切換模型",
         "/help — 顯示此說明",
+        "",
+        "附件：可傳 document / photo / audio / voice / video（含 caption）。",
+        f"下載上限：{cfg.max_download_bytes} bytes；回傳上限：{cfg.max_upload_bytes} bytes。",
+        "Agent 以獨立一行 TGR_FILE:/abs/path 宣告回傳檔案（最多 "
+        f"{cfg.max_files_per_message} 個）。",
+        f"上傳暫存保留 {cfg.upload_retention_hours} 小時後可清理。",
     ]
     await update.message.reply_text("\n".join(lines))
 
@@ -254,15 +274,7 @@ def _chunk_reply(text: str) -> list[str]:
 
 
 def _is_transient_telegram_error(exc: Exception) -> bool:
-    try:
-        from telegram.error import NetworkError, TimedOut
-
-        if isinstance(exc, (TimedOut, NetworkError)):
-            return True
-    except Exception:
-        pass
-    message = str(exc).lower()
-    return "timed out" in message or "bad gateway" in message or "502" in message
+    return is_transient_telegram_error(exc)
 
 
 async def _reply_text_with_retry(message, text: str, retries: int = 2, delay_seconds: float = 2.0) -> None:  # type: ignore[no-untyped-def]
@@ -279,17 +291,183 @@ async def _reply_text_with_retry(message, text: str, retries: int = 2, delay_sec
             await asyncio.sleep(delay_seconds)
 
 
+async def _reply_document_with_retry(message, path: Path, retries: int = 2, delay_seconds: float = 2.0) -> None:  # type: ignore[no-untyped-def]
+    attempt = 0
+    while True:
+        try:
+            with path.open("rb") as fh:
+                await message.reply_document(document=fh, filename=path.name)
+            return
+        except Exception as exc:
+            if attempt >= retries or not _is_transient_telegram_error(exc):
+                raise
+            attempt += 1
+            log.warning(
+                "reply_document 暫時失敗，%s 秒後重試 (%s/%s): %s",
+                delay_seconds,
+                attempt,
+                retries,
+                exc,
+            )
+            await asyncio.sleep(delay_seconds)
+
+
+def _bot_fingerprint_from_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+
+def _attachment_config() -> AttachmentConfig:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    fp = _bot_fingerprint_from_token(token) if token else "default"
+    return AttachmentConfig.from_env(bot_fingerprint=fp)
+
+
+def _supported_types_hint() -> str:
+    return (
+        "請傳送純文字，或支援的附件（document、photo、audio、voice、video）。"
+        "附件可附 caption 作為處理說明。"
+    )
+
+
+async def _download_incoming_attachment(
+    msg,
+    attachment_config: AttachmentConfig,
+) -> tuple[DownloadedAttachment | None, str | None]:
+    """Download one attachment; returns (result, user_error)."""
+    incoming = extract_incoming_attachment(msg)
+    if incoming is None:
+        return None, None
+
+    if incoming.file_size is not None and incoming.file_size > attachment_config.max_download_bytes:
+        return None, (
+            f"附件大小（{incoming.file_size} bytes）超過上限 "
+            f"（{attachment_config.max_download_bytes} bytes）。"
+        )
+
+    if incoming.mime_type and not is_mime_allowed(incoming.mime_type, attachment_config.allowed_download_mime_types):
+        return None, "不支援的附件類型。"
+
+    chat_id = msg.chat_id
+    message_id = msg.message_id
+    existing: set[str] = set()
+    try:
+        dest = prepare_download_path(attachment_config, chat_id, message_id, incoming, existing)
+    except ValueError as exc:
+        log.warning("prepare_download_path 失敗: %s", exc)
+        return None, "無法建立安全的本機儲存路徑。"
+
+    try:
+        size = await download_attachment_to_path(
+            msg.get_bot(),
+            incoming,
+            dest,
+            max_bytes=attachment_config.max_download_bytes,
+        )
+    except ValueError as exc:
+        if "超過上限" in str(exc):
+            return None, str(exc)
+        log.exception("附件下載大小驗證失敗")
+        return None, "附件下載失敗（大小驗證）。"
+    except Exception:
+        log.exception("Telegram 附件下載失敗 chat=%s msg=%s", chat_id, message_id)
+        return None, "附件下載暫時失敗，請稍後再試。"
+
+    mime_confirmed = bool(incoming.mime_type)
+    return DownloadedAttachment(
+        local_path=dest,
+        original_name=incoming.original_name or dest.name,
+        mime_type=incoming.mime_type,
+        mime_confirmed=mime_confirmed,
+        size_bytes=size,
+        caption=msg.caption,
+    ), None
+
+
+async def _send_relay_output(
+    msg,
+    body: str,
+    *,
+    backend: Backend,
+    model: str | None,
+    sid: str | None,
+    attachment_config: AttachmentConfig,
+) -> None:
+    parsed = parse_tgr_file_markers(body)
+    upload_paths, upload_errors = resolve_outbound_files(
+        parsed.marker_paths,
+        attachment_config,
+        existing_errors=parsed.marker_errors,
+    )
+
+    footer_parts: list[str] = [backend]
+    if model:
+        footer_parts.append(model)
+    if sid:
+        footer_parts.append(f"session:{sid}")
+    footer = "\n\n— " + " · ".join(footer_parts) if footer_parts else ""
+
+    text_body = parsed.display_text
+    if upload_errors:
+        err_block = "\n".join(upload_errors)
+        text_body = f"{text_body}\n\n{err_block}".strip() if text_body else err_block
+
+    if not text_body and not upload_paths:
+        text_body = "(無輸出)"
+
+    chunks = _chunk_reply(text_body)
+    for i, part in enumerate(chunks):
+        await _reply_text_with_retry(msg, part + (footer if i == len(chunks) - 1 else ""))
+
+    upload_failures: list[str] = []
+    for path in upload_paths:
+        try:
+            await _reply_document_with_retry(msg, path)
+        except Exception:
+            log.exception("Telegram 附件上傳失敗 path=%s", path.name)
+            upload_failures.append(f"無法傳送附件：{path.name}")
+
+    if upload_failures:
+        await _reply_text_with_retry(msg, "\n".join(upload_failures))
+
+
 async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     if update.effective_user is None or update.effective_chat is None:
         return
-    allow = _allowed_ids()
-    if allow is not None and update.effective_user.id not in allow:
+    if not _check_auth(update):
         log.warning("拒絕未授權使用者: %s", update.effective_user.id)
         return
 
     msg = update.message
-    if msg is None or not (msg.text and msg.text.strip()):
-        await update.effective_chat.send_message("請傳送純文字訊息。")
+    if msg is None:
+        return
+
+    text = (msg.text or "").strip()
+    has_attachment = extract_incoming_attachment(msg) is not None
+
+    if not text and not has_attachment:
+        await update.effective_chat.send_message(_supported_types_hint())
+        return
+
+    attachment_config = _attachment_config()
+    prompt: str | None = None
+
+    if has_attachment:
+        downloaded, dl_err = await _download_incoming_attachment(msg, attachment_config)
+        if dl_err:
+            await _reply_text_with_retry(msg, dl_err)
+            return
+        if downloaded is None:
+            await _reply_text_with_retry(msg, "無法處理附件。")
+            return
+        prompt = build_attachment_prompt(downloaded)
+        try:
+            cleanup_upload_dirs(attachment_config)
+        except Exception:
+            log.exception("upload retention cleanup 失敗")
+    elif text:
+        prompt = text
+    else:
+        await update.effective_chat.send_message(_supported_types_hint())
         return
 
     # 先顯示 typing，讓使用者知道訊息已收到且正在處理。
@@ -319,7 +497,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
             relay_turn,
             thread_key=key,
             backend=backend,
-            prompt=msg.text.strip(),
+            prompt=prompt,
             store=store,
         )
     except Exception:
@@ -342,17 +520,14 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
 
     sid = store.get(key, backend)
     model = _get_model(store, key, backend)
-    footer_parts = []
-    footer_parts.append(backend)
-    if model:
-        footer_parts.append(model)
-    if sid:
-        footer_parts.append(f"session:{sid}")
-    footer = "\n\n— " + " · ".join(footer_parts) if footer_parts else ""
-
-    chunks = _chunk_reply(body)
-    for i, part in enumerate(chunks):
-        await _reply_text_with_retry(msg, part + (footer if i == len(chunks) - 1 else ""))
+    await _send_relay_output(
+        msg,
+        body,
+        backend=backend,
+        model=model,
+        sid=sid,
+        attachment_config=attachment_config,
+    )
 
 
 def _bot_singleton_lock_path(token: str) -> Path:
@@ -438,6 +613,9 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("provider", _cmd_provider))
     app.add_handler(CommandHandler("model", _cmd_model))
     app.add_handler(CommandHandler("help", _cmd_help))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_message))
+    content_filter = (
+        filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VOICE | filters.VIDEO
+    ) & ~filters.COMMAND
+    app.add_handler(MessageHandler(content_filter, _on_message))
     log.info("啟動 Telegram bot（default_backend=%s）", _default_backend())
     app.run_polling(allowed_updates=["message"], drop_pending_updates=True, bootstrap_retries=-1)

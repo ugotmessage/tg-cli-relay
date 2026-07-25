@@ -91,6 +91,21 @@ cp env.example .env
 | `TGR_OPENCODE_BIN` | `opencode` | OpenCode CLI 路徑 |
 | `TELEGRAM_BOT_TOKEN` | （必填） | BotFather 取得的 token |
 | `TGR_ALLOWED_TELEGRAM_USER_IDS` | （留空不限制） | 允許使用的 Telegram user ID，逗號分隔 |
+| `TGR_UPLOAD_DIR` | `~/.hermes/tg-relay-uploads` | Telegram 附件下載暫存目錄 |
+| `TGR_MAX_DOWNLOAD_BYTES` | `20971520`（20 MiB） | 單檔下載大小上限 |
+| `TGR_MAX_UPLOAD_BYTES` | `20971520` | Agent 回傳附件大小上限 |
+| `TGR_MAX_FILES_PER_MESSAGE` | `5` | 單次回覆最多回傳檔案數 |
+| `TGR_UPLOAD_RETENTION_HOURS` | `72` | 下載暫存保留時間 |
+| `TGR_ALLOWED_UPLOAD_ROOTS` | `TGR_UPLOAD_DIR` | 出站 `TGR_FILE:` 允許的根目錄，逗號分隔 |
+
+---
+
+## Telegram 附件
+
+- **接收**：支援 document、photo（最高解析度）、audio、voice、video；caption 作為處理指示。
+- **回傳**：Agent stdout 以獨立一行 `TGR_FILE:/absolute/path` 宣告檔案（最多 5 個）；marker 不會顯示給使用者。
+- **清理**：`python3 -m tg_cli_relay cleanup-uploads`（可設 cron）；成功下載後也會做 bounded cleanup。
+- 僅 **allowlist 內的 Telegram user** 可下載附件。
 
 ---
 
