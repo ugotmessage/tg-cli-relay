@@ -15,11 +15,14 @@ import pytest
 from tg_cli_relay import attachments
 from tg_cli_relay.attachments import (
     AttachmentConfig,
+    DEFAULT_ALLOWED_DOWNLOAD_MIME_TYPES,
     IncomingAttachment,
     build_attachment_prompt,
     cleanup_upload_dirs,
     download_attachment_to_path,
     extract_incoming_attachment,
+    is_attachment_mime_confirmed,
+    is_incoming_attachment_allowed,
     parse_tgr_file_markers,
     prepare_download_path,
     resolve_outbound_files,
@@ -525,3 +528,107 @@ def test_parse_tgr_file_invalid_marker():
     parsed = parse_tgr_file_markers("TGR_FILE:\nTGR_FILE: /bad path\nok")
     assert parsed.display_text == "ok"
     assert parsed.marker_errors
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "file_name", "allowed", "expected"),
+    [
+        ("text/markdown", "notes.md", DEFAULT_ALLOWED_DOWNLOAD_MIME_TYPES, True),
+        ("application/octet-stream", "notes.md", DEFAULT_ALLOWED_DOWNLOAD_MIME_TYPES, True),
+        ("application/octet-stream", "notes.exe", DEFAULT_ALLOWED_DOWNLOAD_MIME_TYPES, False),
+        ("application/x-msdownload", "notes.md", DEFAULT_ALLOWED_DOWNLOAD_MIME_TYPES, False),
+    ],
+)
+def test_incoming_attachment_mime_policy(mime_type, file_name, allowed, expected):
+    assert (
+        is_incoming_attachment_allowed(mime_type, file_name, allowed) is expected
+    )
+
+
+def test_md_text_markdown_download_and_prompt(tmp_path):
+    cfg = _cfg(
+        tmp_path,
+        max_download_bytes=4096,
+        allowed_download_mime_types=DEFAULT_ALLOWED_DOWNLOAD_MIME_TYPES,
+    )
+    msg = _doc_msg(
+        document=SimpleNamespace(
+            file_id="fid-md",
+            file_unique_id="uniq-md",
+            file_name="handoff.md",
+            mime_type="text/markdown",
+            file_size=50,
+        )
+    )
+    incoming = extract_incoming_attachment(msg)
+    assert incoming is not None
+    dest = prepare_download_path(cfg, msg.chat_id, msg.message_id, incoming, set())
+
+    async def _run():
+        bot = AsyncMock()
+
+        async def _get_file(file_id):
+            assert file_id == "fid-md"
+            f = AsyncMock()
+            f.download_to_drive = AsyncMock(
+                side_effect=lambda **kwargs: Path(kwargs["custom_path"]).write_text("# title\n", encoding="utf-8")
+            )
+            return f
+
+        bot.get_file = _get_file
+        size = await download_attachment_to_path(bot, incoming, dest, max_bytes=4096)
+        downloaded = attachments.DownloadedAttachment(
+            local_path=dest,
+            original_name=incoming.original_name or dest.name,
+            mime_type=incoming.mime_type,
+            mime_confirmed=is_attachment_mime_confirmed(
+                incoming.mime_type, incoming.original_name, cfg.allowed_download_mime_types
+            ),
+            size_bytes=size,
+            caption=msg.caption,
+        )
+        prompt = build_attachment_prompt(downloaded)
+        assert "handoff.md" in prompt
+        assert "text/markdown" in prompt
+        assert "類型未確認" not in prompt
+
+    asyncio.run(_run())
+
+
+def test_md_octet_stream_download_prompt_mime_unconfirmed(tmp_path):
+    from tg_cli_relay import telegram_bot
+
+    cfg = _cfg(
+        tmp_path,
+        max_download_bytes=4096,
+        allowed_download_mime_types=DEFAULT_ALLOWED_DOWNLOAD_MIME_TYPES,
+    )
+    msg = _doc_msg(
+        document=SimpleNamespace(
+            file_id="fid-oct",
+            file_unique_id="uniq-oct",
+            file_name="notes.md",
+            mime_type="application/octet-stream",
+            file_size=40,
+        )
+    )
+
+    async def _run():
+        with patch.object(
+            telegram_bot,
+            "download_attachment_to_path",
+            new=AsyncMock(return_value=12),
+        ):
+            with patch.object(telegram_bot, "prepare_download_path") as prep:
+                dest = tmp_path / "uploads" / "testbot" / "42" / "99" / "notes.md"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                prep.return_value = dest
+                result, err = await telegram_bot._download_incoming_attachment(msg, cfg)
+                assert err is None
+                assert result is not None
+                assert result.mime_type == "application/octet-stream"
+                assert result.mime_confirmed is False
+                prompt = build_attachment_prompt(result)
+                assert "類型未確認" in prompt
+
+    asyncio.run(_run())

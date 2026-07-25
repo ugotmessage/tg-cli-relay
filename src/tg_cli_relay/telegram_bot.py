@@ -14,7 +14,8 @@ from tg_cli_relay.attachments import (
     cleanup_upload_dirs,
     download_attachment_to_path,
     extract_incoming_attachment,
-    is_mime_allowed,
+    is_attachment_mime_confirmed,
+    is_incoming_attachment_allowed,
     is_transient_telegram_error,
     parse_tgr_file_markers,
     prepare_download_path,
@@ -344,7 +345,11 @@ async def _download_incoming_attachment(
             f"（{attachment_config.max_download_bytes} bytes）。"
         )
 
-    if incoming.mime_type and not is_mime_allowed(incoming.mime_type, attachment_config.allowed_download_mime_types):
+    if incoming.mime_type and not is_incoming_attachment_allowed(
+        incoming.mime_type,
+        incoming.original_name,
+        attachment_config.allowed_download_mime_types,
+    ):
         return None, "不支援的附件類型。"
 
     chat_id = msg.chat_id
@@ -372,7 +377,11 @@ async def _download_incoming_attachment(
         log.exception("Telegram 附件下載失敗 chat=%s msg=%s", chat_id, message_id)
         return None, "附件下載暫時失敗，請稍後再試。"
 
-    mime_confirmed = bool(incoming.mime_type)
+    mime_confirmed = is_attachment_mime_confirmed(
+        incoming.mime_type,
+        incoming.original_name,
+        attachment_config.allowed_download_mime_types,
+    )
     return DownloadedAttachment(
         local_path=dest,
         original_name=incoming.original_name or dest.name,

@@ -27,6 +27,7 @@ DEFAULT_ALLOWED_DOWNLOAD_MIME_TYPES: frozenset[str] = frozenset(
     {
         "text/plain",
         "text/markdown",
+        "text/x-markdown",
         "text/csv",
         "application/pdf",
         "application/json",
@@ -65,6 +66,12 @@ _MIME_EXTENSION_FALLBACK: dict[str, str] = {
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _MAX_SAFE_FILENAME_LEN = 200
+
+_OCTET_STREAM_MIME = "application/octet-stream"
+_OFFICE_EXTENSIONS = frozenset({".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"})
+_SAFE_EXTENSIONS_FOR_OCTET_STREAM: frozenset[str] = frozenset(
+    set(_MIME_EXTENSION_FALLBACK.values()) | _OFFICE_EXTENSIONS
+)
 
 _DANGEROUS_CLEANUP_ROOTS = frozenset({"", "/", "~"})
 
@@ -209,10 +216,48 @@ def download_dir_for_message(config: AttachmentConfig, chat_id: int, message_id:
     return config.upload_dir / fp / str(chat_id) / str(message_id)
 
 
+def _filename_extension(original_name: str | None) -> str:
+    base = (original_name or "").strip().replace("\\", "/").split("/")[-1]
+    dot = base.rfind(".")
+    if dot <= 0 or dot == len(base) - 1:
+        return ""
+    return base[dot:].lower()
+
+
 def is_mime_allowed(mime_type: str | None, allowed: frozenset[str]) -> bool:
     if not mime_type:
         return True  # unconfirmed; still subject to size limits
     return mime_type.lower() in allowed
+
+
+def is_incoming_attachment_allowed(
+    mime_type: str | None,
+    original_name: str | None,
+    allowed: frozenset[str],
+) -> bool:
+    """Allow known MIME types; for generic octet-stream, trust safe filename extensions."""
+    if not mime_type:
+        return True  # unconfirmed; still subject to size limits
+    normalized = mime_type.lower()
+    if normalized in allowed:
+        return True
+    if normalized == _OCTET_STREAM_MIME:
+        ext = _filename_extension(original_name)
+        return ext in _SAFE_EXTENSIONS_FOR_OCTET_STREAM
+    return False
+
+
+def is_attachment_mime_confirmed(
+    mime_type: str | None,
+    original_name: str | None,
+    allowed: frozenset[str],
+) -> bool:
+    if not mime_type:
+        return False
+    normalized = mime_type.lower()
+    if normalized == _OCTET_STREAM_MIME:
+        return False
+    return normalized in allowed
 
 
 def build_attachment_prompt(downloaded: DownloadedAttachment) -> str:
