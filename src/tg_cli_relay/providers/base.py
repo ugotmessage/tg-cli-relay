@@ -9,6 +9,9 @@ class RunResult:
     stdout: str
     stderr: str
     returncode: int
+    session_id: str | None = None
+    # Codex 等後端若一輪有多個 agent_message，保留分段供 Telegram 分則送出。
+    stdout_segments: list[str] | None = None
 
 
 class CliProvider(Protocol):

@@ -270,8 +270,16 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
 def _chunk_reply(text: str) -> list[str]:
     t = text or ""
     if len(t) <= TG_CHUNK:
-        return [t] if t else ["(無輸出)"]
+        return [t] if t else []
     return [t[i : i + TG_CHUNK] for i in range(0, len(t), TG_CHUNK)]
+
+
+def _chunk_segments(segments: list[str]) -> list[str]:
+    """依邏輯分段 chunk；每段獨立遵守 TG 字數上限，段與段之間不跨 chunk 合併。"""
+    chunks: list[str] = []
+    for segment in segments:
+        chunks.extend(_chunk_reply(segment))
+    return chunks
 
 
 def _is_transient_telegram_error(exc: Exception) -> bool:
@@ -400,6 +408,7 @@ async def _send_relay_output(
     model: str | None,
     sid: str | None,
     attachment_config: AttachmentConfig,
+    segments: list[str] | None = None,
 ) -> None:
     parsed = parse_tgr_file_markers(body)
     upload_paths, upload_errors = resolve_outbound_files(
@@ -415,15 +424,25 @@ async def _send_relay_output(
         footer_parts.append(f"session:{sid}")
     footer = "\n\n— " + " · ".join(footer_parts) if footer_parts else ""
 
-    text_body = parsed.display_text
+    if segments and len(segments) > 1:
+        display_segments = [
+            parse_tgr_file_markers(segment).display_text for segment in segments
+        ]
+        chunks = _chunk_segments(display_segments)
+    else:
+        text_body = parsed.display_text
+        chunks = _chunk_reply(text_body)
+
     if upload_errors:
         err_block = "\n".join(upload_errors)
-        text_body = f"{text_body}\n\n{err_block}".strip() if text_body else err_block
+        if chunks:
+            chunks[-1] = f"{chunks[-1]}\n\n{err_block}".strip()
+        else:
+            chunks = [err_block]
 
-    if not text_body and not upload_paths:
-        text_body = "(無輸出)"
+    if not chunks and not upload_paths:
+        chunks = ["(無輸出)"]
 
-    chunks = _chunk_reply(text_body)
     for i, part in enumerate(chunks):
         await _reply_text_with_retry(msg, part + (footer if i == len(chunks) - 1 else ""))
 
@@ -536,6 +555,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         model=model,
         sid=sid,
         attachment_config=attachment_config,
+        segments=res.stdout_segments,
     )
 
 

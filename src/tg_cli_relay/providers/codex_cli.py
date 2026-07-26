@@ -38,7 +38,13 @@ class CodexCliProvider:
         base: list[str] = [self.codex_bin]
         if self.model:
             base.extend(["-m", self.model])
-        exec_args: list[str] = ["exec", "-C", workspace, "--json"]
+        exec_args: list[str] = [
+            "exec",
+            "-C",
+            workspace,
+            "--json",
+            "--skip-git-repo-check",
+        ]
         if self.dangerously_bypass_approvals_and_sandbox:
             exec_args.append("--dangerously-bypass-approvals-and-sandbox")
         if session_id:
@@ -52,13 +58,22 @@ class CodexCliProvider:
             check=False,
             env=os.environ.copy(),
         )
-        text = parse_text_from_jsonl(proc.stdout)
+        session_id_from_jsonl = parse_session_id_from_jsonl(proc.stdout)
+        messages = parse_messages_from_jsonl(proc.stdout)
+        text = "\n".join(messages) if messages else None
         stdout = text if text is not None else proc.stdout
-        return RunResult(stdout=stdout, stderr=proc.stderr, returncode=proc.returncode)
+        segments = messages if len(messages) > 1 else None
+        return RunResult(
+            stdout=stdout,
+            stderr=proc.stderr,
+            returncode=proc.returncode,
+            session_id=session_id_from_jsonl,
+            stdout_segments=segments,
+        )
 
 
-def parse_text_from_jsonl(blob: str) -> str | None:
-    """從 `codex exec --json` 的 JSONL stdout 提取 agent 回覆文字。"""
+def parse_messages_from_jsonl(blob: str) -> list[str]:
+    """從 `codex exec --json` 的 JSONL stdout 提取各段 agent_message 文字。"""
     parts: list[str] = []
     for line in blob.splitlines():
         line = line.strip()
@@ -76,7 +91,13 @@ def parse_text_from_jsonl(blob: str) -> str | None:
                 text = item.get("text", "")
                 if text:
                     parts.append(text)
-    return "\n".join(parts) if parts else None
+    return parts
+
+
+def parse_text_from_jsonl(blob: str) -> str | None:
+    """從 `codex exec --json` 的 JSONL stdout 提取 agent 回覆文字（合併版）。"""
+    messages = parse_messages_from_jsonl(blob)
+    return "\n".join(messages) if messages else None
 
 
 def parse_session_id_from_jsonl(blob: str) -> str | None:
