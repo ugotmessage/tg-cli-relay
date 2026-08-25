@@ -49,6 +49,10 @@ def main(argv: list[str] | None = None) -> int:
         print("TGR_SESSION_DB =", db)
         print("TGR_DEFAULT_WORKSPACE =", ws or "(未設定)")
         print("TGR_CURSOR_AGENT_BIN =", os.environ.get("TGR_CURSOR_AGENT_BIN", "agent"))
+        print(
+            "TGR_CURSOR_MODEL =",
+            os.environ.get("TGR_CURSOR_MODEL", "").strip() or "auto（relay 預設）",
+        )
         print("TGR_CODEX_BIN =", os.environ.get("TGR_CODEX_BIN", "codex"))
         bypass = os.environ.get("TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX", "").strip().lower() in (
             "1",
@@ -60,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
             "已啟用（--dangerously-bypass-approvals-and-sandbox）" if bypass else "未啟用",
         )
         print("TGR_CLAUDE_BIN =", os.environ.get("TGR_CLAUDE_BIN", "claude"))
+        print("TGR_CLAUDE_RUN_AS =", os.environ.get("TGR_CLAUDE_RUN_AS", "(未設定)"))
         skip = os.environ.get("TGR_CLAUDE_SKIP_PERMISSIONS", "").strip().lower() in ("1", "true", "yes")
         print("TGR_CLAUDE_SKIP_PERMISSIONS =", "已啟用（--dangerously-skip-permissions）" if skip else "未啟用")
         print("TGR_OPENCODE_BIN =", os.environ.get("TGR_OPENCODE_BIN", "opencode"))

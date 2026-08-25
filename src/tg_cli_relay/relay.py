@@ -55,19 +55,22 @@ def _model_pref_key(backend: Backend) -> str:
 
 
 def resolve_cursor_model(store: SessionStore, thread_key: str) -> str:
-    """Resolve Cursor Agent model without reading generic model prefs.
-
-    Cursor CLI persists the last --model globally, so relay must always pass an
-    explicit model. Only the cursor-specific preference/env may override auto.
-    """
+    """Cursor relay 使用的模型；預設 auto，僅 thread 或 env 明確指定時才覆寫。"""
     import os
 
-    from tg_cli_relay.providers.cursor_agent import CURSOR_DEFAULT_MODEL
+    explicit = store.get_pref(thread_key, _model_pref_key("cursor"))
+    if not explicit:
+        explicit = os.environ.get("TGR_CURSOR_MODEL", "").strip()
+    if not explicit:
+        return "auto"
+    return "auto" if explicit.upper() == "AUTO" else explicit
 
-    model = store.get_pref(thread_key, _model_pref_key("cursor"))
-    if not model:
-        model = os.environ.get("TGR_CURSOR_MODEL", "").strip()
-    return model or CURSOR_DEFAULT_MODEL
+
+def effective_model_for_backend(store: SessionStore, thread_key: str, backend: Backend) -> str:
+    if backend == "cursor":
+        return resolve_cursor_model(store, thread_key)
+    model = store.get_pref(thread_key, _model_pref_key(backend))
+    return model or "(預設)"
 
 
 def _get_model(store: SessionStore, thread_key: str, backend: Backend) -> str | None:
@@ -126,10 +129,12 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
     skip_perms = os.environ.get("TGR_CLAUDE_SKIP_PERMISSIONS", "").strip().lower() in ("1", "true", "yes")
     timeout_raw = os.environ.get("TGR_CLAUDE_TIMEOUT", "1800").strip() or "1800"
     timeout_seconds = int(timeout_raw)
+    run_as = os.environ.get("TGR_CLAUDE_RUN_AS", "").strip() or None
     model = _get_model(store, thread_key, "claude")
     prov = ClaudeCliProvider(
         claude_bin=bin_name,
         dangerously_skip_permissions=skip_perms,
+        run_as_user=run_as,
         model=model,
         timeout_seconds=timeout_seconds,
     )
