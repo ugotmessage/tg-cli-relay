@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 
 from tg_cli_relay.attachments import (
@@ -269,9 +270,34 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
 
 def _chunk_reply(text: str) -> list[str]:
     t = text or ""
-    if len(t) <= TG_CHUNK:
+    soft_limit = min(TG_CHUNK, int(os.environ.get("TGR_REPLY_SOFT_CHUNK", "1400")))
+    if len(t) <= soft_limit:
         return [t] if t else []
-    return [t[i : i + TG_CHUNK] for i in range(0, len(t), TG_CHUNK)]
+    chunks: list[str] = []
+    current = ""
+    blocks = re.split(r"\n{2,}", t)
+    for block in (part.strip() for part in blocks):
+        if not block:
+            continue
+        if re.match(r"^#{1,6}\s", block) and current:
+            chunks.append(current)
+            current = ""
+        if len(block) > soft_limit:
+            lines = block.splitlines() or [block]
+        else:
+            lines = [block]
+        for line in lines:
+            pieces = [line[i : i + soft_limit] for i in range(0, len(line), soft_limit)] or [""]
+            for piece in pieces:
+                candidate = f"{current}\n\n{piece}".strip() if current else piece
+                if current and len(candidate) > soft_limit:
+                    chunks.append(current)
+                    current = piece
+                else:
+                    current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _chunk_segments(segments: list[str]) -> list[str]:
@@ -518,6 +544,21 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
     store = SessionStore(store_path)
     backend = _backend_for_thread(store, key)
+    loop = asyncio.get_running_loop()
+
+    def _live_progress(text: str) -> None:
+        # Called from the Codex subprocess worker thread. Block until Telegram
+        # accepts the message so progress ordering stays deterministic.
+        future = asyncio.run_coroutine_threadsafe(
+            _reply_text_with_retry(msg, text), loop
+        )
+        try:
+            future.result()
+        except Exception as exc:
+            # A transient progress-send failure must not abort the Codex
+            # subprocess; the final response still has a chance to arrive.
+            log.warning("Codex live progress delivery failed: %s", exc)
+
     try:
         # relay_turn 內部會跑 subprocess，改放到 thread 避免阻塞 event loop，
         # 才能持續送出 Telegram typing 狀態。
@@ -527,6 +568,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
             backend=backend,
             prompt=prompt,
             store=store,
+            on_progress=_live_progress if backend == "codex" else None,
         )
     except Exception:
         log.exception("relay_turn 失敗 thread=%s", key)

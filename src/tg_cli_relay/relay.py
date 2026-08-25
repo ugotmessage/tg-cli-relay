@@ -1,13 +1,37 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from tg_cli_relay.providers.base import RunResult
 from tg_cli_relay.providers.claude_cli import ClaudeCliProvider, parse_claude_output
-from tg_cli_relay.providers.codex_cli import CodexCliProvider, parse_session_id_from_jsonl
+from tg_cli_relay.providers.codex_cli import CodexCliProvider
 from tg_cli_relay.providers.cursor_agent import CursorAgentProvider
 from tg_cli_relay.providers.opencode_cli import OpencodeCliProvider, parse_opencode_output
 from tg_cli_relay.session_store import Backend, SessionStore
+
+DEFAULT_CURSOR_HARNESS_PREFIX = (
+    "Before acting, enforce Mandatory Agent Harness Workflow "
+    "(~/.cursor/rules/agent-harness-workflow.mdc). "
+    "If any trigger matches, you MUST act only as Orchestrator and delegate "
+    "implementation/investigation to Workers. "
+    "TG relay: main session Shell/Write/StrReplace/Delete combined max 2; "
+    "reply in 繁體中文 with at least 2 sentences.\n\n"
+)
+
+
+def apply_cursor_harness_prefix(prompt: str) -> str:
+    """Prepend harness enforcement instructions for Cursor TG relay turns."""
+    import os
+
+    flag = os.environ.get("TGR_CURSOR_HARNESS_PREFIX", "1").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return prompt
+    custom = os.environ.get("TGR_CURSOR_PROMPT_PREFIX", "").strip()
+    prefix = custom if custom else DEFAULT_CURSOR_HARNESS_PREFIX
+    if not prefix.endswith("\n"):
+        prefix += "\n"
+    return f"{prefix}{prompt}"
 
 
 def _default_db_path() -> Path:
@@ -59,6 +83,7 @@ def relay_turn(
     prompt: str,
     store: SessionStore | None = None,
     workspace: str | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> RunResult:
     """依 thread_key 接續或建立後端 session，送出一輪 prompt。"""
     ws = workspace or _default_workspace()
@@ -67,7 +92,7 @@ def relay_turn(
     if backend == "cursor":
         return _relay_cursor(st, thread_key, ws, prompt)
     if backend == "codex":
-        return _relay_codex(st, thread_key, ws, prompt)
+        return _relay_codex(st, thread_key, ws, prompt, on_progress=on_progress)
     if backend == "claude":
         return _relay_claude(st, thread_key, ws, prompt)
     if backend == "opencode":
@@ -87,7 +112,11 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
     if not sid:
         sid = prov.create_session()
         store.upsert(thread_key, "cursor", sid, workspace=workspace)
-    return prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
+    return prov.run_turn(
+        workspace=workspace,
+        session_id=sid,
+        prompt=apply_cursor_harness_prefix(prompt),
+    )
 
 
 def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
@@ -128,7 +157,14 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
     return RunResult(stdout=display_text, stderr=raw.stderr, returncode=raw.returncode)
 
 
-def _relay_codex(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
+def _relay_codex(
+    store: SessionStore,
+    thread_key: str,
+    workspace: str,
+    prompt: str,
+    *,
+    on_progress: Callable[[str], None] | None = None,
+) -> RunResult:
     import os
 
     bin_name = os.environ.get("TGR_CODEX_BIN", "codex").strip() or "codex"
@@ -144,9 +180,9 @@ def _relay_codex(store: SessionStore, thread_key: str, workspace: str, prompt: s
         model=model,
     )
     sid = store.get(thread_key, "codex")
-    res = prov.run_turn(workspace=workspace, session_id=sid, prompt=prompt)
-    if sid is None:
-        new_sid = parse_session_id_from_jsonl(res.stdout)
-        if new_sid:
-            store.upsert(thread_key, "codex", new_sid, workspace=workspace)
+    res = prov.run_turn(
+        workspace=workspace, session_id=sid, prompt=prompt, on_progress=on_progress
+    )
+    if res.session_id and res.session_id != sid:
+        store.upsert(thread_key, "codex", res.session_id, workspace=workspace)
     return res

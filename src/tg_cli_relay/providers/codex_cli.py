@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
+from typing import Callable
 
 from tg_cli_relay.providers.base import RunResult
 
@@ -34,6 +36,7 @@ class CodexCliProvider:
         workspace: str,
         session_id: str | None,
         prompt: str,
+        on_progress: Callable[[str], None] | None = None,
     ) -> RunResult:
         base: list[str] = [self.codex_bin]
         if self.model:
@@ -51,25 +54,64 @@ class CodexCliProvider:
             cmd: list[str] = base + exec_args + ["resume", session_id, prompt]
         else:
             cmd = base + exec_args + [prompt]
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=os.environ.copy(),
-        )
-        session_id_from_jsonl = parse_session_id_from_jsonl(proc.stdout)
-        messages = parse_messages_from_jsonl(proc.stdout)
+        if on_progress is None:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, check=False, env=os.environ.copy()
+            )
+            raw_stdout, raw_stderr, returncode = proc.stdout, proc.stderr, proc.returncode
+            messages = parse_messages_from_jsonl(raw_stdout)
+        else:
+            raw_lines: list[str] = []
+            messages: list[str] = []
+            pending: str | None = None
+            with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file:
+                proc_live = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    text=True,
+                    env=os.environ.copy(),
+                )
+                assert proc_live.stdout is not None
+                for line in proc_live.stdout:
+                    raw_lines.append(line)
+                    message = parse_agent_message_line(line)
+                    if message is None:
+                        continue
+                    if pending is not None:
+                        on_progress(pending)
+                    pending = message
+                returncode = proc_live.wait()
+                stderr_file.seek(0)
+                raw_stderr = stderr_file.read()
+            raw_stdout = "".join(raw_lines)
+            if pending is not None:
+                messages.append(pending)
+        session_id_from_jsonl = parse_session_id_from_jsonl(raw_stdout)
         text = "\n".join(messages) if messages else None
-        stdout = text if text is not None else proc.stdout
+        stdout = text if text is not None else raw_stdout
         segments = messages if len(messages) > 1 else None
         return RunResult(
             stdout=stdout,
-            stderr=proc.stderr,
-            returncode=proc.returncode,
+            stderr=raw_stderr,
+            returncode=returncode,
             session_id=session_id_from_jsonl,
             stdout_segments=segments,
         )
+
+
+def parse_agent_message_line(line: str) -> str | None:
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "item.completed":
+        return None
+    item = obj.get("item", {})
+    if not isinstance(item, dict) or item.get("type") != "agent_message":
+        return None
+    text = item.get("text")
+    return text if isinstance(text, str) and text else None
 
 
 def parse_messages_from_jsonl(blob: str) -> list[str]:
@@ -79,18 +121,9 @@ def parse_messages_from_jsonl(blob: str) -> list[str]:
         line = line.strip()
         if not line:
             continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        if obj.get("type") == "item.completed":
-            item = obj.get("item", {})
-            if isinstance(item, dict) and item.get("type") == "agent_message":
-                text = item.get("text", "")
-                if text:
-                    parts.append(text)
+        text = parse_agent_message_line(line)
+        if text:
+            parts.append(text)
     return parts
 
 
