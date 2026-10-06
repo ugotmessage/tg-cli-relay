@@ -22,8 +22,10 @@ from tg_cli_relay.attachments import (
     prepare_download_path,
     resolve_outbound_files,
 )
+from tg_cli_relay.job_store import JobStore
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
 from tg_cli_relay.session_store import Backend, SessionStore
+from tg_cli_relay.task_router import route_prompt
 from tg_cli_relay.telegram_app import build_resilient_application
 from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
 
@@ -32,6 +34,8 @@ log = logging.getLogger(__name__)
 TG_CHUNK = 3800
 _BOT_LOCK_FILE = None
 SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+_THREAD_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _allowed_ids() -> set[int] | None:
@@ -129,6 +133,24 @@ def _get_store() -> SessionStore:
     return SessionStore(store_path)
 
 
+def _get_job_store() -> JobStore:
+    store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
+    return JobStore(store_path)
+
+
+def _thread_lock(thread_key: str) -> asyncio.Lock:
+    lock = _THREAD_LOCKS.get(thread_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _THREAD_LOCKS[thread_key] = lock
+    return lock
+
+
+def _track_background_task(task: asyncio.Task[None]) -> None:
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
 def _get_thread_key(update) -> str:  # type: ignore[no-untyped-def]
     chat = update.effective_chat
     msg = update.message
@@ -168,6 +190,57 @@ async def _cmd_status(update, context) -> None:  # type: ignore[no-untyped-def]
         f"模型: {effective_model_for_backend(store, key, backend)}",
         f"可用 providers: {', '.join(_enabled_backends())}",
     ]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _cmd_jobs(update, context) -> None:  # type: ignore[no-untyped-def]
+    if not _check_auth(update):
+        return
+    key = _get_thread_key(update)
+    jobs = _get_job_store().list_for_thread(key, limit=10)
+    if not jobs:
+        await update.message.reply_text("目前沒有 delegated jobs。")
+        return
+
+    lines = ["最近 jobs:"]
+    for job in jobs:
+        reason = f" · {job.reason}" if job.reason else ""
+        lines.append(f"#{job.id} {job.status} · {job.backend}{reason}")
+    lines.append("")
+    lines.append("用法: /job <id>")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _cmd_job(update, context) -> None:  # type: ignore[no-untyped-def]
+    if not _check_auth(update):
+        return
+    args: list[str] = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("用法: /job <id>")
+        return
+
+    key = _get_thread_key(update)
+    job = _get_job_store().get(int(args[0]))
+    if job is None or job.thread_key != key:
+        await update.message.reply_text("找不到這個 job。")
+        return
+
+    lines = [
+        f"Job #{job.id}",
+        f"狀態: {job.status}",
+        f"Provider: {job.backend}",
+        f"建立: {job.created_at}",
+    ]
+    if job.started_at:
+        lines.append(f"開始: {job.started_at}")
+    if job.finished_at:
+        lines.append(f"結束: {job.finished_at}")
+    if job.reason:
+        lines.append(f"派工原因: {job.reason}")
+    if job.error:
+        lines.extend(["", "錯誤:", job.error])
+    elif job.result_preview and job.status == "completed":
+        lines.extend(["", "結果預覽:", job.result_preview[:1200]])
     await update.message.reply_text("\n".join(lines))
 
 
@@ -251,7 +324,11 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
         "/status — 查看目前後端與 session 狀態",
         "/provider [名稱] — 查看或切換 CLI provider",
         "/model [provider] [名稱] — 查看或切換模型",
+        "/jobs — 查看最近派工",
+        "/job <id> — 查看派工狀態與結果預覽",
         "/help — 顯示此說明",
+        "",
+        "路由覆寫：訊息前加 !job 強制派工；!direct 強制主 session 直接執行。",
         "",
         "附件：可傳 document / photo / audio / voice / video（含 caption）。",
         f"下載上限：{cfg.max_download_bytes} bytes；回傳上限：{cfg.max_upload_bytes} bytes。",
@@ -478,6 +555,76 @@ async def _send_relay_output(
         await _reply_text_with_retry(msg, "\n".join(upload_failures))
 
 
+def _run_result_body(res) -> str:  # type: ignore[no-untyped-def]
+    out = res.stdout or ""
+    err = res.stderr or ""
+    if res.returncode == 0:
+        return out
+    if err.strip():
+        return f"{out}\n\n--- stderr ---\n{err}".strip()
+    return out
+
+
+async def _run_delegated_job(
+    *,
+    msg,
+    job_id: int,
+    worker_thread_key: str,
+    backend: Backend,
+    prompt: str,
+    attachment_config: AttachmentConfig,
+) -> None:  # type: ignore[no-untyped-def]
+    jobs = _get_job_store()
+    store = _get_store()
+    jobs.mark_running(job_id)
+    loop = asyncio.get_running_loop()
+
+    def _live_progress(text: str) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _reply_text_with_retry(msg, f"Job #{job_id}: {text}"), loop
+        )
+        try:
+            future.result()
+        except Exception as exc:
+            log.warning("delegated Codex progress delivery failed job=%s: %s", job_id, exc)
+
+    try:
+        res = await asyncio.to_thread(
+            relay_turn,
+            thread_key=worker_thread_key,
+            backend=backend,
+            prompt=prompt,
+            store=store,
+            on_progress=_live_progress if backend == "codex" else None,
+        )
+        body = _run_result_body(res)
+        sid = store.get(worker_thread_key, backend)
+        model = effective_model_for_backend(store, worker_thread_key, backend)
+
+        if res.returncode == 0:
+            jobs.complete(job_id, body)
+            header = f"Job #{job_id} 完成"
+        else:
+            jobs.fail(job_id, res.stderr or f"returncode={res.returncode}", body)
+            header = f"Job #{job_id} 執行失敗"
+
+        await _send_relay_output(
+            msg,
+            f"{header}\n\n{body}".strip(),
+            backend=backend,
+            model=model,
+            sid=sid,
+            attachment_config=attachment_config,
+        )
+    except Exception as exc:
+        log.exception("delegated job failed job=%s thread=%s", job_id, worker_thread_key)
+        jobs.fail(job_id, str(exc))
+        try:
+            await _reply_text_with_retry(msg, f"Job #{job_id} 執行失敗，請查看伺服器日誌。")
+        except Exception:
+            log.exception("failed to deliver delegated job error job=%s", job_id)
+
+
 async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     if update.effective_user is None or update.effective_chat is None:
         return
@@ -540,6 +687,45 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     backend = _backend_for_thread(store, key)
     loop = asyncio.get_running_loop()
 
+    decision = route_prompt(prompt)
+    prompt = decision.prompt
+    if decision.mode == "delegate":
+        reason = ", ".join(decision.reasons) if decision.reasons else f"score={decision.score}"
+        job = _get_job_store().create(
+            thread_key=key,
+            backend=backend,
+            prompt=prompt,
+            reason=reason,
+        )
+
+        # A delegated job gets an independent provider session.  Copy only the
+        # active model preference; conversation/session history stays isolated.
+        model_pref = store.get_pref(key, _model_pref_key(backend))
+        if model_pref:
+            store.set_pref(job.worker_thread_key, _model_pref_key(backend), model_pref)
+
+        typing_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await typing_task
+
+        task = asyncio.create_task(
+            _run_delegated_job(
+                msg=msg,
+                job_id=job.id,
+                worker_thread_key=job.worker_thread_key,
+                backend=backend,
+                prompt=prompt,
+                attachment_config=attachment_config,
+            )
+        )
+        _track_background_task(task)
+        await _reply_text_with_retry(
+            msg,
+            f"已派工 Job #{job.id}（{backend}）。主對話可繼續使用；"
+            f"用 /job {job.id} 查看狀態。",
+        )
+        return
+
     def _live_progress(text: str) -> None:
         # Called from the Codex subprocess worker thread. Block until Telegram
         # accepts the message so progress ordering stays deterministic.
@@ -556,14 +742,15 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     try:
         # relay_turn 內部會跑 subprocess，改放到 thread 避免阻塞 event loop，
         # 才能持續送出 Telegram typing 狀態。
-        res = await asyncio.to_thread(
-            relay_turn,
-            thread_key=key,
-            backend=backend,
-            prompt=prompt,
-            store=store,
-            on_progress=_live_progress if backend == "codex" else None,
-        )
+        async with _thread_lock(key):
+            res = await asyncio.to_thread(
+                relay_turn,
+                thread_key=key,
+                backend=backend,
+                prompt=prompt,
+                store=store,
+                on_progress=_live_progress if backend == "codex" else None,
+            )
     except Exception:
         log.exception("relay_turn 失敗 thread=%s", key)
         await _reply_text_with_retry(msg, "執行失敗，請查看伺服器日誌。")
@@ -573,14 +760,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await typing_task
 
-    out = res.stdout or ""
-    err = res.stderr or ""
-    if res.returncode == 0:
-        body = out
-    elif err.strip():
-        body = f"{out}\n\n--- stderr ---\n{err}".strip()
-    else:
-        body = out
+    body = _run_result_body(res)
 
     sid = store.get(key, backend)
     model = effective_model_for_backend(store, key, backend)
@@ -657,6 +837,8 @@ def run_bot() -> None:
 
     _acquire_bot_singleton(token)
 
+    interrupted = _get_job_store().mark_interrupted_jobs()
+
     log_level = os.environ.get("TGR_LOG_LEVEL", "INFO")
     log_dir = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3")).parent
     log_file = log_dir / "bot.log"
@@ -677,10 +859,16 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("status", _cmd_status))
     app.add_handler(CommandHandler("provider", _cmd_provider))
     app.add_handler(CommandHandler("model", _cmd_model))
+    app.add_handler(CommandHandler("jobs", _cmd_jobs))
+    app.add_handler(CommandHandler("job", _cmd_job))
     app.add_handler(CommandHandler("help", _cmd_help))
     content_filter = (
         filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VOICE | filters.VIDEO
     ) & ~filters.COMMAND
     app.add_handler(MessageHandler(content_filter, _on_message))
-    log.info("啟動 Telegram bot（default_backend=%s）", _default_backend())
+    log.info(
+        "啟動 Telegram bot（default_backend=%s, interrupted_jobs=%s）",
+        _default_backend(),
+        interrupted,
+    )
     app.run_polling(allowed_updates=["message"], drop_pending_updates=True, bootstrap_retries=-1)

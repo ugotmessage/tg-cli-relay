@@ -20,6 +20,7 @@ class SessionStore:
     def _conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self._db_path)
         try:
+            conn.execute("PRAGMA busy_timeout = 5000")
             conn.execute("PRAGMA foreign_keys = ON")
             yield conn
             conn.commit()

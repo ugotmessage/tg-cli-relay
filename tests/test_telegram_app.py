@@ -24,6 +24,10 @@ def test_build_resilient_application_wires_requests(monkeypatch):
             captured["updates_request"] = request
             return self
 
+        def concurrent_updates(self, value):
+            captured["concurrent_updates"] = value
+            return self
+
         def build(self):
             captured["built"] = True
             return "APP"
@@ -43,6 +47,7 @@ def test_build_resilient_application_wires_requests(monkeypatch):
 
     assert app == "APP"
     assert captured["token"] == "123:ABC"
+    assert captured["concurrent_updates"] == 8
     request = captured["request"]
     updates_request = captured["updates_request"]
     assert isinstance(request, FakeRequest)

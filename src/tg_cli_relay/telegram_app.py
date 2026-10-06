@@ -35,10 +35,17 @@ def build_resilient_application(token: str) -> Application:
         httpx_kwargs={"transport": TelegramFallbackTransport(fallback_ips)},
     )
 
+    concurrent_raw = os.environ.get("TGR_CONCURRENT_UPDATES", "8").strip() or "8"
+    try:
+        concurrent_updates = max(1, int(concurrent_raw))
+    except ValueError:
+        concurrent_updates = 8
+
     return (
         ApplicationBuilder()
         .token(token)
         .request(request)
         .get_updates_request(updates_request)
+        .concurrent_updates(concurrent_updates)
         .build()
     )
