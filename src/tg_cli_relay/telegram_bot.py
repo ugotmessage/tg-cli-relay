@@ -837,6 +837,8 @@ def run_bot() -> None:
 
     _acquire_bot_singleton(token)
 
+    interrupted = _get_job_store().mark_interrupted_jobs()
+
     log_level = os.environ.get("TGR_LOG_LEVEL", "INFO")
     log_dir = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3")).parent
     log_file = log_dir / "bot.log"
@@ -864,5 +866,9 @@ def run_bot() -> None:
         filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VOICE | filters.VIDEO
     ) & ~filters.COMMAND
     app.add_handler(MessageHandler(content_filter, _on_message))
-    log.info("啟動 Telegram bot（default_backend=%s）", _default_backend())
+    log.info(
+        "啟動 Telegram bot（default_backend=%s, interrupted_jobs=%s）",
+        _default_backend(),
+        interrupted,
+    )
     app.run_polling(allowed_updates=["message"], drop_pending_updates=True, bootstrap_retries=-1)
