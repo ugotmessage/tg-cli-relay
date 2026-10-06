@@ -125,7 +125,7 @@ Cursor relay 會在送入 `agent --print` 前，用 **rule-based** Task Router �
 - `DIRECT`：小型查詢、狀態檢查、單步操作，留在目前 Cursor session 直接處理。
 - `DELEGATE`：跨檔案、重構、部署/DB/權限等高風險邊界、或「實作 + 測試 + review + PR」這類工作，要求主 session 只當 Orchestrator，透過 Job Dispatcher 拆給隔離 worker sessions，再由主 session 整合與驗證。
 
-Router 不使用 LLM classifier；只依 TOML 規則的 `keywords` / regex `patterns` / `weight` / `threshold` 加總判斷。設定檔遺失或格式錯誤時會使用內建 fallback 規則，不會讓 bot 啟動失敗。
+Router 不使用 LLM classifier；只依 TOML 規則的 `keywords` / regex `patterns` / `weight` / `threshold` 加總判斷。批次補檔會依「回補、分批、長時間監控、背景工作」等任務語意判斷，不綁定某個固定檔案數量。設定檔遺失或格式錯誤時會使用內建 fallback 規則，不會讓 bot 啟動失敗。
 
 ```bash
 cp deploy/router.toml.example router.toml

@@ -36,7 +36,9 @@ class TaskRouterConfig:
     delegate_prompt: str = (
         "Route DELEGATE: act only as Orchestrator. Use Job Dispatcher to split the work "
         "into isolated worker sessions for implementation/investigation/review as needed. "
-        "Preserve worker session isolation; the main session coordinates, verifies, and reports."
+        "Preserve worker session isolation; the main session coordinates, verifies, and reports. "
+        "For long-running or batch work, launch a bounded background job and return a handle/status; "
+        "never block the main relay session with foreground polling or long sleep loops."
     )
     common_prompt: str = (
         "Maintain existing DIRECT / DELEGATE behavior. Keep routing rule-based; do not invoke "
@@ -113,6 +115,21 @@ DEFAULT_RULES: tuple[RouterRule, ...] = (
         description="Implementation plus tests/review/PR is a dispatcher workflow.",
         keywords=("補 tests", "完整測試", "跑測試", "lint", "build", "review diff", "建立 PR", "開 PR", "pull request"),
         patterns=(r"\b(test|lint|build).*(pr|pull request)\b", r"\bpr\b.*\b(test|lint|build)\b"),
+    ),
+    RouterRule(
+        id="batch_backfill_job",
+        route=Route.DELEGATE,
+        weight=4,
+        description="Batch/backfill/long-running data jobs should run in isolated background workers.",
+        keywords=(
+            "批次", "大量", "分批", "補檔", "回補", "慢慢補", "背景執行", "長時間",
+            "持續監控", "等待完成", "backfill", "in batches", "batch job", "background job",
+            "duckdb", "finmind", "tagged universe",
+        ),
+        patterns=(
+            r"\b(?:monitor|poll|wait)\b.*\b(?:finish|complete|progress)\b",
+            r"\b(?:backfill|batch)\b.*\b(?:data|files?|rows?|universe|database)\b",
+        ),
     ),
     RouterRule(
         id="high_risk_boundary",

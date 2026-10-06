@@ -69,6 +69,25 @@ keywords = ["ping"]
         self.assertEqual(route_text("需要 blue-green 部署方案", loaded.config).route, Route.DELEGATE)
         self.assertEqual(route_text("ping", loaded.config).route, Route.DIRECT)
 
+    def test_batch_backfill_routes_by_semantics_not_a_fixed_count(self) -> None:
+        loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})
+        samples = (
+            "優先批次補有標籤的資料，剩下的再慢慢回補，完成後驗證報告",
+            "先回補 120 檔，背景執行並持續監控進度",
+            "backfill the tagged universe in batches and verify the DuckDB output",
+        )
+        for text in samples:
+            with self.subTest(text=text):
+                decision = route_text(text, loaded.config)
+                self.assertEqual(decision.route, Route.DELEGATE)
+                self.assertTrue(any(rule.id == "batch_backfill_job" for rule in decision.matched_rules))
+
+    def test_delegate_prompt_for_long_jobs_forbids_foreground_polling(self) -> None:
+        loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})
+        wrapped = apply_cursor_harness_prefix("批次回補資料並等待完成")
+        self.assertIn("background", wrapped.lower())
+        self.assertIn("foreground polling", wrapped.lower())
+
     def test_status_includes_rules_and_load_state(self) -> None:
         loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})
         status = format_router_status(loaded)
