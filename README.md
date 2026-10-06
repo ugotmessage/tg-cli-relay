@@ -15,6 +15,13 @@ Telegram 訊息
 telegram_bot.py   ← 解析 thread key、處理指令、顯示回覆
     │
     ▼
+task_router.py    ← 快速判斷 direct / delegate
+    │
+    ├─ direct   → 主 session（同一 thread 序列化）
+    │
+    └─ delegate → JobStore + 獨立 worker session，主對話立即釋放
+    │
+    ▼
 relay.py          ← 查 session、呼叫 provider、存回 session
     │
     ▼
@@ -53,9 +60,13 @@ SQLite            ← sessions 表（thread_key → session_id）
 | `/model` | 全部 | 依 provider 列出常用模型清單 |
 | `/model <id>` | 全部 | 切換目前 provider 的模型（下一輪起生效） |
 | `/model <provider> <id>` | 全部 | 切換 provider 並設定該 provider 的模型 |
+| `/jobs` | 全部 | 查看目前 thread 最近的 background jobs |
+| `/job <id>` | 全部 | 查看單一 job 狀態與結果預覽 |
 | `/help` | 全部 | 顯示可用指令 |
 
 > 每個 Telegram thread 會保存自己的 provider。模型偏好依 provider 分開保存（`model:cursor`、`model:claude` 等）。**Cursor relay 預設一律 `--model auto`**，除非你透過 `/model` 或 `TGR_CURSOR_MODEL` 明確指定；不會沿用舊版通用 `model` 偏好或其它程式的 CLI 指定。
+>
+> 長任務會由 router 派到獨立 worker thread key（例如 `private:123::job:42`），因此不會佔用或同時 resume 主對話 session。可在訊息前加 `!job` 強制派工，或加 `!direct` 強制直接執行。
 
 ---
 
