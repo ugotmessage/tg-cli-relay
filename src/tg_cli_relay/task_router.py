@@ -20,7 +20,7 @@ _DELEGATE_PREFIXES = ("!job ", "!delegate ", "[job] ", "[delegate] ")
 _DIRECT_PREFIXES = ("!direct ", "[direct] ")
 
 _RESEARCH_RE = re.compile(
-    r"(研究|深入分析|回測|掃描|盤點|比較.+(?:檔|個|份|月|週)|"
+    r"(研究|深入分析|回測|掃描|盤點|分析.+(?:檔|個|筆|份)|比較.+(?:檔|個|份|月|週)|"
     r"research|investigate|backtest|batch|all files|entire repo|whole repo)",
     re.IGNORECASE,
 )
