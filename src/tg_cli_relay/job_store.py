@@ -40,6 +40,7 @@ class JobStore:
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
         try:
+            conn.execute("PRAGMA busy_timeout = 5000")
             yield conn
             conn.commit()
         finally:
@@ -143,6 +144,20 @@ class JobStore:
                 """,
                 (job_id,),
             )
+
+    def mark_interrupted_jobs(self) -> int:
+        """Mark jobs left active by a previous bot process as failed."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed',
+                    error = 'bot restarted before job completion',
+                    finished_at = datetime('now')
+                WHERE status IN ('queued', 'running')
+                """
+            )
+            return int(cur.rowcount)
 
     def get(self, job_id: int) -> JobRecord | None:
         with self._conn() as conn:
