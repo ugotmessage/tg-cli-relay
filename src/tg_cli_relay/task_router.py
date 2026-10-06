@@ -20,13 +20,17 @@ _DELEGATE_PREFIXES = ("!job ", "!delegate ", "[job] ", "[delegate] ")
 _DIRECT_PREFIXES = ("!direct ", "[direct] ")
 
 _RESEARCH_RE = re.compile(
-    r"(研究|深入分析|回測|批次|逐一|全部|所有|整個|掃描|盤點|比較.+(?:檔|個|份|月|週)|"
+    r"(研究|深入分析|回測|掃描|盤點|比較.+(?:檔|個|份|月|週)|"
     r"research|investigate|backtest|batch|all files|entire repo|whole repo)",
     re.IGNORECASE,
 )
 _IMPLEMENT_RE = re.compile(
     r"(修改程式|改程式|實作|重構|修好|修復|開\s*PR|建立\s*PR|跑測試|測試全部|部署|"
     r"implement|refactor|fix.+tests?|run tests?|open.+PR|create.+PR|deploy)",
+    re.IGNORECASE,
+)
+_BROAD_SCOPE_RE = re.compile(
+    r"(批次|逐一|全部|所有|整個|大量|多個|batch|all files|entire repo|whole repo)",
     re.IGNORECASE,
 )
 _MULTI_STEP_RE = re.compile(
@@ -38,7 +42,10 @@ _TIME_RANGE_RE = re.compile(
     r"(?:last|past)\s+\d+\s+(?:days?|weeks?|months?|years?)",
     re.IGNORECASE,
 )
-_MANY_ITEMS_RE = re.compile(r"\b\d{2,}\s*(?:檔|個|筆|份|stocks?|files?|items?)\b", re.IGNORECASE)
+_MANY_ITEMS_RE = re.compile(
+    r"(?<!\d)\d{2,}\s*(?:檔|個|筆|份|stocks?|files?|items?)(?![A-Za-z])",
+    re.IGNORECASE,
+)
 
 
 def _threshold() -> int:
@@ -98,8 +105,12 @@ def route_prompt(prompt: str) -> RouteDecision:
         reasons.append("research/batch scope")
 
     if _IMPLEMENT_RE.search(text):
-        score += 2
+        score += 3
         reasons.append("implementation/test scope")
+
+    if _BROAD_SCOPE_RE.search(text):
+        score += 1
+        reasons.append("broad scope")
 
     if _MULTI_STEP_RE.search(text):
         score += 1
