@@ -90,10 +90,6 @@ DEFAULT_RULES: tuple[RouterRule, ...] = (
         route=Route.DELEGATE,
         weight=10,
         description="An explicit request to dispatch a worker must override incidental status wording.",
-        keywords=(
-            "派子worker", "派子 worker", "派 worker", "派worker", "派工", "子worker",
-            "子 worker", "delegate to a worker", "dispatch a worker", "spawn a worker",
-        ),
         patterns=(
             r"(?:派|交給|讓).{0,8}(?:子\s*)?(?:worker|agent).{0,8}(?:做|跑|補|處理|執行)",
             r"\b(?:delegate|dispatch|spawn)\b.{0,16}\b(?:worker|agent)\b",

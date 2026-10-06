@@ -534,6 +534,49 @@ def test_delegate_message_acknowledges_without_typing(monkeypatch, tmp_path):
     asyncio.run(_run())
 
 
+def test_delegate_ack_failure_releases_active_thread(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot
+    from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
+
+    monkeypatch.setenv("TGR_SESSION_DB", str(tmp_path / "sessions.sqlite3"))
+    monkeypatch.setenv("TGR_DEFAULT_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("TGR_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("TGR_ROUTER_CONFIG", str(tmp_path / "missing-router.toml"))
+    monkeypatch.delenv("TGR_ALLOWED_TELEGRAM_USER_IDS", raising=False)
+    chat = SimpleNamespace(id=9, type="private", send_message=AsyncMock())
+    msg = SimpleNamespace(
+        text="還沒補完派子 WORKER 去補",
+        caption=None,
+        document=None,
+        photo=None,
+        audio=None,
+        voice=None,
+        video=None,
+        chat_id=9,
+        message_id=4,
+        message_thread_id=None,
+        chat=SimpleNamespace(send_action=AsyncMock()),
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1), effective_chat=chat, message=msg
+    )
+    key = telegram_thread_key(chat_type="private", ids=TelegramIds(9, None))
+
+    async def _run():
+        with patch.object(
+            telegram_bot,
+            "_reply_text_with_retry",
+            new=AsyncMock(side_effect=RuntimeError("ack failed")),
+        ), patch.object(telegram_bot, "relay_turn") as relay:
+            with pytest.raises(RuntimeError, match="ack failed"):
+                await telegram_bot._on_message(update, SimpleNamespace())
+            assert key not in telegram_bot._ACTIVE_RELAY_THREADS
+            relay.assert_not_called()
+
+    asyncio.run(_run())
+
+
 def test_duplicate_thread_is_rejected_without_second_relay(monkeypatch, tmp_path):
     from tg_cli_relay import telegram_bot
     from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key

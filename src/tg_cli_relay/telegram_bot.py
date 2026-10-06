@@ -557,85 +557,85 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         )
         return
     _ACTIVE_RELAY_THREADS.add(key)
-
-    # DELEGATE 任務先回 ACK 並保持主對話可用；長時間工作不持續顯示 typing。
-    if decision.route == Route.DELEGATE:
-        await _reply_text_with_retry(
-            msg,
-            "已接單並交由背景工作處理；主對話不會等待完成，結果會自動回報。",
-        )
-
-    from telegram.constants import ChatAction
-
-    async def _typing_loop() -> None:
-        while True:
-            try:
-                await msg.chat.send_action(action=ChatAction.TYPING)
-            except Exception as exc:
-                log.warning("Telegram typing action failed; continuing without typing indicator: %s", exc)
-            await asyncio.sleep(4)
-
-    typing_task = (
-        asyncio.create_task(_typing_loop()) if decision.route == Route.DIRECT else None
-    )
-
-    loop = asyncio.get_running_loop()
-
-    def _live_progress(text: str) -> None:
-        # Called from the Codex subprocess worker thread. Block until Telegram
-        # accepts the message so progress ordering stays deterministic.
-        future = asyncio.run_coroutine_threadsafe(
-            _reply_text_with_retry(msg, text), loop
-        )
-        try:
-            future.result()
-        except Exception as exc:
-            # A transient progress-send failure must not abort the Codex
-            # subprocess; the final response still has a chance to arrive.
-            log.warning("Codex live progress delivery failed: %s", exc)
-
+    typing_task: asyncio.Task[None] | None = None
     try:
-        # relay_turn 內部會跑 subprocess，改放到 thread 避免阻塞 event loop，
-        # 才能持續送出 Telegram typing 狀態。
-        res = await asyncio.to_thread(
-            relay_turn,
-            thread_key=key,
+        # DELEGATE 任務先回 ACK 並保持主對話可用；長時間工作不持續顯示 typing。
+        if decision.route == Route.DELEGATE:
+            await _reply_text_with_retry(
+                msg,
+                "已接單並交由背景工作處理；主對話不會等待完成，結果會自動回報。",
+            )
+
+        from telegram.constants import ChatAction
+
+        async def _typing_loop() -> None:
+            while True:
+                try:
+                    await msg.chat.send_action(action=ChatAction.TYPING)
+                except Exception as exc:
+                    log.warning("Telegram typing action failed; continuing without typing indicator: %s", exc)
+                await asyncio.sleep(4)
+
+        if decision.route == Route.DIRECT:
+            typing_task = asyncio.create_task(_typing_loop())
+
+        loop = asyncio.get_running_loop()
+
+        def _live_progress(text: str) -> None:
+            # Called from the Codex subprocess worker thread. Block until Telegram
+            # accepts the message so progress ordering stays deterministic.
+            future = asyncio.run_coroutine_threadsafe(
+                _reply_text_with_retry(msg, text), loop
+            )
+            try:
+                future.result()
+            except Exception as exc:
+                # A transient progress-send failure must not abort the Codex
+                # subprocess; the final response still has a chance to arrive.
+                log.warning("Codex live progress delivery failed: %s", exc)
+
+        try:
+            # relay_turn 內部會跑 subprocess，改放到 thread 避免阻塞 event loop，
+            # 才能持續送出 Telegram typing 狀態。
+            res = await asyncio.to_thread(
+                relay_turn,
+                thread_key=key,
+                backend=backend,
+                prompt=prompt,
+                store=store,
+                on_progress=_live_progress if backend == "codex" else None,
+            )
+        except Exception:
+            log.exception("relay_turn 失敗 thread=%s", key)
+            await _reply_text_with_retry(msg, "執行失敗，請查看伺服器日誌。")
+            return
+
+        out = res.stdout or ""
+        err = res.stderr or ""
+        if res.returncode == 0:
+            body = out
+        elif err.strip():
+            body = f"{out}\n\n--- stderr ---\n{err}".strip()
+        else:
+            body = out
+
+        sid = store.get(key, backend)
+        model = effective_model_for_backend(store, key, backend)
+        await _send_relay_output(
+            msg,
+            body,
             backend=backend,
-            prompt=prompt,
-            store=store,
-            on_progress=_live_progress if backend == "codex" else None,
+            model=model,
+            sid=sid,
+            attachment_config=attachment_config,
+            segments=res.stdout_segments,
         )
-    except Exception:
-        log.exception("relay_turn 失敗 thread=%s", key)
-        await _reply_text_with_retry(msg, "執行失敗，請查看伺服器日誌。")
-        return
     finally:
         _ACTIVE_RELAY_THREADS.discard(key)
         if typing_task is not None:
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await typing_task
-
-    out = res.stdout or ""
-    err = res.stderr or ""
-    if res.returncode == 0:
-        body = out
-    elif err.strip():
-        body = f"{out}\n\n--- stderr ---\n{err}".strip()
-    else:
-        body = out
-
-    sid = store.get(key, backend)
-    model = effective_model_for_backend(store, key, backend)
-    await _send_relay_output(
-        msg,
-        body,
-        backend=backend,
-        model=model,
-        sid=sid,
-        attachment_config=attachment_config,
-        segments=res.stdout_segments,
-    )
 
 
 def _bot_singleton_lock_path(token: str) -> Path:

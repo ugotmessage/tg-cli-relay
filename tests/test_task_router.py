@@ -90,6 +90,19 @@ keywords = ["ping"]
         self.assertGreater(decision.delegate_score, decision.direct_score)
         self.assertTrue(any(rule.id == "explicit_worker_delegation" for rule in decision.matched_rules))
 
+    def test_worker_mentions_without_dispatch_intent_stay_direct(self) -> None:
+        loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})
+        for text in (
+            "不要派 worker，直接查目前 status",
+            "子 worker 現在有幾個？",
+        ):
+            with self.subTest(text=text):
+                decision = route_text(text, loaded.config)
+                self.assertEqual(decision.route, Route.DIRECT)
+                self.assertFalse(
+                    any(rule.id == "explicit_worker_delegation" for rule in decision.matched_rules)
+                )
+
     def test_delegate_prompt_for_long_jobs_forbids_foreground_polling(self) -> None:
         wrapped = apply_cursor_harness_prefix("批次回補資料並等待完成")
         self.assertIn("background", wrapped.lower())
