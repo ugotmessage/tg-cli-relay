@@ -82,11 +82,19 @@ keywords = ["ping"]
                 self.assertEqual(decision.route, Route.DELEGATE)
                 self.assertTrue(any(rule.id == "batch_backfill_job" for rule in decision.matched_rules))
 
-    def test_delegate_prompt_for_long_jobs_forbids_foreground_polling(self) -> None:
+    def test_explicit_worker_delegation_overrides_status_words(self) -> None:
         loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})
+        text = "資料是不是還沒補完？還沒補完派子WORKER去補"
+        decision = route_text(text, loaded.config)
+        self.assertEqual(decision.route, Route.DELEGATE)
+        self.assertGreater(decision.delegate_score, decision.direct_score)
+        self.assertTrue(any(rule.id == "explicit_worker_delegation" for rule in decision.matched_rules))
+
+    def test_delegate_prompt_for_long_jobs_forbids_foreground_polling(self) -> None:
         wrapped = apply_cursor_harness_prefix("批次回補資料並等待完成")
         self.assertIn("background", wrapped.lower())
         self.assertIn("foreground polling", wrapped.lower())
+        self.assertIn("reply immediately", wrapped.lower())
 
     def test_status_includes_rules_and_load_state(self) -> None:
         loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})

@@ -24,7 +24,13 @@ from tg_cli_relay.attachments import (
 )
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
 from tg_cli_relay.session_store import Backend, SessionStore
-from tg_cli_relay.task_router import format_router_status, format_router_test
+from tg_cli_relay.task_router import (
+    Route,
+    format_router_status,
+    format_router_test,
+    load_task_router_config,
+    route_text,
+)
 from tg_cli_relay.telegram_app import build_resilient_application
 from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
 
@@ -32,6 +38,7 @@ log = logging.getLogger(__name__)
 
 TG_CHUNK = 3800
 _BOT_LOCK_FILE = None
+_ACTIVE_RELAY_THREADS: set[str] = set()
 SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
 
 
@@ -535,7 +542,29 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         await update.effective_chat.send_message(_supported_types_hint())
         return
 
-    # 先顯示 typing，讓使用者知道訊息已收到且正在處理。
+    chat = update.effective_chat
+    thread_id = msg.message_thread_id
+    key = telegram_thread_key(chat_type=str(chat.type), ids=TelegramIds(chat.id, thread_id))
+
+    decision = route_text(prompt, load_task_router_config().config)
+    store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
+    store = SessionStore(store_path)
+    backend = _backend_for_thread(store, key)
+    if key in _ACTIVE_RELAY_THREADS:
+        await _reply_text_with_retry(
+            msg,
+            "這個對話已有任務在背景處理；完成後會自動回報，未重複啟動。",
+        )
+        return
+    _ACTIVE_RELAY_THREADS.add(key)
+
+    # DELEGATE 任務先回 ACK 並保持主對話可用；長時間工作不持續顯示 typing。
+    if decision.route == Route.DELEGATE:
+        await _reply_text_with_retry(
+            msg,
+            "已接單並交由背景工作處理；主對話不會等待完成，結果會自動回報。",
+        )
+
     from telegram.constants import ChatAction
 
     async def _typing_loop() -> None:
@@ -546,15 +575,10 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
                 log.warning("Telegram typing action failed; continuing without typing indicator: %s", exc)
             await asyncio.sleep(4)
 
-    typing_task = asyncio.create_task(_typing_loop())
+    typing_task = (
+        asyncio.create_task(_typing_loop()) if decision.route == Route.DIRECT else None
+    )
 
-    chat = update.effective_chat
-    thread_id = msg.message_thread_id
-    key = telegram_thread_key(chat_type=str(chat.type), ids=TelegramIds(chat.id, thread_id))
-
-    store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
-    store = SessionStore(store_path)
-    backend = _backend_for_thread(store, key)
     loop = asyncio.get_running_loop()
 
     def _live_progress(text: str) -> None:
@@ -586,9 +610,11 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         await _reply_text_with_retry(msg, "執行失敗，請查看伺服器日誌。")
         return
     finally:
-        typing_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await typing_task
+        _ACTIVE_RELAY_THREADS.discard(key)
+        if typing_task is not None:
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await typing_task
 
     out = res.stdout or ""
     err = res.stderr or ""
@@ -699,6 +725,8 @@ def run_bot() -> None:
     content_filter = (
         filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VOICE | filters.VIDEO
     ) & ~filters.COMMAND
-    app.add_handler(MessageHandler(content_filter, _on_message))
+    # block=False isolates each relay turn from Telegram's update loop.  A slow
+    # provider can no longer prevent commands or other chats from being handled.
+    app.add_handler(MessageHandler(content_filter, _on_message, block=False))
     log.info("啟動 Telegram bot（default_backend=%s）", _default_backend())
     app.run_polling(allowed_updates=["message"], drop_pending_updates=True, bootstrap_retries=-1)

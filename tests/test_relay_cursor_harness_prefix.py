@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from tg_cli_relay.relay import apply_cursor_harness_prefix

@@ -490,6 +490,90 @@ def test_plain_text_message_unchanged(monkeypatch, tmp_path):
     asyncio.run(_run())
 
 
+def test_delegate_message_acknowledges_without_typing(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot
+
+    monkeypatch.setenv("TGR_SESSION_DB", str(tmp_path / "sessions.sqlite3"))
+    monkeypatch.setenv("TGR_DEFAULT_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("TGR_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("TGR_ROUTER_CONFIG", str(tmp_path / "missing-router.toml"))
+    monkeypatch.delenv("TGR_ALLOWED_TELEGRAM_USER_IDS", raising=False)
+    chat = SimpleNamespace(id=1, type="private", send_message=AsyncMock())
+    msg = SimpleNamespace(
+        text="還沒補完派子 WORKER 去補",
+        caption=None,
+        document=None,
+        photo=None,
+        audio=None,
+        voice=None,
+        video=None,
+        chat_id=1,
+        message_id=2,
+        message_thread_id=None,
+        chat=SimpleNamespace(send_action=AsyncMock()),
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1),
+        effective_chat=chat,
+        message=msg,
+    )
+
+    async def _run():
+        with patch.object(
+            telegram_bot,
+            "relay_turn",
+            return_value=RunResult(stdout="started", stderr="", returncode=0),
+        ):
+            with patch.object(telegram_bot, "_send_relay_output", new=AsyncMock()):
+                await telegram_bot._on_message(update, SimpleNamespace())
+                assert msg.reply_text.await_count == 1
+                assert "背景" in msg.reply_text.await_args.args[0]
+                msg.chat.send_action.assert_not_awaited()
+
+    asyncio.run(_run())
+
+
+def test_duplicate_thread_is_rejected_without_second_relay(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot
+    from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
+
+    monkeypatch.setenv("TGR_SESSION_DB", str(tmp_path / "sessions.sqlite3"))
+    monkeypatch.setenv("TGR_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.delenv("TGR_ALLOWED_TELEGRAM_USER_IDS", raising=False)
+    chat = SimpleNamespace(id=7, type="private", send_message=AsyncMock())
+    msg = SimpleNamespace(
+        text="再跑一次",
+        caption=None,
+        document=None,
+        photo=None,
+        audio=None,
+        voice=None,
+        video=None,
+        chat_id=7,
+        message_id=3,
+        message_thread_id=None,
+        chat=SimpleNamespace(send_action=AsyncMock()),
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1), effective_chat=chat, message=msg
+    )
+    key = telegram_thread_key(chat_type="private", ids=TelegramIds(7, None))
+
+    async def _run():
+        telegram_bot._ACTIVE_RELAY_THREADS.add(key)
+        try:
+            with patch.object(telegram_bot, "relay_turn") as relay:
+                await telegram_bot._on_message(update, SimpleNamespace())
+                relay.assert_not_called()
+                assert "未重複啟動" in msg.reply_text.await_args.args[0]
+        finally:
+            telegram_bot._ACTIVE_RELAY_THREADS.discard(key)
+
+    asyncio.run(_run())
+
+
 def test_cleanup_bounded_no_symlink_follow(tmp_path):
     cfg = _cfg(tmp_path, upload_retention_hours=1)
     root = cfg.upload_dir

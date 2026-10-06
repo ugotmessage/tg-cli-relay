@@ -6,7 +6,7 @@ import tomllib
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping
 
 
 class Route(StrEnum):
@@ -37,8 +37,9 @@ class TaskRouterConfig:
         "Route DELEGATE: act only as Orchestrator. Use Job Dispatcher to split the work "
         "into isolated worker sessions for implementation/investigation/review as needed. "
         "Preserve worker session isolation; the main session coordinates, verifies, and reports. "
-        "For long-running or batch work, launch a bounded background job and return a handle/status; "
-        "never block the main relay session with foreground polling or long sleep loops."
+        "For long-running or batch work, launch a bounded background job, return a handle/status, "
+        "and reply immediately after launch; never wait for completion, block the main relay session "
+        "with foreground polling, or use long sleep loops."
     )
     common_prompt: str = (
         "Maintain existing DIRECT / DELEGATE behavior. Keep routing rule-based; do not invoke "
@@ -84,6 +85,20 @@ class RouterDecision:
 
 
 DEFAULT_RULES: tuple[RouterRule, ...] = (
+    RouterRule(
+        id="explicit_worker_delegation",
+        route=Route.DELEGATE,
+        weight=10,
+        description="An explicit request to dispatch a worker must override incidental status wording.",
+        keywords=(
+            "派子worker", "派子 worker", "派 worker", "派worker", "派工", "子worker",
+            "子 worker", "delegate to a worker", "dispatch a worker", "spawn a worker",
+        ),
+        patterns=(
+            r"(?:派|交給|讓).{0,8}(?:子\s*)?(?:worker|agent).{0,8}(?:做|跑|補|處理|執行)",
+            r"\b(?:delegate|dispatch|spawn)\b.{0,16}\b(?:worker|agent)\b",
+        ),
+    ),
     RouterRule(
         id="quick_status_or_count",
         route=Route.DIRECT,

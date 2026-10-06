@@ -127,6 +127,8 @@ Cursor relay 會在送入 `agent --print` 前，用 **rule-based** Task Router �
 
 Router 不使用 LLM classifier；只依 TOML 規則的 `keywords` / regex `patterns` / `weight` / `threshold` 加總判斷。批次補檔會依「回補、分批、長時間監控、背景工作」等任務語意判斷，不綁定某個固定檔案數量。設定檔遺失或格式錯誤時會使用內建 fallback 規則，不會讓 bot 啟動失敗。
 
+`DELEGATE` 任務會先立即回覆接單訊息，不持續顯示 `typing`；relay turn 以非阻塞 handler 執行，因此慢速 provider 不會卡住 Telegram update loop。同一 thread 同時只允許一個 relay turn，後續重複要求會回報已有背景工作，不會重複啟動。
+
 ```bash
 cp deploy/router.toml.example router.toml
 # 可選：指定其它位置
