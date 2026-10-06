@@ -24,6 +24,7 @@ from tg_cli_relay.attachments import (
 )
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
 from tg_cli_relay.session_store import Backend, SessionStore
+from tg_cli_relay.task_router import format_router_status, format_router_test
 from tg_cli_relay.telegram_app import build_resilient_application
 from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
 
@@ -242,6 +243,20 @@ async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
     await update.message.reply_text(f"{backend} 模型已切換至 {chosen}（下一輪起生效）。")
 
 
+async def _cmd_router(update, context) -> None:  # type: ignore[no-untyped-def]
+    if not _check_auth(update):
+        return
+    args: list[str] = context.args or []
+    if args and args[0].lower() == "test":
+        text = " ".join(args[1:]).strip()
+        if not text:
+            await update.message.reply_text("用法: /router test <文字>")
+            return
+        await update.message.reply_text(format_router_test(text))
+        return
+    await update.message.reply_text(format_router_status())
+
+
 async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
@@ -251,6 +266,8 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
         "/status — 查看目前後端與 session 狀態",
         "/provider [名稱] — 查看或切換 CLI provider",
         "/model [provider] [名稱] — 查看或切換模型",
+        "/router — 查看 Task Router 規則與設定來源",
+        "/router test <文字> — 測試 DIRECT / DELEGATE 判斷",
         "/help — 顯示此說明",
         "",
         "附件：可傳 document / photo / audio / voice / video（含 caption）。",
@@ -677,6 +694,7 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("status", _cmd_status))
     app.add_handler(CommandHandler("provider", _cmd_provider))
     app.add_handler(CommandHandler("model", _cmd_model))
+    app.add_handler(CommandHandler("router", _cmd_router))
     app.add_handler(CommandHandler("help", _cmd_help))
     content_filter = (
         filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VOICE | filters.VIDEO

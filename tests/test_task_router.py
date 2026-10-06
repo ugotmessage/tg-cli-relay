@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tg_cli_relay.relay import apply_cursor_harness_prefix
+from tg_cli_relay.task_router import (
+    Route,
+    TaskRouterConfig,
+    format_router_status,
+    load_task_router_config,
+    route_text,
+)
+
+
+class TaskRouterConfigTest(unittest.TestCase):
+    def test_missing_config_falls_back_to_default_rules(self) -> None:
+        with patch.dict(os.environ, {"TGR_ROUTER_CONFIG": "/tmp/does-not-exist-router.toml"}):
+            loaded = load_task_router_config()
+        self.assertTrue(loaded.fallback_used)
+        self.assertEqual(loaded.config.threshold, 3)
+        decision = route_text("請重構三個檔案、補 tests、跑完整測試並建立 PR", loaded.config)
+        self.assertEqual(decision.route, Route.DELEGATE)
+        self.assertGreaterEqual(decision.delegate_score, loaded.config.threshold)
+
+    def test_invalid_config_falls_back_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.toml"
+            path.write_text("[router\nthis is broken", encoding="utf-8")
+            with patch.dict(os.environ, {"TGR_ROUTER_CONFIG": str(path)}):
+                loaded = load_task_router_config()
+        self.assertTrue(loaded.fallback_used)
+        self.assertIn("error", loaded.message.lower())
+        self.assertEqual(route_text("幫我看現在幾個 relay 在跑", loaded.config).route, Route.DIRECT)
+
+    def test_external_toml_rules_override_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router.toml"
+            path.write_text(
+                """
+[router]
+enabled = true
+threshold = 5
+prompt_header = "Custom Router"
+
+[[rules]]
+id = "force_delegate"
+route = "delegate"
+weight = 6
+description = "custom deploy trigger"
+keywords = ["blue-green"]
+
+[[rules]]
+id = "force_direct"
+route = "direct"
+weight = 10
+description = "custom quick trigger"
+keywords = ["ping"]
+""".strip(),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"TGR_ROUTER_CONFIG": str(path)}):
+                loaded = load_task_router_config()
+        self.assertFalse(loaded.fallback_used)
+        self.assertEqual(loaded.config.prompt_header, "Custom Router")
+        self.assertEqual(route_text("需要 blue-green 部署方案", loaded.config).route, Route.DELEGATE)
+        self.assertEqual(route_text("ping", loaded.config).route, Route.DIRECT)
+
+    def test_status_includes_rules_and_load_state(self) -> None:
+        loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})
+        status = format_router_status(loaded)
+        self.assertIn("Task Router", status)
+        self.assertIn("fallback", status.lower())
+        self.assertIn("/router test <文字>", status)
+        self.assertIn("delegate", status.lower())
+
+
+class CursorHarnessPrefixTest(unittest.TestCase):
+    def test_prefix_includes_router_decision_and_dispatcher_for_delegate(self) -> None:
+        prompt = "請跨多檔重構、補 tests、跑 lint/build，完成後建立 PR"
+        with patch.dict(os.environ, {"TGR_ROUTER_CONFIG": "/tmp/missing-router.toml"}, clear=False):
+            wrapped = apply_cursor_harness_prefix(prompt)
+        self.assertIn("Task Router decision: DELEGATE", wrapped)
+        self.assertIn("Job Dispatcher", wrapped)
+        self.assertIn("worker session isolation", wrapped)
+        self.assertTrue(wrapped.endswith(prompt))
+
+    def test_prefix_marks_simple_questions_direct(self) -> None:
+        prompt = "現在主機上有幾個 tg relay 在跑？"
+        with patch.dict(os.environ, {"TGR_ROUTER_CONFIG": "/tmp/missing-router.toml"}, clear=False):
+            wrapped = apply_cursor_harness_prefix(prompt)
+        self.assertIn("Task Router decision: DIRECT", wrapped)
+        self.assertTrue(wrapped.endswith(prompt))
+
+    def test_router_can_be_disabled_by_config(self) -> None:
+        cfg = TaskRouterConfig(enabled=False)
+        decision = route_text("請重構三個檔案並跑測試", cfg)
+        self.assertEqual(decision.route, Route.DIRECT)
+        self.assertEqual(decision.matched_rules, ())
+
+
+if __name__ == "__main__":
+    unittest.main()

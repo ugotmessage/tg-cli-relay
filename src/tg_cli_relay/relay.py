@@ -9,28 +9,21 @@ from tg_cli_relay.providers.codex_cli import CodexCliProvider
 from tg_cli_relay.providers.cursor_agent import CursorAgentProvider
 from tg_cli_relay.providers.opencode_cli import OpencodeCliProvider, parse_opencode_output
 from tg_cli_relay.session_store import Backend, SessionStore
-
-DEFAULT_CURSOR_HARNESS_PREFIX = (
-    "Before acting, enforce Mandatory Agent Harness Workflow "
-    "(~/.cursor/rules/agent-harness-workflow.mdc). "
-    "If any trigger matches, you MUST act only as Orchestrator and delegate "
-    "implementation/investigation to Workers. "
-    "TG relay: main session Shell/Write/StrReplace/Delete combined max 2; "
-    "reply in 繁體中文 with at least 2 sentences.\n\n"
-)
+from tg_cli_relay.task_router import render_router_prefix
 
 
 def apply_cursor_harness_prefix(prompt: str) -> str:
-    """Prepend harness enforcement instructions for Cursor TG relay turns."""
+    """Prepend rule-based Task Router / harness instructions for Cursor TG relay turns."""
     import os
 
     flag = os.environ.get("TGR_CURSOR_HARNESS_PREFIX", "1").strip().lower()
     if flag in ("0", "false", "no", "off"):
         return prompt
     custom = os.environ.get("TGR_CURSOR_PROMPT_PREFIX", "").strip()
-    prefix = custom if custom else DEFAULT_CURSOR_HARNESS_PREFIX
-    if not prefix.endswith("\n"):
-        prefix += "\n"
+    if custom:
+        prefix = custom if custom.endswith("\n") else f"{custom}\n"
+    else:
+        prefix = render_router_prefix(prompt)
     return f"{prefix}{prompt}"
 
 

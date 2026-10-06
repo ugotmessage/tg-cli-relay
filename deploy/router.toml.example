@@ -1,0 +1,62 @@
+# tg-cli-relay Task Router 設定範例
+#
+# 使用方式：
+#   cp deploy/router.toml.example router.toml
+# 或設定：
+#   TGR_ROUTER_CONFIG=/path/to/router.toml
+#
+# 設定檔遺失或格式錯誤時，bot 會 fallback 至內建預設規則，不會啟動失敗。
+
+[router]
+enabled = true
+threshold = 3
+prompt_header = "Task Router"
+common_prompt = "Maintain existing DIRECT / DELEGATE behavior. Keep routing rule-based; do not invoke an LLM classifier. Reply in 繁體中文 unless the user asks otherwise."
+direct_prompt = "Route DIRECT: handle the request in the current Cursor session. Do not spawn workers unless the user explicitly broadens scope."
+delegate_prompt = "Route DELEGATE: act only as Orchestrator. Use Job Dispatcher to split the work into isolated worker sessions for implementation/investigation/review as needed. Preserve worker session isolation; the main session coordinates, verifies, and reports."
+
+[[rules]]
+id = "quick_status_or_count"
+route = "direct"
+weight = 4
+description = "Small status/count/process questions stay in the current session."
+keywords = ["幾個", "有幾個", "目前", "現在", "status", "ps", "process", "relay 在跑"]
+patterns = ["\\b(how many|status|list)\\b"]
+
+[[rules]]
+id = "simple_question"
+route = "direct"
+weight = 3
+description = "Read-only questions and quick checks should be handled directly."
+keywords = ["可以嗎", "能不能", "查一下", "看一下", "是否", "有沒有", "版本", "路徑"]
+patterns = ["^(what|which|where|is|are)\\b"]
+
+[[rules]]
+id = "multi_file_change"
+route = "delegate"
+weight = 4
+description = "Multi-file or broad refactor/build work should use workers."
+keywords = ["跨檔", "多檔", "三個檔案", "3+ 檔", "重構", "refactor", "架構", "升級"]
+patterns = ["\\b(3\\+|three|multiple|many)\\s+(files?|modules?|scopes?)\\b"]
+
+[[rules]]
+id = "full_delivery_pipeline"
+route = "delegate"
+weight = 5
+description = "Implementation plus tests/review/PR is a dispatcher workflow."
+keywords = ["補 tests", "完整測試", "跑測試", "lint", "build", "review diff", "建立 PR", "開 PR", "pull request"]
+patterns = ["\\b(test|lint|build).*(pr|pull request)\\b", "\\bpr\\b.*\\b(test|lint|build)\\b"]
+
+[[rules]]
+id = "high_risk_boundary"
+route = "delegate"
+weight = 4
+description = "DB/deploy/auth/external side effects need isolated investigation and verification."
+keywords = ["DB", "database", "migration", "部署", "deploy", "登入", "login", "權限", "permission", "金流", "payment", "外部發送", "寄信", "交易", "restart", "systemd"]
+
+[[rules]]
+id = "debug_investigation"
+route = "delegate"
+weight = 3
+description = "Non-trivial debugging/investigation should be split from implementation."
+keywords = ["debug", "除錯", "排查", "調查", "root cause", "失敗", "錯誤", "troubleshoot"]

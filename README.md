@@ -14,6 +14,8 @@ Telegram 訊息
     ▼
 telegram_bot.py   ← 解析 thread key、處理指令、顯示回覆
     │
+    ├── task_router.py  ← rule-based DIRECT / DELEGATE 判斷與 prompt 前綴
+    │
     ▼
 relay.py          ← 查 session、呼叫 provider、存回 session
     │
@@ -53,6 +55,8 @@ SQLite            ← sessions 表（thread_key → session_id）
 | `/model` | 全部 | 依 provider 列出常用模型清單 |
 | `/model <id>` | 全部 | 切換目前 provider 的模型（下一輪起生效） |
 | `/model <provider> <id>` | 全部 | 切換 provider 並設定該 provider 的模型 |
+| `/router` | `cursor` | 查看目前 Task Router 規則、設定來源與 fallback 狀態 |
+| `/router test <文字>` | `cursor` | 用目前規則測試文字會被判斷為 `DIRECT` 或 `DELEGATE` |
 | `/help` | 全部 | 顯示可用指令 |
 
 > 每個 Telegram thread 會保存自己的 provider。模型偏好依 provider 分開保存（`model:cursor`、`model:claude` 等）。**Cursor relay 預設一律 `--model auto`**，除非你透過 `/model` 或 `TGR_CURSOR_MODEL` 明確指定；不會沿用舊版通用 `model` 偏好或其它程式的 CLI 指定。
@@ -85,6 +89,10 @@ cp env.example .env
 | `TGR_DEFAULT_WORKSPACE` | （必填） | 代理操作的 git 工作目錄 |
 | `TGR_CURSOR_AGENT_BIN` | `agent` | Cursor Agent CLI 路徑 |
 | `TGR_CURSOR_MODEL` | `auto` | Cursor relay 預設模型；僅影響本 relay，不受其它 CLI 呼叫或舊版 `model` 偏好影響。可用 Telegram `/model <id>` 或 `model:cursor` 覆寫 |
+| `TGR_CURSOR_TIMEOUT` | `600` | Cursor agent 單輪逾時秒數；`0` 表示不限制 |
+| `TGR_ROUTER_CONFIG` | `router.toml` / `config/router.toml` | Task Router TOML 設定檔；遺失或錯誤會 fallback 至內建規則 |
+| `TGR_CURSOR_HARNESS_PREFIX` | `1` | 設為 `0` 可關閉 Cursor Task Router / harness prompt 前綴 |
+| `TGR_CURSOR_PROMPT_PREFIX` | （未設定） | 完全覆寫 Cursor prompt 前綴；設定後不使用 Task Router 產生的前綴 |
 | `TGR_CODEX_BIN` | `codex` | OpenAI Codex CLI 路徑 |
 | `TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX` | （未設定） | 設為 `1` 啟用 `--dangerously-bypass-approvals-and-sandbox` |
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
@@ -107,6 +115,30 @@ cp env.example .env
 - **回傳**：Agent stdout 以獨立一行 `TGR_FILE:/absolute/path` 宣告檔案（最多 5 個）；marker 不會顯示給使用者。
 - **清理**：`python3 -m tg_cli_relay cleanup-uploads`（可設 cron）；成功下載後也會做 bounded cleanup。
 - 僅 **allowlist 內的 Telegram user** 可下載附件。
+
+---
+
+## Task Router
+
+Cursor relay 會在送入 `agent --print` 前，用 **rule-based** Task Router 產生前綴，標示本輪應走：
+
+- `DIRECT`：小型查詢、狀態檢查、單步操作，留在目前 Cursor session 直接處理。
+- `DELEGATE`：跨檔案、重構、部署/DB/權限等高風險邊界、或「實作 + 測試 + review + PR」這類工作，要求主 session 只當 Orchestrator，透過 Job Dispatcher 拆給隔離 worker sessions，再由主 session 整合與驗證。
+
+Router 不使用 LLM classifier；只依 TOML 規則的 `keywords` / regex `patterns` / `weight` / `threshold` 加總判斷。設定檔遺失或格式錯誤時會使用內建 fallback 規則，不會讓 bot 啟動失敗。
+
+```bash
+cp deploy/router.toml.example router.toml
+# 可選：指定其它位置
+export TGR_ROUTER_CONFIG=/path/to/router.toml
+```
+
+Telegram 內可用：
+
+```text
+/router
+/router test 請重構三個檔案、補 tests、跑完整測試並建立 PR
+```
 
 ---
 
