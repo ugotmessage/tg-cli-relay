@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tg_cli_relay.relay import apply_cursor_harness_prefix
+from tg_cli_relay.relay import apply_cursor_harness_prefix, apply_cursor_worker_prefix
 
 
 def test_apply_cursor_harness_prefix_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -29,3 +29,11 @@ def test_apply_cursor_harness_prefix_disabled(monkeypatch: pytest.MonkeyPatch) -
 def test_apply_cursor_harness_prefix_disabled_false(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TGR_CURSOR_HARNESS_PREFIX", "false")
     assert apply_cursor_harness_prefix("plain") == "plain"
+
+
+def test_cursor_worker_prefix_executes_without_recursive_delegation() -> None:
+    out = apply_cursor_worker_prefix("請實作功能並跑測試")
+    assert "Relay role: WORKER" in out
+    assert "Execute the assigned scope directly" in out
+    assert "do not dispatch, spawn, or delegate" in out
+    assert out.endswith("請實作功能並跑測試")

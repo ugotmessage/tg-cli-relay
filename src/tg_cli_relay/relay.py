@@ -27,6 +27,24 @@ def apply_cursor_harness_prefix(prompt: str) -> str:
     return f"{prefix}{prompt}"
 
 
+def apply_cursor_worker_prefix(prompt: str) -> str:
+    """Tell a relay-created Cursor worker to execute, not recursively delegate."""
+    prefix = (
+        "Relay role: WORKER. This is already an isolated background worker session created by "
+        "the TG Relay Orchestrator. Execute the assigned scope directly; do not dispatch, spawn, "
+        "or delegate to another worker. Read applicable repository instructions, make the minimum "
+        "safe changes, run proportionate validation, and report changes, paths, validation, risks, "
+        "and blockers in Traditional Chinese. Do not deploy, restart services, migrate databases, "
+        "change permissions/accounts, send external messages, spend money, or perform real "
+        "transactions without explicit user confirmation.\n\n"
+    )
+    return f"{prefix}{prompt}"
+
+
+def _is_relay_worker_thread(thread_key: str) -> bool:
+    return ":job:" in thread_key
+
+
 def _env_enabled(name: str, default: bool = False) -> bool:
     import os
 
@@ -193,10 +211,15 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
     if not sid:
         sid = prov.create_session()
         store.upsert(thread_key, "cursor", sid, workspace=workspace)
+    effective_prompt = (
+        apply_cursor_worker_prefix(prompt)
+        if _is_relay_worker_thread(thread_key)
+        else apply_cursor_harness_prefix(prompt)
+    )
     return prov.run_turn(
         workspace=workspace,
         session_id=sid,
-        prompt=apply_cursor_harness_prefix(prompt),
+        prompt=effective_prompt,
     )
 
 

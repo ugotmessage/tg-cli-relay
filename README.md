@@ -135,6 +135,8 @@ Codex backend 預設也使用同一份判定，遵守知識庫的「勞力活外
 
 `DELEGATE` 任務會建立獨立的 job session，先回覆 job id，然後立即釋放主對話；背景 worker 完成後會自動回報。執行期間可傳送「進度」或使用 `/status` 查詢 job 狀態、執行秒數、最近一則進度與排隊數量，其他 DIRECT 訊息仍由主 session 處理。同一 thread 同時只執行一個背景 job；忙碌期間收到的新訊息不會丟棄，而是放入記憶體 FIFO queue，前一輪完成後自動執行並回覆。queue 預設最多 20 則，可用 `TGR_THREAD_QUEUE_MAX` 調整；服務重啟時尚未執行的記憶體 queue 不會保留。
 
+Cursor relay 的主 session 會收到 Router／Orchestrator 指示；relay 建立的 `:job:` session 則明確標示為 Worker，直接執行與驗證，不得再次派工，避免巢狀 delegation。3600 秒是背景 Worker 的安全上限，不是主對話的等待時間。
+
 ```bash
 cp deploy/router.toml.example router.toml
 # 可選：指定其它位置
