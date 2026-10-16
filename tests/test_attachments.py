@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -530,6 +531,78 @@ def test_delegate_message_acknowledges_without_typing(monkeypatch, tmp_path):
                 assert msg.reply_text.await_count == 1
                 assert "背景" in msg.reply_text.await_args.args[0]
                 msg.chat.send_action.assert_not_awaited()
+                await asyncio.gather(*tuple(telegram_bot._BACKGROUND_TASKS))
+                assert not telegram_bot._ACTIVE_JOBS
+
+    asyncio.run(_run())
+
+
+def test_delegate_runs_in_isolated_job_and_progress_remains_responsive(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot
+
+    monkeypatch.setenv("TGR_SESSION_DB", str(tmp_path / "sessions.sqlite3"))
+    monkeypatch.setenv("TGR_DEFAULT_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("TGR_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("TGR_ROUTER_CONFIG", str(tmp_path / "missing-router.toml"))
+    monkeypatch.delenv("TGR_ALLOWED_TELEGRAM_USER_IDS", raising=False)
+
+    chat = SimpleNamespace(id=31, type="private", send_message=AsyncMock())
+
+    def make_update(text: str, message_id: int):
+        msg = SimpleNamespace(
+            text=text,
+            caption=None,
+            document=None,
+            photo=None,
+            audio=None,
+            voice=None,
+            video=None,
+            chat_id=31,
+            message_id=message_id,
+            message_thread_id=None,
+            chat=SimpleNamespace(send_action=AsyncMock()),
+            reply_text=AsyncMock(),
+        )
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            effective_chat=chat,
+            message=msg,
+        )
+
+    release_worker = threading.Event()
+    worker_started = threading.Event()
+    main_turn_seen = threading.Event()
+
+    def slow_relay(**kwargs):
+        if ":job:" in kwargs["thread_key"]:
+            worker_started.set()
+            release_worker.wait(timeout=5)
+            return RunResult(stdout="done", stderr="", returncode=0)
+        main_turn_seen.set()
+        return RunResult(stdout="main reply", stderr="", returncode=0)
+
+    async def _run():
+        telegram_bot._ACTIVE_JOBS.clear()
+        telegram_bot._RECENT_JOBS.clear()
+        delegate = make_update("派 worker 執行跨檔重構", 1)
+        progress = make_update("現在進度如何", 2)
+        direct = make_update("查一下版本", 3)
+        with patch.object(telegram_bot, "relay_turn", side_effect=slow_relay), patch.object(
+            telegram_bot, "_send_relay_output", new=AsyncMock()
+        ):
+            await telegram_bot._on_message(delegate, SimpleNamespace())
+            assert "主對話可繼續使用" in delegate.message.reply_text.await_args.args[0]
+            await asyncio.to_thread(worker_started.wait, 2)
+            await telegram_bot._on_message(direct, SimpleNamespace())
+            assert main_turn_seen.is_set()
+            await telegram_bot._on_message(progress, SimpleNamespace())
+            progress_text = progress.message.reply_text.await_args.args[0]
+            assert "背景工作" in progress_text
+            assert "狀態: running" in progress_text
+            release_worker.set()
+            await asyncio.gather(*tuple(telegram_bot._BACKGROUND_TASKS))
+        telegram_bot._ACTIVE_JOBS.clear()
+        telegram_bot._RECENT_JOBS.clear()
 
     asyncio.run(_run())
 
@@ -577,7 +650,7 @@ def test_delegate_ack_failure_releases_active_thread(monkeypatch, tmp_path):
     asyncio.run(_run())
 
 
-def test_duplicate_thread_is_rejected_without_second_relay(monkeypatch, tmp_path):
+def test_busy_thread_queues_message_and_runs_after_release(monkeypatch, tmp_path):
     from tg_cli_relay import telegram_bot
     from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
 
@@ -607,12 +680,84 @@ def test_duplicate_thread_is_rejected_without_second_relay(monkeypatch, tmp_path
     async def _run():
         telegram_bot._ACTIVE_RELAY_THREADS.add(key)
         try:
-            with patch.object(telegram_bot, "relay_turn") as relay:
+            with patch.object(
+                telegram_bot,
+                "relay_turn",
+                return_value=RunResult(stdout="queued reply", stderr="", returncode=0),
+            ) as relay, patch.object(telegram_bot, "_send_relay_output", new=AsyncMock()):
                 await telegram_bot._on_message(update, SimpleNamespace())
                 relay.assert_not_called()
-                assert "未重複啟動" in msg.reply_text.await_args.args[0]
+                assert "已加入等待佇列" in msg.reply_text.await_args.args[0]
+                telegram_bot._ACTIVE_RELAY_THREADS.discard(key)
+                telegram_bot._schedule_queue_drain(key)
+                await asyncio.gather(*tuple(telegram_bot._BACKGROUND_TASKS))
+                relay.assert_called_once()
+                assert relay.call_args.kwargs["prompt"] == "再跑一次"
         finally:
             telegram_bot._ACTIVE_RELAY_THREADS.discard(key)
+            telegram_bot._PENDING_TURNS.clear()
+            telegram_bot._QUEUE_DRAIN_TASKS.clear()
+
+    asyncio.run(_run())
+
+
+def test_second_delegate_is_queued_then_starts_after_first_job(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot
+
+    monkeypatch.setenv("TGR_SESSION_DB", str(tmp_path / "sessions.sqlite3"))
+    monkeypatch.setenv("TGR_DEFAULT_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("TGR_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("TGR_ROUTER_CONFIG", str(tmp_path / "missing-router.toml"))
+    monkeypatch.delenv("TGR_ALLOWED_TELEGRAM_USER_IDS", raising=False)
+
+    chat = SimpleNamespace(id=77, type="private", send_message=AsyncMock())
+
+    def make_update(text: str, message_id: int):
+        msg = SimpleNamespace(
+            text=text,
+            caption=None,
+            document=None,
+            photo=None,
+            audio=None,
+            voice=None,
+            video=None,
+            chat_id=77,
+            message_id=message_id,
+            message_thread_id=None,
+            chat=SimpleNamespace(send_action=AsyncMock()),
+            reply_text=AsyncMock(),
+        )
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(id=1), effective_chat=chat, message=msg
+        )
+
+    first_release = threading.Event()
+    calls: list[str] = []
+
+    def relay(**kwargs):
+        calls.append(kwargs["prompt"])
+        if len(calls) == 1:
+            first_release.wait(timeout=5)
+        return RunResult(stdout="done", stderr="", returncode=0)
+
+    async def _run():
+        telegram_bot._ACTIVE_JOBS.clear()
+        telegram_bot._PENDING_TURNS.clear()
+        first = make_update("請實作第一個功能", 1)
+        second = make_update("請實作第二個功能", 2)
+        with patch.object(telegram_bot, "relay_turn", side_effect=relay), patch.object(
+            telegram_bot, "_send_relay_output", new=AsyncMock()
+        ):
+            await telegram_bot._on_message(first, SimpleNamespace())
+            await telegram_bot._on_message(second, SimpleNamespace())
+            assert "已加入等待佇列" in second.message.reply_text.await_args.args[0]
+            assert telegram_bot._queue_size("private:77") == 1
+            first_release.set()
+            while telegram_bot._BACKGROUND_TASKS:
+                await asyncio.gather(*tuple(telegram_bot._BACKGROUND_TASKS))
+            assert calls == ["請實作第一個功能", "請實作第二個功能"]
+        telegram_bot._ACTIVE_JOBS.clear()
+        telegram_bot._PENDING_TURNS.clear()
 
     asyncio.run(_run())
 

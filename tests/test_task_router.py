@@ -82,6 +82,20 @@ keywords = ["ping"]
                 self.assertEqual(decision.route, Route.DELEGATE)
                 self.assertTrue(any(rule.id == "batch_backfill_job" for rule in decision.matched_rules))
 
+    def test_single_scope_coding_is_delegated_for_cursor_implementation(self) -> None:
+        loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})
+        for text in (
+            "請實作登入頁的欄位驗證",
+            "幫我修 bug 並補測試",
+            "implement a cache function",
+        ):
+            with self.subTest(text=text):
+                decision = route_text(text, loaded.config)
+                self.assertEqual(decision.route, Route.DELEGATE)
+                self.assertTrue(
+                    any(rule.id == "coding_implementation" for rule in decision.matched_rules)
+                )
+
     def test_explicit_worker_delegation_overrides_status_words(self) -> None:
         loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})
         text = "資料是不是還沒補完？還沒補完派子WORKER去補"

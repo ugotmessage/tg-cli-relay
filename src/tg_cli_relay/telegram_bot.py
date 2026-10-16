@@ -6,6 +6,10 @@ import hashlib
 import logging
 import os
 import re
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 from tg_cli_relay.attachments import (
@@ -39,7 +43,68 @@ log = logging.getLogger(__name__)
 TG_CHUNK = 3800
 _BOT_LOCK_FILE = None
 _ACTIVE_RELAY_THREADS: set[str] = set()
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
+
+@dataclass(slots=True)
+class RelayJob:
+    job_id: str
+    parent_key: str
+    worker_key: str
+    backend: Backend
+    started_at: float
+    finished_at: float | None = None
+    status: str = "starting"
+    latest_progress: str = "等待 worker 啟動"
+
+
+@dataclass(slots=True)
+class QueuedTurn:
+    msg: object
+    key: str
+    backend: Backend
+    prompt: str
+    store_path: Path
+    attachment_config: AttachmentConfig
+    route: Route
+
+
+_ACTIVE_JOBS: dict[str, RelayJob] = {}
+_RECENT_JOBS: dict[str, RelayJob] = {}
+_PENDING_TURNS: dict[str, deque[QueuedTurn]] = {}
+_QUEUE_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
 SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
+
+
+def _job_status_text(job: RelayJob) -> str:
+    end = job.finished_at if job.finished_at is not None else time.monotonic()
+    elapsed = max(0, int(end - job.started_at))
+    latest = job.latest_progress.strip() or "尚無進度訊息"
+    if len(latest) > 600:
+        latest = latest[-600:]
+    return (
+        f"背景工作 {job.job_id}\n"
+        f"狀態: {job.status}\n"
+        f"已執行: {elapsed} 秒\n"
+        f"最新進度: {latest}"
+    )
+
+
+def _is_progress_query(text: str) -> bool:
+    normalized = text.casefold().strip()
+    return any(
+        term in normalized
+        for term in ("進度", "做到哪", "現在怎樣", "現在如何", "還在跑", "job status", "progress")
+    )
+
+
+def _queue_limit() -> int:
+    raw = os.environ.get("TGR_THREAD_QUEUE_MAX", "20").strip() or "20"
+    return max(1, int(raw))
+
+
+def _queue_size(thread_key: str) -> int:
+    return len(_PENDING_TURNS.get(thread_key, ()))
 
 
 def _allowed_ids() -> set[int] | None:
@@ -114,13 +179,24 @@ def _models_for_backend(backend: Backend) -> list[str]:
     return []
 
 
-def _format_model_catalog(store: SessionStore, thread_key: str, active_backend: Backend) -> str:
+async def _models_for_backend_live(backend: Backend) -> list[str]:
+    if backend == "cursor":
+        from tg_cli_relay.providers.cursor_agent import list_cursor_models
+
+        agent_bin = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
+        return await asyncio.to_thread(list_cursor_models, agent_bin)
+    return _models_for_backend(backend)
+
+
+async def _format_model_catalog(
+    store: SessionStore, thread_key: str, active_backend: Backend
+) -> str:
     lines = [f"目前 provider: {active_backend}", ""]
     for backend in _enabled_backends():
         marker = "*" if backend == active_backend else "-"
         current = effective_model_for_backend(store, thread_key, backend)
         lines.append(f"{marker} {backend} 目前模型: {current}")
-        models = _models_for_backend(backend)
+        models = await _models_for_backend_live(backend)
         if models:
             lines.extend(f"  {model}" for model in models)
         else:
@@ -176,6 +252,12 @@ async def _cmd_status(update, context) -> None:  # type: ignore[no-untyped-def]
         f"模型: {effective_model_for_backend(store, key, backend)}",
         f"可用 providers: {', '.join(_enabled_backends())}",
     ]
+    job = _ACTIVE_JOBS.get(key) or _RECENT_JOBS.get(key)
+    if job is not None:
+        lines.extend(["", _job_status_text(job)])
+    queued = _queue_size(key)
+    if queued:
+        lines.extend(["", f"等待中的訊息: {queued}"])
     await update.message.reply_text("\n".join(lines))
 
 
@@ -218,7 +300,9 @@ async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
     args: list[str] = context.args or []
 
     if not args:
-        await update.message.reply_text(_format_model_catalog(store, key, backend))
+        catalog = await _format_model_catalog(store, key, backend)
+        for chunk in _chunk_reply(catalog):
+            await update.message.reply_text(chunk)
         return
 
     maybe_backend = _parse_backend(args[0])
@@ -232,16 +316,16 @@ async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
         store.set_pref(key, "backend", backend)
         if len(args) == 1:
             current = effective_model_for_backend(store, key, backend)
-            models = "\n".join(f"  {m}" for m in _models_for_backend(backend))
-            await update.message.reply_text(
-                f"Provider 已切換至 {backend}\n目前模型: {current}\n\n可用模型:\n{models}"
-            )
+            models = "\n".join(f"  {m}" for m in await _models_for_backend_live(backend))
+            body = f"Provider 已切換至 {backend}\n目前模型: {current}\n\n可用模型:\n{models}"
+            for chunk in _chunk_reply(body):
+                await update.message.reply_text(chunk)
             return
         chosen = args[1]
     else:
         chosen = args[0]
 
-    models = _models_for_backend(backend)
+    models = await _models_for_backend_live(backend)
     if models and chosen not in models:
         await update.message.reply_text(f"不支援的模型: {chosen}\n可用: {', '.join(models)}")
         return
@@ -275,6 +359,8 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
         "/model [provider] [名稱] — 查看或切換模型",
         "/router — 查看 Task Router 規則與設定來源",
         "/router test <文字> — 測試 DIRECT / DELEGATE 判斷",
+        "進度 — 查詢目前背景 worker 狀態",
+        "忙碌期間的新訊息會依序排隊，完成後自動處理。",
         "/help — 顯示此說明",
         "",
         "附件：可傳 document / photo / audio / voice / video（含 caption）。",
@@ -502,6 +588,230 @@ async def _send_relay_output(
         await _reply_text_with_retry(msg, "\n".join(upload_failures))
 
 
+async def _execute_relay_turn(
+    *,
+    msg,
+    key: str,
+    backend: Backend,
+    prompt: str,
+    store: SessionStore,
+    attachment_config: AttachmentConfig,
+    show_typing: bool,
+    job: RelayJob | None = None,
+) -> None:
+    typing_task: asyncio.Task[None] | None = None
+    try:
+        from telegram.constants import ChatAction
+
+        async def _typing_loop() -> None:
+            while True:
+                try:
+                    await msg.chat.send_action(action=ChatAction.TYPING)
+                except Exception as exc:
+                    log.warning(
+                        "Telegram typing action failed; continuing without typing indicator: %s",
+                        exc,
+                    )
+                await asyncio.sleep(4)
+
+        if show_typing:
+            typing_task = asyncio.create_task(_typing_loop())
+
+        loop = asyncio.get_running_loop()
+
+        def _live_progress(text: str) -> None:
+            if job is not None:
+                job.status = "running"
+                job.latest_progress = text
+            future = asyncio.run_coroutine_threadsafe(
+                _reply_text_with_retry(msg, text), loop
+            )
+            try:
+                future.result()
+            except Exception as exc:
+                log.warning("Codex live progress delivery failed: %s", exc)
+
+        try:
+            res = await asyncio.to_thread(
+                relay_turn,
+                thread_key=key,
+                backend=backend,
+                prompt=prompt,
+                store=store,
+                on_progress=_live_progress if backend == "codex" else None,
+            )
+        except Exception as exc:
+            log.exception("relay_turn 失敗 thread=%s", key)
+            if job is not None:
+                job.status = "failed"
+                job.latest_progress = f"relay 執行失敗: {type(exc).__name__}"
+            await _reply_text_with_retry(msg, "執行失敗，請查看伺服器日誌。")
+            return
+
+        out = res.stdout or ""
+        err = res.stderr or ""
+        if res.returncode == 0:
+            body = out
+            if job is not None:
+                job.status = "completed"
+                job.latest_progress = "worker 已完成並回傳結果"
+        elif err.strip():
+            body = f"{out}\n\n--- stderr ---\n{err}".strip()
+            if job is not None:
+                job.status = "failed"
+                job.latest_progress = f"worker 結束，return code {res.returncode}"
+        else:
+            body = out
+            if job is not None:
+                job.status = "failed"
+                job.latest_progress = f"worker 結束，return code {res.returncode}"
+
+        sid = store.get(key, backend)
+        model = effective_model_for_backend(store, key, backend)
+        await _send_relay_output(
+            msg,
+            body,
+            backend=backend,
+            model=model,
+            sid=sid,
+            attachment_config=attachment_config,
+            segments=res.stdout_segments,
+        )
+    finally:
+        _ACTIVE_RELAY_THREADS.discard(key)
+        if typing_task is not None:
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await typing_task
+
+
+async def _run_background_job(
+    *,
+    msg,
+    job: RelayJob,
+    prompt: str,
+    store_path: Path,
+    attachment_config: AttachmentConfig,
+) -> None:
+    try:
+        job.status = "running"
+        job.latest_progress = "Orchestrator 已啟動獨立 worker session"
+        await _execute_relay_turn(
+            msg=msg,
+            key=job.worker_key,
+            backend=job.backend,
+            prompt=prompt,
+            store=SessionStore(store_path),
+            attachment_config=attachment_config,
+            show_typing=False,
+            job=job,
+        )
+    except Exception as exc:
+        job.status = "failed"
+        job.latest_progress = f"背景工作異常中止: {type(exc).__name__}"
+        log.exception("背景 relay job 失敗 job=%s", job.job_id)
+    finally:
+        job.finished_at = time.monotonic()
+        _ACTIVE_JOBS.pop(job.parent_key, None)
+        _RECENT_JOBS[job.parent_key] = job
+        _schedule_queue_drain(job.parent_key)
+
+
+async def _start_background_job(turn: QueuedTurn) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    worker_key = f"{turn.key}:job:{job_id}"
+    job = RelayJob(
+        job_id=job_id,
+        parent_key=turn.key,
+        worker_key=worker_key,
+        backend=turn.backend,
+        started_at=time.monotonic(),
+    )
+    _ACTIVE_JOBS[turn.key] = job
+    try:
+        await _reply_text_with_retry(
+            turn.msg,
+            f"已派出背景 worker（job {job_id}）。主對話可繼續使用；傳送「進度」可隨時查詢，完成後會自動回報。",
+        )
+    except Exception:
+        _ACTIVE_JOBS.pop(turn.key, None)
+        raise
+    task = asyncio.create_task(
+        _run_background_job(
+            msg=turn.msg,
+            job=job,
+            prompt=turn.prompt,
+            store_path=turn.store_path,
+            attachment_config=turn.attachment_config,
+        )
+    )
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _run_direct_turn(turn: QueuedTurn) -> None:
+    _ACTIVE_RELAY_THREADS.add(turn.key)
+    await _execute_relay_turn(
+        msg=turn.msg,
+        key=turn.key,
+        backend=turn.backend,
+        prompt=turn.prompt,
+        store=SessionStore(turn.store_path),
+        attachment_config=turn.attachment_config,
+        show_typing=True,
+    )
+    _schedule_queue_drain(turn.key)
+
+
+async def _drain_thread_queue(key: str) -> None:
+    try:
+        while True:
+            queue = _PENDING_TURNS.get(key)
+            if not queue:
+                _PENDING_TURNS.pop(key, None)
+                return
+            turn = queue[0]
+            if key in _ACTIVE_RELAY_THREADS:
+                return
+            if turn.route == Route.DELEGATE:
+                if key in _ACTIVE_JOBS:
+                    return
+                queue.popleft()
+                await _start_background_job(turn)
+                continue
+            queue.popleft()
+            await _run_direct_turn(turn)
+    finally:
+        _QUEUE_DRAIN_TASKS.pop(key, None)
+
+
+def _schedule_queue_drain(key: str) -> None:
+    current = _QUEUE_DRAIN_TASKS.get(key)
+    if current is not None and not current.done():
+        return
+    task = asyncio.create_task(_drain_thread_queue(key))
+    _QUEUE_DRAIN_TASKS[key] = task
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _enqueue_turn(turn: QueuedTurn) -> bool:
+    queue = _PENDING_TURNS.setdefault(turn.key, deque())
+    if len(queue) >= _queue_limit():
+        await _reply_text_with_retry(
+            turn.msg,
+            f"等待佇列已滿（上限 {_queue_limit()} 則），請稍後再傳。",
+        )
+        return False
+    queue.append(turn)
+    await _reply_text_with_retry(
+        turn.msg,
+        f"已加入等待佇列，目前順位 {len(queue)}；前一項完成後會自動處理並回覆。",
+    )
+    _schedule_queue_drain(turn.key)
+    return True
+
+
 async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     if update.effective_user is None or update.effective_chat is None:
         return
@@ -550,92 +860,32 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
     store = SessionStore(store_path)
     backend = _backend_for_thread(store, key)
-    if key in _ACTIVE_RELAY_THREADS:
-        await _reply_text_with_retry(
-            msg,
-            "這個對話已有任務在背景處理；完成後會自動回報，未重複啟動。",
-        )
+
+    active_job = _ACTIVE_JOBS.get(key)
+    if active_job is not None and _is_progress_query(prompt):
+        await _reply_text_with_retry(msg, _job_status_text(active_job))
         return
-    _ACTIVE_RELAY_THREADS.add(key)
-    typing_task: asyncio.Task[None] | None = None
-    try:
-        # DELEGATE 任務先回 ACK 並保持主對話可用；長時間工作不持續顯示 typing。
-        if decision.route == Route.DELEGATE:
-            await _reply_text_with_retry(
-                msg,
-                "已接單並交由背景工作處理；主對話不會等待完成，結果會自動回報。",
-            )
 
-        from telegram.constants import ChatAction
+    turn = QueuedTurn(
+        msg=msg,
+        key=key,
+        backend=backend,
+        prompt=prompt,
+        store_path=store_path,
+        attachment_config=attachment_config,
+        route=decision.route,
+    )
 
-        async def _typing_loop() -> None:
-            while True:
-                try:
-                    await msg.chat.send_action(action=ChatAction.TYPING)
-                except Exception as exc:
-                    log.warning("Telegram typing action failed; continuing without typing indicator: %s", exc)
-                await asyncio.sleep(4)
+    if decision.route == Route.DELEGATE and active_job is None and not _PENDING_TURNS.get(key):
+        await _start_background_job(turn)
+        return
 
-        if decision.route == Route.DIRECT:
-            typing_task = asyncio.create_task(_typing_loop())
-
-        loop = asyncio.get_running_loop()
-
-        def _live_progress(text: str) -> None:
-            # Called from the Codex subprocess worker thread. Block until Telegram
-            # accepts the message so progress ordering stays deterministic.
-            future = asyncio.run_coroutine_threadsafe(
-                _reply_text_with_retry(msg, text), loop
-            )
-            try:
-                future.result()
-            except Exception as exc:
-                # A transient progress-send failure must not abort the Codex
-                # subprocess; the final response still has a chance to arrive.
-                log.warning("Codex live progress delivery failed: %s", exc)
-
-        try:
-            # relay_turn 內部會跑 subprocess，改放到 thread 避免阻塞 event loop，
-            # 才能持續送出 Telegram typing 狀態。
-            res = await asyncio.to_thread(
-                relay_turn,
-                thread_key=key,
-                backend=backend,
-                prompt=prompt,
-                store=store,
-                on_progress=_live_progress if backend == "codex" else None,
-            )
-        except Exception:
-            log.exception("relay_turn 失敗 thread=%s", key)
-            await _reply_text_with_retry(msg, "執行失敗，請查看伺服器日誌。")
-            return
-
-        out = res.stdout or ""
-        err = res.stderr or ""
-        if res.returncode == 0:
-            body = out
-        elif err.strip():
-            body = f"{out}\n\n--- stderr ---\n{err}".strip()
-        else:
-            body = out
-
-        sid = store.get(key, backend)
-        model = effective_model_for_backend(store, key, backend)
-        await _send_relay_output(
-            msg,
-            body,
-            backend=backend,
-            model=model,
-            sid=sid,
-            attachment_config=attachment_config,
-            segments=res.stdout_segments,
-        )
-    finally:
-        _ACTIVE_RELAY_THREADS.discard(key)
-        if typing_task is not None:
-            typing_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await typing_task
+    if key in _ACTIVE_RELAY_THREADS or (
+        decision.route == Route.DELEGATE and active_job is not None
+    ) or _PENDING_TURNS.get(key):
+        await _enqueue_turn(turn)
+        return
+    await _run_direct_turn(turn)
 
 
 def _bot_singleton_lock_path(token: str) -> Path:

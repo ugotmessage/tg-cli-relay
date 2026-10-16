@@ -120,6 +120,20 @@ DEFAULT_RULES: tuple[RouterRule, ...] = (
         patterns=(r"\b(3\+|three|multiple|many)\s+(files?|modules?|scopes?)\b",),
     ),
     RouterRule(
+        id="coding_implementation",
+        route=Route.DELEGATE,
+        weight=4,
+        description="Coding and implementation are execution work for a Cursor worker; the orchestrator reviews.",
+        keywords=(
+            "寫程式", "改程式", "修改程式", "實作", "開發功能", "新增功能", "修 bug", "修bug",
+            "補測試", "寫測試", "coding", "implement", "implementation", "fix bug",
+        ),
+        patterns=(
+            r"\b(?:add|build|create|develop|implement|patch|refactor)\b.{0,24}\b(?:code|feature|function|module|test)s?\b",
+            r"\bfix(?:ing|ed)?\b.{0,16}\b(?:bug|code|test)s?\b",
+        ),
+    ),
+    RouterRule(
         id="full_delivery_pipeline",
         route=Route.DELEGATE,
         weight=5,

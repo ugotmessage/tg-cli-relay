@@ -47,6 +47,14 @@ keywords = ["跨檔", "多檔", "三個檔案", "3+ 檔", "重構", "refactor", 
 patterns = ["\\b(3\\+|three|multiple|many)\\s+(files?|modules?|scopes?)\\b"]
 
 [[rules]]
+id = "coding_implementation"
+route = "delegate"
+weight = 4
+description = "Coding and implementation are execution work for a Cursor worker; the orchestrator reviews."
+keywords = ["寫程式", "改程式", "修改程式", "實作", "開發功能", "新增功能", "修 bug", "修bug", "補測試", "寫測試", "coding", "implement", "implementation", "fix bug"]
+patterns = ["\\b(?:add|build|create|develop|implement|patch|refactor)\\b.{0,24}\\b(?:code|feature|function|module|test)s?\\b", "\\bfix(?:ing|ed)?\\b.{0,16}\\b(?:bug|code|test)s?\\b"]
+
+[[rules]]
 id = "full_delivery_pipeline"
 route = "delegate"
 weight = 5

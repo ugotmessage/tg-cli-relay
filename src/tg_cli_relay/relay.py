@@ -9,7 +9,7 @@ from tg_cli_relay.providers.codex_cli import CodexCliProvider
 from tg_cli_relay.providers.cursor_agent import CursorAgentProvider
 from tg_cli_relay.providers.opencode_cli import OpencodeCliProvider, parse_opencode_output
 from tg_cli_relay.session_store import Backend, SessionStore
-from tg_cli_relay.task_router import render_router_prefix
+from tg_cli_relay.task_router import Route, load_task_router_config, render_router_prefix, route_text
 
 
 def apply_cursor_harness_prefix(prompt: str) -> str:
@@ -25,6 +25,86 @@ def apply_cursor_harness_prefix(prompt: str) -> str:
     else:
         prefix = render_router_prefix(prompt)
     return f"{prefix}{prompt}"
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    import os
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _codex_cursor_worker_prompt(prompt: str) -> str:
+    return (
+        "You are the implementation/investigation Worker for a Codex Orchestrator. "
+        "Handle only the user's requested scope in the current workspace. Inspect existing "
+        "instructions first, make the smallest safe changes, and run proportionate validation. "
+        "Do not deploy, restart services, migrate databases, change permissions/accounts, send "
+        "external messages, spend money, or perform real transactions without explicit user "
+        "confirmation. Finish with a concise Traditional Chinese handoff covering changes, paths, "
+        "validation, risks, and blockers.\n\n"
+        f"User request:\n{prompt}"
+    )
+
+
+def _codex_orchestrator_prompt(prompt: str, worker: RunResult) -> str:
+    import os
+
+    limit_raw = os.environ.get("TGR_CODEX_CURSOR_RESULT_MAX_CHARS", "24000").strip() or "24000"
+    limit = max(1000, int(limit_raw))
+    report = (worker.stdout or "(Cursor worker returned no stdout)").strip()
+    if len(report) > limit:
+        report = report[:limit] + "\n[Cursor worker report truncated by relay]"
+    return (
+        "A Cursor Worker has already handled the implementation/execution portion of this request "
+        "in the same workspace. Act strictly as the Codex Reviewer and Orchestrator: inspect the "
+        "actual workspace state, review the diff for correctness and scope, run or inspect "
+        "proportionate validation, identify unresolved issues and risks, and make the final "
+        "judgement. Do not redo routine coding that belongs to the Cursor Worker and do not blindly "
+        "repeat its report. Give the final answer in Traditional Chinese.\n\n"
+        f"Original user request:\n{prompt}\n\n"
+        f"Cursor Worker report (return code {worker.returncode}):\n{report}"
+    )
+
+
+def _run_codex_cursor_worker(
+    store: SessionStore,
+    thread_key: str,
+    workspace: str,
+    prompt: str,
+) -> RunResult | None:
+    """Run heavy Codex work in an isolated Cursor session; None means Codex should fall back."""
+    import os
+
+    if not _env_enabled("TGR_CODEX_DELEGATE_TO_CURSOR", default=True):
+        return None
+    decision = route_text(prompt, load_task_router_config().config)
+    if decision.route != Route.DELEGATE:
+        return None
+
+    bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
+    timeout_raw = os.environ.get("TGR_CURSOR_DELEGATE_TIMEOUT", "3600").strip() or "3600"
+    provider = CursorAgentProvider(
+        agent_bin=bin_name,
+        model=resolve_cursor_model(store, thread_key),
+        timeout_seconds=int(timeout_raw),
+    )
+    worker_key = f"{thread_key}:codex-cursor-worker"
+    try:
+        sid = store.get(worker_key, "cursor")
+        if not sid:
+            sid = provider.create_session()
+            store.upsert(worker_key, "cursor", sid, workspace=workspace)
+        result = provider.run_turn(
+            workspace=workspace,
+            session_id=sid,
+            prompt=_codex_cursor_worker_prompt(prompt),
+        )
+    except Exception:
+        return None
+    return result if result.returncode == 0 else None
 
 
 def _default_db_path() -> Path:
@@ -100,7 +180,12 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
     import os
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
-    timeout_raw = os.environ.get("TGR_CURSOR_TIMEOUT", "600").strip() or "600"
+    decision = route_text(prompt, load_task_router_config().config)
+    timeout_var = (
+        "TGR_CURSOR_DELEGATE_TIMEOUT" if decision.route == Route.DELEGATE else "TGR_CURSOR_TIMEOUT"
+    )
+    timeout_default = "3600" if decision.route == Route.DELEGATE else "600"
+    timeout_raw = os.environ.get(timeout_var, timeout_default).strip() or timeout_default
     timeout_seconds = int(timeout_raw)
     model = _get_model(store, thread_key, "cursor")
     prov = CursorAgentProvider(agent_bin=bin_name, model=model, timeout_seconds=timeout_seconds)
@@ -178,8 +263,10 @@ def _relay_codex(
         model=model,
     )
     sid = store.get(thread_key, "codex")
+    worker = _run_codex_cursor_worker(store, thread_key, workspace, prompt)
+    codex_prompt = _codex_orchestrator_prompt(prompt, worker) if worker is not None else prompt
     res = prov.run_turn(
-        workspace=workspace, session_id=sid, prompt=prompt, on_progress=on_progress
+        workspace=workspace, session_id=sid, prompt=codex_prompt, on_progress=on_progress
     )
     if res.session_id and res.session_id != sid:
         store.upsert(thread_key, "codex", res.session_id, workspace=workspace)

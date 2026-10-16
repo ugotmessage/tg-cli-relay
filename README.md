@@ -90,11 +90,15 @@ cp env.example .env
 | `TGR_CURSOR_AGENT_BIN` | `agent` | Cursor Agent CLI 路徑 |
 | `TGR_CURSOR_MODEL` | `auto` | Cursor relay 預設模型；僅影響本 relay，不受其它 CLI 呼叫或舊版 `model` 偏好影響。可用 Telegram `/model <id>` 或 `model:cursor` 覆寫 |
 | `TGR_CURSOR_TIMEOUT` | `600` | Cursor agent 單輪逾時秒數；`0` 表示不限制 |
+| `TGR_CURSOR_DELEGATE_TIMEOUT` | `3600` | Cursor `DELEGATE`／Codex→Cursor Worker 長工作逾時秒數；仍維持有界，避免永久卡死 |
 | `TGR_ROUTER_CONFIG` | `router.toml` / `config/router.toml` | Task Router TOML 設定檔；遺失或錯誤會 fallback 至內建規則 |
 | `TGR_CURSOR_HARNESS_PREFIX` | `1` | 設為 `0` 可關閉 Cursor Task Router / harness prompt 前綴 |
 | `TGR_CURSOR_PROMPT_PREFIX` | （未設定） | 完全覆寫 Cursor prompt 前綴；設定後不使用 Task Router 產生的前綴 |
+| `TGR_THREAD_QUEUE_MAX` | `20` | 每個 Telegram thread 忙碌時可緩存的訊息上限；FIFO 自動接續處理 |
 | `TGR_CODEX_BIN` | `codex` | OpenAI Codex CLI 路徑 |
 | `TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX` | （未設定） | 設為 `1` 啟用 `--dangerously-bypass-approvals-and-sandbox` |
+| `TGR_CODEX_DELEGATE_TO_CURSOR` | `1` | Codex 收到 coding、實作、大量簡易或其他 `DELEGATE` 工作時，先交給獨立 Cursor Worker 執行，再由 Codex 審核；設為 `0` 關閉，Cursor 失敗會自動回退 Codex |
+| `TGR_CODEX_CURSOR_RESULT_MAX_CHARS` | `24000` | 傳回 Codex 的 Cursor Worker 報告字元上限，避免 Worker 輸出耗用過多 Codex context |
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
 | `TGR_CLAUDE_SKIP_PERMISSIONS` | （未設定） | 設為 `1` 啟用 `--dangerously-skip-permissions` |
 | `TGR_OPENCODE_BIN` | `opencode` | OpenCode CLI 路徑 |
@@ -127,7 +131,9 @@ Cursor relay 會在送入 `agent --print` 前，用 **rule-based** Task Router �
 
 Router 不使用 LLM classifier；只依 TOML 規則的 `keywords` / regex `patterns` / `weight` / `threshold` 加總判斷。批次補檔會依「回補、分批、長時間監控、背景工作」等任務語意判斷，不綁定某個固定檔案數量。設定檔遺失或格式錯誤時會使用內建 fallback 規則，不會讓 bot 啟動失敗。
 
-`DELEGATE` 任務會先立即回覆接單訊息，不持續顯示 `typing`；relay turn 以非阻塞 handler 執行，因此慢速 provider 不會卡住 Telegram update loop。同一 thread 同時只允許一個 relay turn，後續重複要求會回報已有背景工作，不會重複啟動。
+Codex backend 預設也使用同一份判定，遵守知識庫的「勞力活外包，決策活自己做」原則。coding／實作與大量簡易工作會先由隔離的 Cursor session 執行，再把精簡報告交給原 Codex session 檢查 workspace、review diff、驗證與下最後結論；需求理解、架構決策、高風險判斷與審核留給 Codex。`DIRECT` 問答仍只呼叫 Codex。若 Cursor CLI、認證、額度或執行失敗，relay 會以原始 prompt 回退到 Codex。
+
+`DELEGATE` 任務會建立獨立的 job session，先回覆 job id，然後立即釋放主對話；背景 worker 完成後會自動回報。執行期間可傳送「進度」或使用 `/status` 查詢 job 狀態、執行秒數、最近一則進度與排隊數量，其他 DIRECT 訊息仍由主 session 處理。同一 thread 同時只執行一個背景 job；忙碌期間收到的新訊息不會丟棄，而是放入記憶體 FIFO queue，前一輪完成後自動執行並回覆。queue 預設最多 20 則，可用 `TGR_THREAD_QUEUE_MAX` 調整；服務重啟時尚未執行的記憶體 queue 不會保留。
 
 ```bash
 cp deploy/router.toml.example router.toml
@@ -149,6 +155,7 @@ Telegram 內可用：
 ### Cursor
 - **OAuth（建議）**：在執行 bot 的同一使用者環境下執行 `agent login`，憑證存於家目錄。systemd 的 `User=` 必須與登入帳號一致。
 - **API Key**：設定 `CURSOR_API_KEY` 環境變數。
+- `/model` 會從 `agent --list-models` 動態取得最新清單並快取一小時；CLI 查詢失敗時才退回內建清單。
 
 ### Codex
 執行 `codex login` 或依 CLI 文件設定 API Key。
