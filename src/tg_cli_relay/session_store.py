@@ -16,6 +16,10 @@ class SessionStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
+
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self._db_path)

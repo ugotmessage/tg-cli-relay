@@ -37,6 +37,8 @@ def test_heavy_codex_task_delegates_to_cursor_then_codex(tmp_path: Path, monkeyp
     assert "Cursor Worker report" in codex_prompt
     assert "Codex Reviewer and Orchestrator" in codex_prompt
     assert "Do not redo routine coding" in codex_prompt
+    assert "review ONLY this current request" in codex_prompt
+    assert "Do not treat historical tasks" in codex_prompt
     assert "已修改兩個 scope 並跑完測試" in codex_prompt
     assert store.get("chat:1:codex-cursor-worker", "cursor") == "cursor-worker-1"
 
@@ -117,6 +119,36 @@ def test_cursor_failure_falls_back_to_original_codex_prompt(tmp_path: Path, monk
         )
 
     assert codex_cls.return_value.run_turn.call_args.kwargs["prompt"] == prompt
+
+
+def test_orchestrator_prompt_scopes_nested_worker_to_current_task(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TGR_CODEX_DELEGATE_TO_CURSOR", "1")
+    monkeypatch.setenv("TGR_ROUTER_CONFIG", str(tmp_path / "missing-router.toml"))
+    store = SessionStore(tmp_path / "sessions.sqlite3")
+
+    with patch("tg_cli_relay.relay.CursorAgentProvider") as cursor_cls, patch(
+        "tg_cli_relay.relay.CodexCliProvider"
+    ) as codex_cls:
+        cursor_cls.return_value.create_session.return_value = "cursor-task-worker"
+        cursor_cls.return_value.run_turn.return_value = RunResult(
+            stdout="current task only", stderr="", returncode=0
+        )
+        codex_cls.return_value.run_turn.return_value = RunResult(
+            stdout="review", stderr="", returncode=0
+        )
+        relay_turn(
+            thread_key="private:9:job:abcd1234",
+            backend="codex",
+            prompt="請跨多檔重構並跑完整測試",
+            store=store,
+            workspace=str(tmp_path),
+        )
+
+    assert store.get("private:9:job:abcd1234:codex-cursor-worker", "cursor") == "cursor-task-worker"
+    assert "current task only" in codex_cls.return_value.run_turn.call_args.kwargs["prompt"]
+    assert "Current task id: abcd1234" in codex_cls.return_value.run_turn.call_args.kwargs["prompt"]
+    assert "Do not treat historical tasks" in codex_cls.return_value.run_turn.call_args.kwargs["prompt"]
+    assert "Do not deploy, restart services" in cursor_cls.return_value.run_turn.call_args.kwargs["prompt"]
 
 
 def test_delegation_can_be_disabled(tmp_path: Path, monkeypatch) -> None:

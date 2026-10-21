@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -41,8 +42,16 @@ def apply_cursor_worker_prefix(prompt: str) -> str:
     return f"{prefix}{prompt}"
 
 
+_TASK_ID_IN_KEY = re.compile(r":job:([0-9a-f]+)")
+
+
 def _is_relay_worker_thread(thread_key: str) -> bool:
     return ":job:" in thread_key
+
+
+def task_id_from_thread_key(thread_key: str) -> str | None:
+    match = _TASK_ID_IN_KEY.search(thread_key)
+    return match.group(1) if match else None
 
 
 def _env_enabled(name: str, default: bool = False) -> bool:
@@ -67,7 +76,12 @@ def _codex_cursor_worker_prompt(prompt: str) -> str:
     )
 
 
-def _codex_orchestrator_prompt(prompt: str, worker: RunResult) -> str:
+def _codex_orchestrator_prompt(
+    prompt: str,
+    worker: RunResult,
+    *,
+    thread_key: str = "",
+) -> str:
     import os
 
     limit_raw = os.environ.get("TGR_CODEX_CURSOR_RESULT_MAX_CHARS", "24000").strip() or "24000"
@@ -75,7 +89,15 @@ def _codex_orchestrator_prompt(prompt: str, worker: RunResult) -> str:
     report = (worker.stdout or "(Cursor worker returned no stdout)").strip()
     if len(report) > limit:
         report = report[:limit] + "\n[Cursor worker report truncated by relay]"
+    task_id = task_id_from_thread_key(thread_key)
+    scope = (
+        "Scope: review ONLY this current request and the Cursor Worker report below. "
+        "Do not treat historical tasks, prior jobs, or other chat threads as the requested work."
+    )
+    if task_id:
+        scope += f" Current task id: {task_id}."
     return (
+        f"{scope}\n\n"
         "A Cursor Worker has already handled the implementation/execution portion of this request "
         "in the same workspace. Act strictly as the Codex Reviewer and Orchestrator: inspect the "
         "actual workspace state, review the diff for correctness and scope, run or inspect "
@@ -287,7 +309,11 @@ def _relay_codex(
     )
     sid = store.get(thread_key, "codex")
     worker = _run_codex_cursor_worker(store, thread_key, workspace, prompt)
-    codex_prompt = _codex_orchestrator_prompt(prompt, worker) if worker is not None else prompt
+    codex_prompt = (
+        _codex_orchestrator_prompt(prompt, worker, thread_key=thread_key)
+        if worker is not None
+        else prompt
+    )
     res = prov.run_turn(
         workspace=workspace, session_id=sid, prompt=codex_prompt, on_progress=on_progress
     )
