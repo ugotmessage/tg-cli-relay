@@ -243,11 +243,103 @@ def _register_new_task(turn: QueuedTurn, store: SessionStore, registry: TaskRegi
     return task
 
 
+_PROGRESS_QUERY_RE = re.compile(
+    r"^(?:"
+    r"進度(?:如何|怎樣)?"
+    r"|現在進度(?:如何|怎樣)?"
+    r"|做到哪(?:裡)?(?:了)?"
+    r"|現在怎樣|現在如何"
+    r"|還在跑(?:嗎)?"
+    r"|做好了嗎|好了嗎|做完了嗎|完成了嗎|跑完了嗎"
+    r"|job\s*status"
+    r"|progress"
+    r")[\s?？!！.。]*$",
+    re.IGNORECASE,
+)
+_CONTINUATION_RE = re.compile(
+    r"^(?:"
+    r"(?:請)?繼續(?:做|下去|吧)?"
+    r"|接著(?:做|下去)?"
+    r"|往下(?:做|去)?"
+    r"|continue(?:\s+please)?"
+    r"|keep\s+going"
+    r"|go\s+on"
+    r")[\s?？!！.。]*$",
+    re.IGNORECASE,
+)
+
+
 def _is_progress_query(text: str) -> bool:
-    normalized = text.casefold().strip()
-    return any(
-        term in normalized
-        for term in ("進度", "做到哪", "現在怎樣", "現在如何", "還在跑", "job status", "progress")
+    return bool(_PROGRESS_QUERY_RE.match((text or "").strip()))
+
+
+def _is_bare_continuation(text: str) -> bool:
+    return bool(_CONTINUATION_RE.match((text or "").strip()))
+
+
+def _job_like_from_turn(turn: QueuedTurn) -> RelayJob | None:
+    if not turn.task_id:
+        return None
+    return RelayJob(
+        job_id=turn.task_id,
+        parent_key=turn.key,
+        worker_key=turn.worker_key or "",
+        backend=turn.backend,
+        started_at=time.monotonic(),
+        title=turn.title,
+    )
+
+
+def _discard_queued_turn(pending: dict[str, deque[QueuedTurn]], key: str, turn: QueuedTurn) -> None:
+    queue = pending.get(key)
+    if queue is None:
+        return
+    try:
+        queue.remove(turn)
+    except ValueError:
+        return
+    if not queue:
+        pending.pop(key, None)
+
+
+def _pending_parent_turn_for_task(task_id: str) -> QueuedTurn | None:
+    for queue in _PENDING_TURNS.values():
+        for turn in queue:
+            if turn.task_id == task_id:
+                return turn
+    return None
+
+
+def _task_session_busy(task_id: str, worker_key: str | None) -> bool:
+    if task_id in _RUNNING_TASKS:
+        return True
+    if worker_key and worker_key in _ACTIVE_RELAY_THREADS:
+        return True
+    return False
+
+
+def _manual_resume_text(task: TaskRecord) -> str:
+    return _with_task_banner(
+        task,
+        (
+            f"任務 {task.task_id} 的原始請求尚未執行，不會自動跑後續訊息。\n"
+            f"請回覆該任務的訊息，或使用 /task {task.task_id} <說明> 手動繼續。"
+        ),
+    )
+
+
+async def _reply_task_status(
+    msg,
+    task: TaskRecord,
+    registry: TaskRegistry,
+    job: RelayJob | None = None,
+) -> None:
+    await _reply_text_with_retry(
+        msg,
+        _task_status_text(task, job),
+        job=task,
+        registry=registry,
+        role="status",
     )
 
 
@@ -540,7 +632,9 @@ async def _cmd_task(update, context) -> None:  # type: ignore[no-untyped-def]
         busy = key in _ACTIVE_RELAY_THREADS or key in _ACTIVE_JOBS or bool(_PENDING_TURNS.get(key))
         _register_new_task(turn, store, registry, "queued" if busy else "starting")
         if busy:
-            await _enqueue_turn(turn)
+            queued_ok = await _enqueue_turn(turn)
+            if not queued_ok:
+                registry.update_status(turn.task_id, "failed")
             return
         await _start_background_job(turn)
         return
@@ -552,11 +646,13 @@ async def _cmd_task(update, context) -> None:  # type: ignore[no-untyped-def]
         await msg.reply_text(f"找不到任務 {task_id}。請用 /task 查看本對話的任務。")
         return
     if task.parent_key != key:
-        await msg.reply_text(f"任務 {task_id} 不屬於這個對話／主題，無法在此繼續。")
+        await msg.reply_text(
+            f"任務 {task_id} [{task.title}] 不屬於這個對話／主題，無法在此繼續。"
+        )
         return
     if not prompt:
         job = _RUNNING_TASKS.get(task.task_id)
-        await msg.reply_text(_task_status_text(task, job))
+        await _reply_task_status(msg, task, registry, job)
         return
     await _resume_existing_task(
         task,
@@ -1029,6 +1125,9 @@ async def _run_background_job(
 
 
 async def _start_background_job(turn: QueuedTurn) -> None:
+    if turn.task_id and _task_session_busy(turn.task_id, turn.worker_key):
+        _PENDING_TURNS.setdefault(turn.key, deque()).appendleft(turn)
+        return
     registry = TaskRegistry(turn.store_path)
     job = _job_from_turn(turn, occupy_parent=True)
     try:
@@ -1046,6 +1145,8 @@ async def _start_background_job(turn: QueuedTurn) -> None:
         _ACTIVE_JOBS.pop(turn.key, None)
         _RUNNING_TASKS.pop(job.job_id, None)
         registry.update_status(job.job_id, "failed")
+        _PENDING_TASK_TURNS.pop(job.job_id, None)
+        _schedule_queue_drain(turn.key)
         raise
     task = asyncio.create_task(
         _run_background_job(
@@ -1062,6 +1163,11 @@ async def _start_background_job(turn: QueuedTurn) -> None:
 
 
 async def _start_task_followup(turn: QueuedTurn) -> None:
+    if not turn.task_id:
+        raise RuntimeError("follow-up routing must be frozen at arrival")
+    if _task_session_busy(turn.task_id, turn.worker_key) or _pending_parent_turn_for_task(turn.task_id):
+        _PENDING_TASK_TURNS.setdefault(turn.task_id, deque()).appendleft(turn)
+        return
     registry = TaskRegistry(turn.store_path)
     job = _job_from_turn(turn, occupy_parent=False)
     try:
@@ -1075,6 +1181,7 @@ async def _start_task_followup(turn: QueuedTurn) -> None:
     except Exception:
         _RUNNING_TASKS.pop(job.job_id, None)
         registry.update_status(job.job_id, "failed")
+        _schedule_task_drain(job.job_id)
         raise
     task = asyncio.create_task(
         _run_background_job(
@@ -1094,32 +1201,36 @@ async def _enqueue_task_followup(turn: QueuedTurn) -> bool:
     if not turn.task_id:
         raise RuntimeError("follow-up routing must be frozen at arrival")
     queue = _PENDING_TASK_TURNS.setdefault(turn.task_id, deque())
+    job_like = _job_like_from_turn(turn)
+    registry = TaskRegistry(turn.store_path)
     if len(queue) >= _queue_limit():
         await _reply_text_with_retry(
             turn.msg,
-            _with_task_banner(None, f"任務 {turn.task_id} 的等待佇列已滿（上限 {_queue_limit()} 則），請稍後再傳。"),
+            _with_task_banner(
+                job_like,
+                f"任務 {turn.task_id} 的等待佇列已滿（上限 {_queue_limit()} 則），請稍後再傳。",
+            ),
+            job=job_like,
+            registry=registry,
+            role="error",
         )
         return False
     queue.append(turn)
-    registry = TaskRegistry(turn.store_path)
-    job_like = RelayJob(
-        job_id=turn.task_id,
-        parent_key=turn.key,
-        worker_key=turn.worker_key or "",
-        backend=turn.backend,
-        started_at=time.monotonic(),
-        title=turn.title,
-    )
-    await _reply_text_with_retry(
-        turn.msg,
-        _with_task_banner(
-            job_like,
-            f"已加入任務 {turn.task_id} 的等待佇列，目前順位 {len(queue)}；前一項完成後會自動處理並回覆。",
-        ),
-        job=job_like,
-        registry=registry,
-        role="ack",
-    )
+    try:
+        await _reply_text_with_retry(
+            turn.msg,
+            _with_task_banner(
+                job_like,
+                f"已加入任務 {turn.task_id} 的等待佇列，目前順位 {len(queue)}；前一項完成後會自動處理並回覆。",
+            ),
+            job=job_like,
+            registry=registry,
+            role="ack",
+        )
+    except Exception:
+        _discard_queued_turn(_PENDING_TASK_TURNS, turn.task_id, turn)
+        _schedule_task_drain(turn.task_id)
+        raise
     _schedule_task_drain(turn.task_id)
     return True
 
@@ -1131,9 +1242,13 @@ async def _drain_task_queue(task_id: str) -> None:
             if not queue:
                 _PENDING_TASK_TURNS.pop(task_id, None)
                 return
-            if task_id in _RUNNING_TASKS:
+            turn = queue[0]
+            if _task_session_busy(task_id, turn.worker_key) or _pending_parent_turn_for_task(task_id):
                 return
-            turn = queue.popleft()
+            record = TaskRegistry(turn.store_path).get_task(task_id)
+            if record is not None and record.status in ("queued", "starting") and task_id not in _RUNNING_TASKS:
+                return
+            queue.popleft()
             await _start_task_followup(turn)
     finally:
         _TASK_DRAIN_TASKS.pop(task_id, None)
@@ -1172,7 +1287,21 @@ async def _resume_existing_task(
         title=task.title,
         kind="task_followup",
     )
-    if task.task_id in _RUNNING_TASKS or _PENDING_TASK_TURNS.get(task.task_id):
+    initial_pending = _pending_parent_turn_for_task(task.task_id) is not None
+    session_busy = _task_session_busy(task.task_id, task.worker_key)
+    if task.status in ("queued", "starting") and not session_busy:
+        if initial_pending or task.status == "starting":
+            await _enqueue_task_followup(turn)
+            return
+        await _reply_text_with_retry(
+            msg,
+            _manual_resume_text(task),
+            job=task,
+            registry=registry,
+            role="error",
+        )
+        return
+    if session_busy or initial_pending or _PENDING_TASK_TURNS.get(task.task_id):
         await _enqueue_task_followup(turn)
         return
     await _start_task_followup(turn)
@@ -1205,6 +1334,8 @@ async def _drain_thread_queue(key: str) -> None:
             if turn.kind == "new_task" or turn.route == Route.DELEGATE:
                 if key in _ACTIVE_JOBS:
                     return
+                if turn.task_id and _task_session_busy(turn.task_id, turn.worker_key):
+                    return
                 queue.popleft()
                 if not turn.task_id or not turn.worker_key:
                     store = SessionStore(turn.store_path)
@@ -1229,35 +1360,39 @@ def _schedule_queue_drain(key: str) -> None:
 
 async def _enqueue_turn(turn: QueuedTurn) -> bool:
     queue = _PENDING_TURNS.setdefault(turn.key, deque())
+    job = _job_like_from_turn(turn)
+    registry = TaskRegistry(turn.store_path) if turn.task_id else None
     if len(queue) >= _queue_limit():
         await _reply_text_with_retry(
             turn.msg,
-            f"等待佇列已滿（上限 {_queue_limit()} 則），請稍後再傳。",
+            _with_task_banner(
+                job,
+                f"等待佇列已滿（上限 {_queue_limit()} 則），請稍後再傳。",
+            ),
+            job=job,
+            registry=registry,
+            role="error",
         )
         return False
     queue.append(turn)
-    registry = TaskRegistry(turn.store_path) if turn.task_id else None
-    job = None
-    if turn.task_id:
-        job = RelayJob(
-            job_id=turn.task_id,
-            parent_key=turn.key,
-            worker_key=turn.worker_key or "",
-            backend=turn.backend,
-            started_at=time.monotonic(),
-            title=turn.title,
-        )
     extra = f"（task {turn.task_id}）" if turn.task_id else ""
-    await _reply_text_with_retry(
-        turn.msg,
-        _with_task_banner(
-            job,
-            f"已加入等待佇列{extra}，目前順位 {len(queue)}；前一項完成後會自動處理並回覆。",
-        ),
-        job=job,
-        registry=registry,
-        role="ack",
-    )
+    try:
+        await _reply_text_with_retry(
+            turn.msg,
+            _with_task_banner(
+                job,
+                f"已加入等待佇列{extra}，目前順位 {len(queue)}；前一項完成後會自動處理並回覆。",
+            ),
+            job=job,
+            registry=registry,
+            role="ack",
+        )
+    except Exception:
+        _discard_queued_turn(_PENDING_TURNS, turn.key, turn)
+        if turn.task_id:
+            TaskRegistry(turn.store_path).update_status(turn.task_id, "failed")
+        _schedule_queue_drain(turn.key)
+        raise
     _schedule_queue_drain(turn.key)
     return True
 
@@ -1323,10 +1458,14 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         elif bound.parent_key != key:
             await _reply_text_with_retry(
                 msg,
-                f"任務 {bound.task_id} 不屬於這個對話／主題，無法在此繼續。",
+                f"任務 {bound.task_id} [{bound.title}] 不屬於這個對話／主題，無法在此繼續。",
             )
             return
         else:
+            if _is_progress_query(prompt):
+                job = _RUNNING_TASKS.get(bound.task_id)
+                await _reply_task_status(msg, bound, registry, job)
+                return
             await _resume_existing_task(
                 bound,
                 msg=msg,
@@ -1338,8 +1477,29 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
             return
 
     active_job = _ACTIVE_JOBS.get(key)
+
+    if decision.route == Route.DELEGATE:
+        turn = QueuedTurn(
+            msg=msg,
+            key=key,
+            backend=backend,
+            prompt=prompt,
+            store_path=store_path,
+            attachment_config=attachment_config,
+            route=decision.route,
+        )
+        busy = active_job is not None or key in _ACTIVE_RELAY_THREADS or bool(_PENDING_TURNS.get(key))
+        _register_new_task(turn, store, registry, "queued" if busy else "starting")
+        if not busy:
+            await _start_background_job(turn)
+            return
+        queued_ok = await _enqueue_turn(turn)
+        if not queued_ok:
+            registry.update_status(turn.task_id, "failed")
+        return
+
+    tasks = registry.list_tasks(key)
     if _is_progress_query(prompt):
-        tasks = registry.list_tasks(key)
         running = [t for t in tasks if t.status in ("queued", "starting", "running")]
         if len(running) > 1 or (not running and len(tasks) > 1):
             await _reply_text_with_retry(msg, _task_choice_text(tasks))
@@ -1349,18 +1509,38 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
             job = _RUNNING_TASKS.get(chosen.task_id) or (
                 active_job if active_job is not None and active_job.job_id == chosen.task_id else None
             )
-            await _reply_text_with_retry(msg, _task_status_text(chosen, job))
+            await _reply_task_status(msg, chosen, registry, job)
             return
         if len(tasks) == 1:
             chosen = tasks[0]
             job = _RUNNING_TASKS.get(chosen.task_id) or (
                 active_job if active_job is not None and active_job.job_id == chosen.task_id else None
             )
-            await _reply_text_with_retry(msg, _task_status_text(chosen, job))
+            await _reply_task_status(msg, chosen, registry, job)
             return
         if active_job is not None:
-            await _reply_text_with_retry(msg, _job_status_text(active_job))
+            await _reply_text_with_retry(
+                msg,
+                _job_status_text(active_job),
+                job=active_job,
+                registry=registry,
+                role="status",
+            )
             return
+
+    if _is_bare_continuation(prompt) and tasks:
+        if len(tasks) > 1:
+            await _reply_text_with_retry(msg, _task_choice_text(tasks))
+            return
+        await _resume_existing_task(
+            tasks[0],
+            msg=msg,
+            prompt=prompt,
+            store_path=store_path,
+            attachment_config=attachment_config,
+            registry=registry,
+        )
+        return
 
     turn = QueuedTurn(
         msg=msg,
@@ -1371,15 +1551,6 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         attachment_config=attachment_config,
         route=decision.route,
     )
-
-    if decision.route == Route.DELEGATE:
-        busy = active_job is not None or key in _ACTIVE_RELAY_THREADS or bool(_PENDING_TURNS.get(key))
-        _register_new_task(turn, store, registry, "queued" if busy else "starting")
-        if not busy:
-            await _start_background_job(turn)
-            return
-        await _enqueue_turn(turn)
-        return
 
     if key in _ACTIVE_RELAY_THREADS or _PENDING_TURNS.get(key):
         await _enqueue_turn(turn)

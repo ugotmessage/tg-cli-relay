@@ -14,7 +14,7 @@ import pytest
 
 from tg_cli_relay.providers.base import RunResult
 from tg_cli_relay.session_store import SessionStore
-from tg_cli_relay.task_registry import TaskRegistry
+from tg_cli_relay.task_registry import TaskRegistry, make_task_title
 from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
 
 
@@ -550,6 +550,327 @@ def test_parent_model_pref_copied_not_leaked(monkeypatch, tmp_path: Path) -> Non
         assert store.get_pref(task.worker_key, "model:cursor") == "composer-1"
         store.set_pref("private:44", "model:cursor", "other-model")
         assert store.get_pref(task.worker_key, "model:cursor") == "composer-1"
+        _reset(bot)
+
+    asyncio.run(_run())
+
+
+def test_unthreaded_continuation_asks_when_ambiguous(monkeypatch, tmp_path: Path) -> None:
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    registry = TaskRegistry(tmp_path / "sessions.sqlite3")
+    first = registry.create_task(parent_key="private:101", backend="codex", title="A", status="completed")
+    second = registry.create_task(parent_key="private:101", backend="codex", title="B", status="completed")
+    calls: list[str] = []
+
+    def relay(**kwargs):
+        calls.append(kwargs["thread_key"])
+        return RunResult(stdout="done", stderr="", returncode=0)
+
+    async def _run():
+        _reset(bot)
+        with patch.object(bot, "relay_turn", side_effect=relay):
+            for text in ("繼續", "接著做", "往下做", "做好了嗎"):
+                msg = FakeMessage(text=text, chat_id=101, message_id=hash(text) % 10000 + 1)
+                await bot._on_message(_update(msg, 101), SimpleNamespace())
+                await _drain(bot)
+                body = msg.sent[-1].text
+                assert first.task_id in body and second.task_id in body
+                assert "/task" in body
+        assert calls == []
+        _reset(bot)
+
+    asyncio.run(_run())
+
+
+def test_unthreaded_continuation_resumes_sole_task(monkeypatch, tmp_path: Path) -> None:
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    registry = TaskRegistry(tmp_path / "sessions.sqlite3")
+    sole = registry.create_task(parent_key="private:77", backend="codex", title="only", status="completed")
+    calls: list[dict] = []
+
+    def relay(**kwargs):
+        calls.append({"thread_key": kwargs["thread_key"], "prompt": kwargs["prompt"]})
+        return RunResult(stdout="done", stderr="", returncode=0)
+
+    async def _run():
+        _reset(bot)
+        with patch.object(bot, "relay_turn", side_effect=relay):
+            msg = FakeMessage(text="繼續", chat_id=77, message_id=1)
+            await bot._on_message(_update(msg, 77), SimpleNamespace())
+            await _drain(bot)
+        assert calls == [{"thread_key": sole.worker_key, "prompt": "繼續"}]
+        _reset(bot)
+
+    asyncio.run(_run())
+
+
+def test_delegate_mentioning_progress_still_opens_new_task(monkeypatch, tmp_path: Path) -> None:
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    registry = TaskRegistry(tmp_path / "sessions.sqlite3")
+    registry.create_task(parent_key="private:88", backend="codex", title="old", status="completed")
+    calls: list[dict] = []
+
+    def relay(**kwargs):
+        calls.append({"thread_key": kwargs["thread_key"], "prompt": kwargs["prompt"]})
+        return RunResult(stdout="done", stderr="", returncode=0)
+
+    async def _run():
+        _reset(bot)
+        with patch.object(bot, "relay_turn", side_effect=relay):
+            msg = FakeMessage(
+                text="請實作並持續監控進度的跨檔背景工作",
+                chat_id=88,
+                message_id=2,
+            )
+            await bot._on_message(_update(msg, 88), SimpleNamespace())
+            await _drain(bot)
+        assert len(calls) == 1
+        assert calls[0]["thread_key"].startswith("private:88:job:")
+        assert calls[0]["thread_key"] != "private:88"
+        _reset(bot)
+
+    asyncio.run(_run())
+
+
+def test_reply_to_bound_progress_query_is_status_only(monkeypatch, tmp_path: Path) -> None:
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    calls: list[str] = []
+
+    def relay(**kwargs):
+        calls.append(kwargs["prompt"])
+        return RunResult(stdout="done", stderr="", returncode=0)
+
+    async def _run():
+        _reset(bot)
+        with patch.object(bot, "relay_turn", side_effect=relay):
+            src = FakeMessage(text="請實作任務A獨立功能", chat_id=91, message_id=1)
+            await bot._on_message(_update(src, 91), SimpleNamespace())
+            await _drain(bot)
+            task_id = _task_id_from_sent(src)
+            before = len(calls)
+            probe = FakeMessage(text="現在進度如何", chat_id=91, message_id=2, reply_to=1)
+            await bot._on_message(_update(probe, 91), SimpleNamespace())
+            await _drain(bot)
+            assert len(calls) == before
+            body = probe.sent[-1].text
+            assert task_id in body
+            assert "狀態:" in body
+            status_id = probe.sent[-1].message_id
+            follow = FakeMessage(text="補上測試", chat_id=91, message_id=3, reply_to=status_id)
+            await bot._on_message(_update(follow, 91), SimpleNamespace())
+            await _drain(bot)
+            assert calls[-1] == "補上測試"
+        _reset(bot)
+
+    asyncio.run(_run())
+
+
+def test_queued_initial_precedes_followup_and_occupancy_one(monkeypatch, tmp_path: Path) -> None:
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    calls: list[dict] = []
+    hold_a = threading.Event()
+    a_started = threading.Event()
+    occupancy: dict[str, dict[str, int]] = {}
+    occupancy_lock = threading.Lock()
+
+    def relay(**kwargs):
+        calls.append({"thread_key": kwargs["thread_key"], "prompt": kwargs["prompt"]})
+        key = kwargs["thread_key"]
+        with occupancy_lock:
+            slot = occupancy.setdefault(key, {"current": 0, "max": 0})
+            slot["current"] += 1
+            slot["max"] = max(slot["max"], slot["current"])
+        try:
+            if "任務A" in kwargs["prompt"]:
+                a_started.set()
+                hold_a.wait(timeout=5)
+            return RunResult(stdout=f"done:{kwargs['prompt']}", stderr="", returncode=0)
+        finally:
+            with occupancy_lock:
+                occupancy[key]["current"] -= 1
+
+    async def _run():
+        _reset(bot)
+        with patch.object(bot, "relay_turn", side_effect=relay):
+            msg_a = FakeMessage(text="請實作任務A獨立功能", chat_id=101, message_id=1)
+            await bot._on_message(_update(msg_a, 101), SimpleNamespace())
+            assert await asyncio.to_thread(a_started.wait, 2)
+            msg_b = FakeMessage(text="請實作任務B獨立功能", chat_id=101, message_id=2)
+            await bot._on_message(_update(msg_b, 101), SimpleNamespace())
+            b_id = _task_id_from_sent(msg_b)
+            follow = FakeMessage(
+                text="追加 B 的要求",
+                chat_id=101,
+                message_id=3,
+                reply_to=2,
+            )
+            await bot._on_message(_update(follow, 101), SimpleNamespace())
+            assert all("追加 B 的要求" not in c["prompt"] for c in calls)
+            assert all("任務B" not in c["prompt"] for c in calls)
+            hold_a.set()
+            await _drain(bot)
+        b_key = f"private:101:job:{b_id}"
+        b_prompts = [c["prompt"] for c in calls if c["thread_key"] == b_key]
+        assert b_prompts[0] == "請實作任務B獨立功能"
+        assert "追加 B 的要求" in b_prompts
+        assert b_prompts.index("請實作任務B獨立功能") < b_prompts.index("追加 B 的要求")
+        assert occupancy[b_key]["max"] == 1
+        assert all(slot["max"] == 1 for slot in occupancy.values())
+        _reset(bot)
+
+    asyncio.run(_run())
+
+
+def test_queued_without_in_memory_initial_fails_visibly(monkeypatch, tmp_path: Path) -> None:
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    registry = TaskRegistry(tmp_path / "sessions.sqlite3")
+    queued = registry.create_task(parent_key="private:101", backend="codex", title="B", status="queued")
+    registry.bind_message(
+        parent_key="private:101",
+        message_id=2,
+        task_id=queued.task_id,
+        backend="codex",
+        role="source",
+    )
+    calls: list[str] = []
+
+    def relay(**kwargs):
+        calls.append(kwargs["prompt"])
+        return RunResult(stdout="done", stderr="", returncode=0)
+
+    async def _run():
+        _reset(bot)
+        with patch.object(bot, "relay_turn", side_effect=relay):
+            msg = FakeMessage(text="追加 B 的要求", chat_id=101, message_id=3, reply_to=2)
+            await bot._on_message(_update(msg, 101), SimpleNamespace())
+            await _drain(bot)
+            body = msg.sent[-1].text
+            assert queued.task_id in body
+            assert "尚未執行" in body
+            assert "手動" in body or "/task" in body
+        assert calls == []
+        _reset(bot)
+
+    asyncio.run(_run())
+
+
+def test_status_replies_are_task_bound(monkeypatch, tmp_path: Path) -> None:
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    calls: list[dict] = []
+
+    def relay(**kwargs):
+        calls.append({"thread_key": kwargs["thread_key"], "prompt": kwargs["prompt"]})
+        return RunResult(stdout="done", stderr="", returncode=0)
+
+    async def _run():
+        _reset(bot)
+        with patch.object(bot, "relay_turn", side_effect=relay):
+            src = FakeMessage(text="請實作任務A獨立功能", chat_id=55, message_id=1)
+            await bot._on_message(_update(src, 55), SimpleNamespace())
+            await _drain(bot)
+            task_id = _task_id_from_sent(src)
+            status = FakeMessage(text="/task", chat_id=55, message_id=2)
+            await bot._cmd_task(_update(status, 55), SimpleNamespace(args=[task_id]))
+            body = status.sent[-1].text
+            assert task_id in body
+            status_id = status.sent[-1].message_id
+            follow = FakeMessage(
+                text="從狀態回覆繼續",
+                chat_id=55,
+                message_id=3,
+                reply_to=status_id,
+            )
+            await bot._on_message(_update(follow, 55), SimpleNamespace())
+            await _drain(bot)
+            assert calls[-1]["thread_key"] == f"private:55:job:{task_id}"
+            assert calls[-1]["prompt"] == "從狀態回覆繼續"
+        _reset(bot)
+
+    asyncio.run(_run())
+
+
+def test_task_title_redacts_path_and_credentials(monkeypatch, tmp_path: Path) -> None:
+    from tg_cli_relay import telegram_bot as bot
+
+    assert make_task_title("請實作任務A獨立功能") == "請實作任務A獨立功能"
+    assert make_task_title("password=example-secret please implement") == "background task"
+    assert make_task_title("TGR_FILE:/tmp/secret.pem") == "background task"
+    assert "secret.env" not in make_task_title("請實作 /Users/ht/secret.env 的處理並補測試")
+
+    _env(monkeypatch, tmp_path, backend="codex")
+
+    async def _run():
+        _reset(bot)
+        with patch.object(
+            bot, "relay_turn", return_value=RunResult(stdout="ok", stderr="", returncode=0)
+        ):
+            msg = FakeMessage(
+                text="請實作 /Users/ht/secret.env 的處理並補測試",
+                chat_id=66,
+                message_id=1,
+            )
+            await bot._on_message(_update(msg, 66), SimpleNamespace())
+            await _drain(bot)
+        task = TaskRegistry(tmp_path / "sessions.sqlite3").list_tasks("private:66")[0]
+        assert task.title == "background task"
+        assert all("secret.env" not in (s.text or "") for s in msg.sent)
+        _reset(bot)
+
+    asyncio.run(_run())
+
+
+def test_enqueue_ack_failure_does_not_orphan_queue(monkeypatch, tmp_path: Path) -> None:
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    hold_a = threading.Event()
+    a_started = threading.Event()
+
+    def relay(**kwargs):
+        if "任務A" in kwargs["prompt"]:
+            a_started.set()
+            hold_a.wait(timeout=5)
+        return RunResult(stdout="done", stderr="", returncode=0)
+
+    async def _run():
+        _reset(bot)
+        original_reply = bot._reply_text_with_retry
+
+        async def fail_queue_ack(message, text, *args, **kwargs):
+            if "等待佇列" in text:
+                raise RuntimeError("ack failed")
+            return await original_reply(message, text, *args, **kwargs)
+
+        with patch.object(bot, "relay_turn", side_effect=relay), patch.object(
+            bot, "_reply_text_with_retry", side_effect=fail_queue_ack
+        ):
+            msg_a = FakeMessage(text="請實作任務A獨立功能", chat_id=12, message_id=1)
+            await bot._on_message(_update(msg_a, 12), SimpleNamespace())
+            assert await asyncio.to_thread(a_started.wait, 2)
+            msg_b = FakeMessage(text="請實作任務B獨立功能", chat_id=12, message_id=2)
+            with pytest.raises(RuntimeError, match="ack failed"):
+                await bot._on_message(_update(msg_b, 12), SimpleNamespace())
+            assert not bot._PENDING_TURNS.get("private:12")
+            registry = TaskRegistry(tmp_path / "sessions.sqlite3")
+            b_tasks = [t for t in registry.list_tasks("private:12") if t.title.startswith("請實作任務B")]
+            assert b_tasks
+            assert b_tasks[0].status == "failed"
+            hold_a.set()
+            await _drain(bot)
         _reset(bot)
 
     asyncio.run(_run())

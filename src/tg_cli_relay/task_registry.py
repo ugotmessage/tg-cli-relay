@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -7,11 +8,37 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+_GENERIC_TASK_TITLE = "background task"
+_TITLE_PATH_HINT = re.compile(
+    r"(?:"
+    r"TGR_FILE:"
+    r"|附件本機路徑"
+    r"|(?:^|[\s'\"=])/(?:Users|home|tmp|var|etc|opt|root|private)/"
+    r"|(?:^|[\s'\"=])~/[^\s]+"
+    r"|[A-Za-z]:\\[^\s]*"
+    r")"
+)
+_TITLE_SECRET_HINT = re.compile(
+    r"(?:"
+    r"(?:api[_-]?key|secret|token|password|passwd|credential)s?\s*[:=]"
+    r"|\bsk-[A-Za-z0-9]"
+    r"|BEGIN (?:RSA |OPENSSH )?PRIVATE KEY"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def make_task_title(prompt: str, max_len: int = 48) -> str:
-    """Concise routing title only; never persist the full prompt."""
+    """Concise routing title only; never persist the full prompt.
+
+    If the prompt looks like a filesystem path or a credential assignment,
+    store a generic title. This is conservative redaction, not a scanner.
+    """
     text = " ".join((prompt or "").split())
     if not text:
         return "untitled"
+    if _TITLE_PATH_HINT.search(text) or _TITLE_SECRET_HINT.search(text):
+        return _GENERIC_TASK_TITLE
     if len(text) > max_len:
         return text[: max_len - 1] + "…"
     return text

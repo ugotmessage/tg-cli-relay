@@ -57,9 +57,22 @@ SQLite            ← sessions 表（thread_key → session_id）
 | `/model <provider> <id>` | 全部 | 切換 provider 並設定該 provider 的模型 |
 | `/router` | `cursor` | 查看目前 Task Router 規則、設定來源與 fallback 狀態 |
 | `/router test <文字>` | `cursor` | 用目前規則測試文字會被判斷為 `DIRECT` 或 `DELEGATE` |
+| `/task` | 全部 | 列出本對話的孤立任務 |
+| `/task <id>` | 全部 | 顯示該任務狀態（此回覆會綁定該任務，回覆它可以繼續） |
+| `/task <id> <說明>` | 全部 | 把說明送到該任務的獨立 session |
+| `/task new <說明>` | 全部 | 開新的孤立任務（含小型 DIRECT） |
 | `/help` | 全部 | 顯示可用指令 |
 
 > 每個 Telegram thread 會保存自己的 provider。模型偏好依 provider 分開保存（`model:cursor`、`model:claude` 等）。**Cursor relay 預設一律 `--model auto`**，除非你透過 `/model` 或 `TGR_CURSOR_MODEL` 明確指定；不會沿用舊版通用 `model` 偏好或其它程式的 CLI 指定。
+
+### 任務隔離（task isolation）
+
+`DELEGATE` 與 `/task new` 會建立 `{parent}:job:{task_id}` 獨立 session，來源／ACK／進度／狀態／結果都綁在該任務上。回覆綁定訊息會繼續**同一個**任務，不會掉回混在一起的父對話。細節見 `docs/task-isolation.md`。
+
+- 未串接且整句是 `繼續`／`接著做`／`往下做`：多個任務時請選擇，**不**走父 session；只有一個明確任務時恢復該任務。
+- 未串接且整句是 `進度`／`做好了嗎` 等：只回狀態，不重跑。回覆已綁定的進度查詢同樣只回狀態。
+- 新的 DELEGATE（即使內文提到「進度」）仍開新任務。延續／進度用整句錨定，不會用子字串把「請繼續實作…」當成舊任務。
+- **舊的未綁定父對話回覆不會自動遷移或猜測任務**。請用 `/task new <說明>` 一次建立孤立任務，之後再回覆帶 `[task …]` 的訊息。
 
 ---
 
