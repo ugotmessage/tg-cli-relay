@@ -265,6 +265,24 @@ def _rule_from_mapping(raw: object) -> RouterRule:
 
 def route_text(text: str, config: TaskRouterConfig | None = None) -> RouterDecision:
     cfg = config or load_task_router_config().config
+    # Keep the old relay's explicit per-message routing overrides.
+    lowered = text.lstrip().casefold()
+    for route, prefixes in (
+        (Route.DELEGATE, ("!job ", "!delegate ", "[job] ", "[delegate] ")),
+        (Route.DIRECT, ("!direct ", "[direct] ")),
+    ):
+        if any(lowered.startswith(prefix) for prefix in prefixes):
+            weight = 999 if route == Route.DELEGATE else 0
+            matched = (MatchedRule("explicit_override", route, weight, "message override", ()),)
+            return RouterDecision(
+                route, weight, 0 if route == Route.DELEGATE else 999,
+                cfg.threshold, matched
+            )
+    legacy_mode = os.environ.get("TGR_ROUTER_MODE", "").strip().lower()
+    if legacy_mode in ("always_direct", "always_delegate"):
+        route = Route.DIRECT if legacy_mode == "always_direct" else Route.DELEGATE
+        return RouterDecision(route, 999 if route == Route.DELEGATE else 0,
+                              0 if route == Route.DELEGATE else 999, cfg.threshold, ())
     if not cfg.enabled:
         return RouterDecision(Route.DIRECT, 0, 0, cfg.threshold, (), enabled=False)
     haystack = text.casefold()
