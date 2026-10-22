@@ -133,6 +133,17 @@ class TaskRegistry:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_task_messages_task ON task_messages(task_id)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS parent_messages (
+                    parent_key TEXT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    backend TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (parent_key, message_id)
+                )
+                """
+            )
 
     def create_task(
         self,
@@ -264,6 +275,28 @@ class TaskRegistry:
                 """,
                 (parent_key, int(message_id), task_id, backend, role),
             )
+
+    def bind_parent_message(
+        self, *, parent_key: str, message_id: int, backend: str
+    ) -> None:
+        """Remember parent-session messages separately from task messages."""
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO parent_messages(parent_key, message_id, backend)
+                VALUES (?, ?, ?)
+                ON CONFLICT(parent_key, message_id) DO NOTHING
+                """,
+                (parent_key, int(message_id), backend),
+            )
+
+    def get_parent_message_backend(self, parent_key: str, message_id: int) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT backend FROM parent_messages WHERE parent_key = ? AND message_id = ?",
+                (parent_key, int(message_id)),
+            ).fetchone()
+        return str(row[0]) if row is not None else None
 
     def get_task_for_message(self, parent_key: str, message_id: int) -> TaskRecord | None:
         with self._conn() as conn:
