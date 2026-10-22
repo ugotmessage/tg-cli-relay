@@ -562,6 +562,7 @@ def test_unthreaded_continuation_asks_when_ambiguous(monkeypatch, tmp_path: Path
     registry = TaskRegistry(tmp_path / "sessions.sqlite3")
     first = registry.create_task(parent_key="private:101", backend="codex", title="A", status="completed")
     second = registry.create_task(parent_key="private:101", backend="codex", title="B", status="completed")
+    registry.clear_focus("private:101")
     calls: list[str] = []
 
     def relay(**kwargs):
