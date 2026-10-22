@@ -1494,15 +1494,44 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
             return
 
     active_job = _ACTIVE_JOBS.get(key)
+    tasks = registry.list_tasks(key)
+    focused = registry.focused_task(key)
+
+    # References to the ongoing task take precedence over new-task classification.
+    if _is_progress_query(prompt):
+        if focused is not None:
+            await _reply_task_status(msg, focused, registry, _RUNNING_TASKS.get(focused.task_id))
+            return
+        running = [t for t in tasks if t.status in ("queued", "starting", "running")]
+        if len(running) == 1:
+            await _reply_task_status(msg, running[0], registry, _RUNNING_TASKS.get(running[0].task_id))
+            return
+        if len(tasks) == 1:
+            await _reply_task_status(msg, tasks[0], registry, _RUNNING_TASKS.get(tasks[0].task_id))
+            return
+        if tasks:
+            await _reply_text_with_retry(msg, _task_choice_text(tasks))
+            return
+        if active_job is not None:
+            await _reply_text_with_retry(msg, _job_status_text(active_job))
+            return
+
+    if _is_bare_continuation(prompt) or _is_contextual_followup(prompt):
+        target = focused or (tasks[0] if len(tasks) == 1 else None)
+        if target is not None:
+            await _resume_existing_task(
+                target, msg=msg, prompt=prompt, store_path=store_path,
+                attachment_config=attachment_config, registry=registry,
+            )
+            return
+        if tasks:
+            await _reply_text_with_retry(msg, _task_choice_text(tasks))
+            return
 
     if decision.route == Route.DELEGATE:
         turn = QueuedTurn(
-            msg=msg,
-            key=key,
-            backend=backend,
-            prompt=prompt,
-            store_path=store_path,
-            attachment_config=attachment_config,
+            msg=msg, key=key, backend=backend, prompt=prompt,
+            store_path=store_path, attachment_config=attachment_config,
             route=decision.route,
         )
         busy = active_job is not None or key in _ACTIVE_RELAY_THREADS or bool(_PENDING_TURNS.get(key))
@@ -1513,50 +1542,6 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         queued_ok = await _enqueue_turn(turn)
         if not queued_ok:
             registry.update_status(turn.task_id, "failed")
-        return
-
-    tasks = registry.list_tasks(key)
-    if _is_progress_query(prompt):
-        running = [t for t in tasks if t.status in ("queued", "starting", "running")]
-        if len(running) > 1 or (not running and len(tasks) > 1):
-            await _reply_text_with_retry(msg, _task_choice_text(tasks))
-            return
-        if len(running) == 1:
-            chosen = running[0]
-            job = _RUNNING_TASKS.get(chosen.task_id) or (
-                active_job if active_job is not None and active_job.job_id == chosen.task_id else None
-            )
-            await _reply_task_status(msg, chosen, registry, job)
-            return
-        if len(tasks) == 1:
-            chosen = tasks[0]
-            job = _RUNNING_TASKS.get(chosen.task_id) or (
-                active_job if active_job is not None and active_job.job_id == chosen.task_id else None
-            )
-            await _reply_task_status(msg, chosen, registry, job)
-            return
-        if active_job is not None:
-            await _reply_text_with_retry(
-                msg,
-                _job_status_text(active_job),
-                job=active_job,
-                registry=registry,
-                role="status",
-            )
-            return
-
-    if _is_bare_continuation(prompt) and tasks:
-        if len(tasks) > 1:
-            await _reply_text_with_retry(msg, _task_choice_text(tasks))
-            return
-        await _resume_existing_task(
-            tasks[0],
-            msg=msg,
-            prompt=prompt,
-            store_path=store_path,
-            attachment_config=attachment_config,
-            registry=registry,
-        )
         return
 
     turn = QueuedTurn(
