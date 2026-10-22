@@ -167,7 +167,11 @@ def test_handler_handoff_reaches_real_relay_and_keeps_provider_sessions_isolated
     calls = codex.run_turn.call_args_list
     assert len(calls) == 3
     assert [call.kwargs["session_id"] for call in calls] == [None, None, "parent-session"]
-    assert "任務驗證完成：網站甲健康" in calls[-1].kwargs["prompt"]
+    # The resumed parent CLI session already has prior answers in its own history.
+    assert "任務驗證完成：網站甲健康" not in calls[-1].kwargs["prompt"]
+    assert "任務驗證完成：網站甲健康" in ConversationContext(
+        tmp_path / "sessions.sqlite3"
+    ).prompt("private:101", "新 session 需要的交接")
     store = SessionStore(tmp_path / "sessions.sqlite3")
     tasks = TaskRegistry(store.db_path).list_tasks("private:101")
     assert len(tasks) == 1
