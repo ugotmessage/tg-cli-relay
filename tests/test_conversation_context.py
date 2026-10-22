@@ -178,3 +178,36 @@ def test_handler_handoff_reaches_real_relay_and_keeps_provider_sessions_isolated
     assert tasks[0].worker_key.startswith("private:101:job:")
     assert store.get(tasks[0].worker_key, "codex") == "task-session"
     assert store.get("private:101", "codex") == "parent-session"
+
+
+
+def test_completed_task_handoff_delivered_once_to_each_resumed_parent_provider(context):
+    parent, task = "private:1", "private:1:job:aaa"
+    context.snapshot(parent)
+    context.bind_task(parent, task)
+    finish(context, task, "實作 API", "API 已修正；待整合測試")
+    snapshot = context.snapshot(parent)
+    first = context.prompt(parent, "接著檢查", include_history=False, consumer="codex")
+    assert "API 已修正" in first
+    assert "new_completed_task_results" in first
+    context.acknowledge(parent, snapshot["epoch"], "codex", snapshot["next_handoff_id"])
+    assert context.prompt(parent, "再問一次", include_history=False, consumer="codex") == "再問一次"
+    assert "API 已修正" in context.prompt(
+        parent, "換個 backend", include_history=False, consumer="cursor"
+    )
+    finish(context, task, "跑測試", "測試通過")
+    next_delta = context.prompt(parent, "現在如何", include_history=False, consumer="codex")
+    assert "測試通過" in next_delta
+    assert "API 已修正" not in next_delta
+
+
+def test_reset_rejects_late_handoff_ack(context):
+    parent, task = "private:7", "private:7:job:xyz"
+    old = context.snapshot(parent)
+    context.bind_task(parent, task)
+    finish(context, task, "問題", "結果")
+    context.reset(parent)
+    context.acknowledge(parent, old["epoch"], "codex", 999)
+    new = context.snapshot(parent)
+    assert new["epoch"] != old["epoch"]
+    assert "delivered" not in new
