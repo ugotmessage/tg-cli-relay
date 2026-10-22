@@ -1725,6 +1725,13 @@ def run_bot() -> None:
     app.add_handler(MessageHandler(content_filter, _on_message, block=False))
     store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
     interrupted = TaskRegistry(store_path).interrupt_inflight()
+    # Existing installations may still have jobs created by the earlier
+    # JobStore dispatcher. Preserve their history, but never auto-rerun them.
+    try:
+        from tg_cli_relay.job_store import JobStore
+        JobStore(store_path).mark_interrupted_jobs()
+    except ImportError:
+        pass
     if interrupted:
         log.warning("啟動時將 %s 筆 queued/running 任務標為 interrupted，不會自動重跑", interrupted)
     log.info("啟動 Telegram bot（default_backend=%s）", _default_backend())
