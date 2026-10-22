@@ -101,13 +101,13 @@ def test_failed_relay_turn_is_not_saved(context, monkeypatch):
     assert context.snapshot("private:1")["turns"] == []
 
 
-def test_codex_cursor_worker_uses_fresh_session_and_explicit_task_context(context, monkeypatch):
+def test_codex_cursor_worker_resumes_task_scoped_session_without_repeating_context(context, monkeypatch):
     from tg_cli_relay import relay
     store = SessionStore(context.db_path)
     finish(context, "private:1", "前文問題", "前文答案")
     key = "private:1:job:aaa"
     context.bind_task("private:1", key)
-    store.upsert(key + ":cursor-worker", "cursor", "stale-worker-session")
+    store.upsert("private:other:job:bbb:codex-cursor-worker", "cursor", "other-task-session")
     provider = MagicMock()
     provider.create_session.side_effect = ["fresh-1", "fresh-2"]
     provider.run_turn.return_value = RunResult("ok", "", 0)
@@ -119,9 +119,12 @@ def test_codex_cursor_worker_uses_fresh_session_and_explicit_task_context(contex
     finish(context, key, "第一輪任務", "本任務已完成步驟")
     relay._run_codex_cursor_worker(store, key, "/tmp", "接著呢？")
     calls = provider.run_turn.call_args_list
-    assert [call.kwargs["session_id"] for call in calls] == ["fresh-1", "fresh-2"]
+    assert [call.kwargs["session_id"] for call in calls] == ["fresh-1", "fresh-1"]
+    assert provider.create_session.call_count == 1
     assert "前文答案" in calls[0].kwargs["prompt"]
-    assert "本任務已完成步驟" in calls[1].kwargs["prompt"]
+    assert "前文答案" not in calls[1].kwargs["prompt"]
+    assert "本任務已完成步驟" not in calls[1].kwargs["prompt"]
+    assert store.get(key + ":codex-cursor-worker", "cursor") == "fresh-1"
     assert "接著呢？" in calls[1].kwargs["prompt"]
 
 
