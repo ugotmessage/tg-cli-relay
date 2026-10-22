@@ -26,6 +26,7 @@ from tg_cli_relay.attachments import (
     resolve_outbound_files,
 )
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
+from tg_cli_relay.conversation_context import ConversationContext
 from tg_cli_relay.session_store import Backend, SessionStore
 from tg_cli_relay.task_registry import TaskRecord, TaskRegistry, make_task_title
 from tg_cli_relay.task_router import (
@@ -235,6 +236,7 @@ def _register_new_task(turn: QueuedTurn, store: SessionStore, registry: TaskRegi
         status=status,
     )
     _copy_parent_model_pref(store, turn.key, task.worker_key, turn.backend)
+    ConversationContext(store.db_path).bind_task(turn.key, task.worker_key)
     _bind_source_message(registry, task, turn.msg)
     turn.task_id = task.task_id
     turn.worker_key = task.worker_key
@@ -476,9 +478,13 @@ async def _cmd_reset(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
     key = _get_thread_key(update)
+    if key in _ACTIVE_RELAY_THREADS or _PENDING_TURNS.get(key):
+        await update.message.reply_text("主對話仍在執行或排隊，請完成後再重置。")
+        return
     store = _get_store()
     backend = _backend_for_thread(store, key)
     store.delete(key, backend)
+    ConversationContext(store.db_path).reset(key)
     await update.message.reply_text(f"對話已重置，下一則訊息將開啟新的 {backend} session。")
 
 

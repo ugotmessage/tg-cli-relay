@@ -137,6 +137,8 @@ cp env.example .env
 
 ## Task Router
 
+任務訊息綁定、追問與上下文交接見 [task-isolation.md](docs/task-isolation.md)。新任務會取得已完成主對話的有界快照；成功結果會提供給主對話後續回合參考，任務 session 仍各自隔離。
+
 Cursor relay 會在送入 `agent --print` 前，用 **rule-based** Task Router 產生前綴，標示本輪應走：
 
 - `DIRECT`：小型查詢、狀態檢查、單步操作，留在目前 Cursor session 直接處理。

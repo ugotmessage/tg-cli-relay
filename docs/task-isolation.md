@@ -44,8 +44,18 @@
 
 Bot 啟動時，先前仍是 queued/running/starting 的列會標成 **interrupted**，**不會**自動重跑或改 provider/model。訊息綁定與 session id 保留，可用回覆或 `/task <id> <說明>` 手動繼續。
 
-SQLite 只存 task id、parent、worker key、backend、短標題、生命週期與 message id 綁定。**不**存完整 prompt、憑證或 worker 報告。
+任務登錄只存 task id、parent、worker key、backend、短標題、生命週期與 message id 綁定，不存完整 prompt 或 worker 報告。另有下述有界上下文，儲存在既有 `preferences`。
 
-`/reset` 只清父 session，不清孤立任務。
+`/reset` 清父 session 與父對話交接資料，不清孤立任務。父 session 執行或排隊時拒絕重置；重置後，先前任務的晚到結果不會重新灌入父對話。
 
-Codex → Cursor 巢狀 worker 會掛在**目前任務**的 worker key 底下（`{task_key}:codex-cursor-worker`）。Codex reviewer prompt 被限制只審這一個任務／這一份報告，不得把歷史任務當成本次需求。既有安全限制（部署、重啟、migration、對外發送、金流等）不變。
+Codex → Cursor 每次派工建立新的 Worker session，明確傳遞目前任務的上下文，不再 resume 舊的巢狀 Worker。Codex reviewer session 仍維持同一任務，審核目前請求與報告。既有安全限制（部署、重啟、migration、對外發送、金流等）不變。
+
+## 上下文交接
+
+- 父對話及任務每輪成功完成後，保存當輪問題與最終結果的有界摘錄。新任務取得建立時已完成的父對話快照；之後只加入該任務自己的成功回合，不讀取其他任務後續進度。
+- 任務成功結果以 task ID 標示，原子追加到父對話參考資料。父 session 下一輪才會讀取，不在背景直接寫入／呼叫父 CLI，因此不與父對話競爭同一 provider session。
+- Router 仍只判斷當輪原始問題；前文不影響 DIRECT／DELEGATE 或任務路由。前文以 JSON 參考資料提供，明確禁止把舊問題當新指令執行。
+- 使用既有 `preferences` 的 `relay:context:v1`，不額外建立資料表。每份紀錄最多 8 輪、16,000 JSON 字元；單輪問題最多 2,000 字元、結果最多 4,000 字元（另加截短標記）。任務最多另帶一份父對話快照。
+- 僅保存成功結果，不保存 stderr、進度、Worker 報告；常見憑證賦值／私鑰提示的整段內容會略過，附件輸出標記不保留。這不是完整的敏感資訊掃描，session DB 仍需依既有方式保護。
+- reset 以 generation 隔離；並行任務回寫使用同一 SQLite transaction，避免遺失更新或使舊記憶復活。
+- 更新前的 CLI 歷史／job 不自動匯入；交接資料從更新後成功問答開始累積。快照不含建立時尚未完成的父對話內容，長文也可能截短，不能當成完整逐字歷史或最新事實。

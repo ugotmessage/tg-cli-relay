@@ -40,7 +40,8 @@ def test_heavy_codex_task_delegates_to_cursor_then_codex(tmp_path: Path, monkeyp
     assert "review ONLY this current request" in codex_prompt
     assert "Do not treat historical tasks" in codex_prompt
     assert "已修改兩個 scope 並跑完測試" in codex_prompt
-    assert store.get("chat:1:codex-cursor-worker", "cursor") == "cursor-worker-1"
+    assert store.get("chat:1:codex-cursor-worker", "cursor") is None
+    assert cursor_cls.return_value.run_turn.call_args.kwargs["session_id"] == "cursor-worker-1"
 
 
 def test_single_scope_coding_delegates_to_cursor(tmp_path: Path, monkeypatch) -> None:
@@ -144,7 +145,8 @@ def test_orchestrator_prompt_scopes_nested_worker_to_current_task(tmp_path: Path
             workspace=str(tmp_path),
         )
 
-    assert store.get("private:9:job:abcd1234:codex-cursor-worker", "cursor") == "cursor-task-worker"
+    assert store.get("private:9:job:abcd1234:codex-cursor-worker", "cursor") is None
+    assert cursor_cls.return_value.run_turn.call_args.kwargs["session_id"] == "cursor-task-worker"
     assert "current task only" in codex_cls.return_value.run_turn.call_args.kwargs["prompt"]
     assert "Current task id: abcd1234" in codex_cls.return_value.run_turn.call_args.kwargs["prompt"]
     assert "Do not treat historical tasks" in codex_cls.return_value.run_turn.call_args.kwargs["prompt"]
