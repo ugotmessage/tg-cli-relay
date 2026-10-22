@@ -291,7 +291,7 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
     raw = prov.run_turn(
         workspace=workspace, session_id=sid,
         prompt=ConversationContext(store.db_path).prompt(
-            thread_key, prompt, include_history=not sid, consumer="opencode", consumer="claude"
+            thread_key, prompt, include_history=not sid, consumer="claude"
         ),
     )
     display_text, new_sid = parse_claude_output(raw.stdout)
@@ -310,7 +310,7 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
     raw = prov.run_turn(
         workspace=workspace, session_id=sid,
         prompt=ConversationContext(store.db_path).prompt(
-            thread_key, prompt, include_history=not sid
+            thread_key, prompt, include_history=not sid, consumer="opencode"
         ),
     )
     display_text, new_sid = parse_opencode_output(raw.stdout)
