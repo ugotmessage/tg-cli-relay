@@ -97,7 +97,11 @@ class ConversationContext:
         with self._conn() as conn:
             self._write(conn, key, {"epoch": uuid4().hex, "turns": []})
 
-    def prompt(self, key: str, request: str) -> str:
+    def prompt(self, key: str, request: str, *, include_history: bool = True) -> str:
+        # Provider sessions already have their own history. Handoff is only for
+        # the FIRST turn of a new/recovered session, never every resumed turn.
+        if not include_history:
+            return request
         state = self.snapshot(key)
         data = {"parent_at_task_creation": state.get("inherited", []), "completed_turns": state["turns"]}
         if not any(data.values()):
