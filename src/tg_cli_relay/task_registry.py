@@ -80,6 +80,7 @@ class TaskRegistry:
     def _conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
         try:
             conn.execute("PRAGMA foreign_keys = ON")
             yield conn
@@ -118,6 +119,15 @@ class TaskRegistry:
                 """
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_focus (
+                    parent_key TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+                )
+                """
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_key, updated_at)"
             )
             conn.execute(
@@ -149,6 +159,13 @@ class TaskRegistry:
                         """,
                         (task_id, parent_key, worker_key, backend, safe_title, status),
                     )
+                    conn.execute(
+                        """
+                        INSERT INTO task_focus(parent_key, task_id) VALUES(?, ?)
+                        ON CONFLICT(parent_key) DO UPDATE SET task_id = excluded.task_id
+                        """,
+                        (parent_key, task_id),
+                    )
                 record = self.get_task(task_id)
                 if record is None:
                     raise RuntimeError("task insert succeeded but row is missing")
@@ -178,6 +195,41 @@ class TaskRegistry:
                 (parent_key, limit),
             ).fetchall()
         return [_row_to_task(row) for row in rows]
+
+    def focused_task(self, parent_key: str) -> TaskRecord | None:
+        """The last explicitly selected task for this chat/topic, surviving restarts."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT t.* FROM task_focus f
+                JOIN tasks t ON t.task_id = f.task_id
+                WHERE f.parent_key = ? AND t.parent_key = ?
+                """,
+                (parent_key, parent_key),
+            ).fetchone()
+        return _row_to_task(row) if row is not None else None
+
+    def focus_task(self, parent_key: str, task_id: str) -> bool:
+        """Atomically switch focus only to a task belonging to this chat/topic."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ? AND parent_key = ?",
+                (task_id, parent_key),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                """
+                INSERT INTO task_focus(parent_key, task_id) VALUES(?, ?)
+                ON CONFLICT(parent_key) DO UPDATE SET task_id = excluded.task_id
+                """,
+                (parent_key, task_id),
+            )
+        return True
+
+    def clear_focus(self, parent_key: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM task_focus WHERE parent_key = ?", (parent_key,))
 
     def update_status(self, task_id: str, status: str) -> bool:
         """Update one task by id. Never matches sibling tasks on the same parent."""
