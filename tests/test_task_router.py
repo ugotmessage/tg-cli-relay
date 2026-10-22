@@ -96,6 +96,11 @@ keywords = ["ping"]
                     any(rule.id == "coding_implementation" for rule in decision.matched_rules)
                 )
 
+    def test_implementation_beats_incidental_status_on_score_tie(self) -> None:
+        cfg = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"}).config
+        result = route_text("現在修 bug", cfg)
+        self.assertEqual(result.route, Route.DELEGATE)
+
     def test_explicit_worker_delegation_overrides_status_words(self) -> None:
         loaded = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"})
         text = "資料是不是還沒補完？還沒補完派子WORKER去補"
