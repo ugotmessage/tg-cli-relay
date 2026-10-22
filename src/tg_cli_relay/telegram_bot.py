@@ -829,12 +829,19 @@ async def _reply_text_with_retry(  # type: ignore[no-untyped-def]
     job: RelayJob | TaskRecord | None = None,
     registry: TaskRegistry | None = None,
     role: str = "progress",
+    parent_key: str | None = None,
+    parent_backend: Backend | None = None,
 ):
     attempt = 0
     while True:
         try:
             sent = await message.reply_text(text)
             _bind_sent_message(registry, job, sent, role)
+            mid = _sent_message_id(sent)
+            if registry is not None and job is None and parent_key and parent_backend and mid is not None:
+                registry.bind_parent_message(
+                    parent_key=parent_key, message_id=mid, backend=parent_backend
+                )
             return sent
         except Exception as exc:
             if attempt >= retries or not _is_transient_telegram_error(exc):
@@ -965,6 +972,7 @@ async def _send_relay_output(
     segments: list[str] | None = None,
     job: RelayJob | None = None,
     registry: TaskRegistry | None = None,
+    parent_key: str | None = None,
 ) -> None:
     parsed = parse_tgr_file_markers(body)
     upload_paths, upload_errors = resolve_outbound_files(
@@ -1007,6 +1015,8 @@ async def _send_relay_output(
             job=job,
             registry=registry,
             role=role,
+            parent_key=parent_key,
+            parent_backend=backend if parent_key else None,
         )
 
     upload_failures: list[str] = []
@@ -1057,7 +1067,7 @@ async def _execute_relay_turn(
             typing_task = asyncio.create_task(_typing_loop())
 
         loop = asyncio.get_running_loop()
-        registry = TaskRegistry(store.db_path) if job is not None else None
+        registry = TaskRegistry(store.db_path)
 
         def _live_progress(text: str) -> None:
             if job is not None:
@@ -1102,6 +1112,8 @@ async def _execute_relay_turn(
                 job=job,
                 registry=registry,
                 role="error",
+                parent_key=key if job is None else None,
+                parent_backend=backend if job is None else None,
             )
             return
 
@@ -1141,6 +1153,7 @@ async def _execute_relay_turn(
             segments=res.stdout_segments,
             job=job,
             registry=registry,
+            parent_key=key if job is None else None,
         )
     finally:
         _ACTIVE_RELAY_THREADS.discard(key)
@@ -1394,6 +1407,12 @@ async def _resume_existing_task(
 
 
 async def _run_direct_turn(turn: QueuedTurn) -> None:
+    # Bind source at execution time even if this turn was previously queued.
+    mid = getattr(turn.msg, "message_id", None)
+    if isinstance(mid, int):
+        TaskRegistry(turn.store_path).bind_parent_message(
+            parent_key=turn.key, message_id=mid, backend=turn.backend
+        )
     _ACTIVE_RELAY_THREADS.add(turn.key)
     await _execute_relay_turn(
         msg=turn.msg,
