@@ -860,6 +860,8 @@ async def _reply_document_with_retry(  # type: ignore[no-untyped-def]
     job: RelayJob | TaskRecord | None = None,
     registry: TaskRegistry | None = None,
     role: str = "attachment",
+    parent_key: str | None = None,
+    parent_backend: Backend | None = None,
 ):
     attempt = 0
     while True:
@@ -867,6 +869,11 @@ async def _reply_document_with_retry(  # type: ignore[no-untyped-def]
             with path.open("rb") as fh:
                 sent = await message.reply_document(document=fh, filename=path.name)
             _bind_sent_message(registry, job, sent, role)
+            mid = _sent_message_id(sent)
+            if registry is not None and job is None and parent_key and parent_backend and mid is not None:
+                registry.bind_parent_message(
+                    parent_key=parent_key, message_id=mid, backend=parent_backend
+                )
             return sent
         except Exception as exc:
             if attempt >= retries or not _is_transient_telegram_error(exc):
@@ -1022,7 +1029,10 @@ async def _send_relay_output(
     upload_failures: list[str] = []
     for path in upload_paths:
         try:
-            await _reply_document_with_retry(msg, path, job=job, registry=registry, role="attachment")
+            await _reply_document_with_retry(
+                msg, path, job=job, registry=registry, role="attachment",
+                parent_key=parent_key, parent_backend=backend if parent_key else None,
+            )
         except Exception:
             log.exception("Telegram 附件上傳失敗 path=%s", path.name)
             upload_failures.append(f"無法傳送附件：{path.name}")
@@ -1034,6 +1044,8 @@ async def _send_relay_output(
             job=job,
             registry=registry,
             role="error",
+            parent_key=parent_key,
+            parent_backend=backend if parent_key else None,
         )
 
 
