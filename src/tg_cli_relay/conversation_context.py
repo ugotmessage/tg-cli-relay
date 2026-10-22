@@ -90,20 +90,51 @@ class ConversationContext:
             if state.get("parent"):
                 parent = self._read(conn, state["parent"])
                 if parent["epoch"] == state["parent_epoch"]:
-                    self._append(parent, {"task": key.rsplit(":job:", 1)[-1], **entry})
+                    task_id = key.rsplit(":job:", 1)[-1]
+                    self._append(parent, {"task": task_id, **entry})
+                    # Keep a small, ordered event stream separate from the
+                    # provider's own conversation history. Parent sessions
+                    # receive only unseen task completions on their next turn.
+                    seq = int(parent.get("next_handoff_id", 0)) + 1
+                    parent["next_handoff_id"] = seq
+                    handoffs = parent.setdefault("handoffs", [])
+                    handoffs.append({"id": seq, "task": task_id, **entry})
+                    parent["handoffs"] = handoffs[-8:]
                     self._write(conn, state["parent"], parent)
+
+    def acknowledge(self, key: str, epoch: str, consumer: str, through_id: int) -> None:
+        """Advance the delivered cursor only after successful provider execution."""
+        if not through_id:
+            return
+        with self._conn() as conn:
+            state = self._read(conn, key)
+            if state["epoch"] != epoch:
+                return
+            delivered = state.setdefault("delivered", {})
+            delivered[consumer] = max(int(delivered.get(consumer, 0)), through_id)
+            self._write(conn, key, state)
 
     def reset(self, key: str) -> None:
         with self._conn() as conn:
             self._write(conn, key, {"epoch": uuid4().hex, "turns": []})
 
-    def prompt(self, key: str, request: str, *, include_history: bool = True) -> str:
-        # Provider sessions already have their own history. Handoff is only for
-        # the FIRST turn of a new/recovered session, never every resumed turn.
-        if not include_history:
-            return request
+    def prompt(
+        self, key: str, request: str, *, include_history: bool = True,
+        consumer: str | None = None,
+    ) -> str:
         state = self.snapshot(key)
-        data = {"parent_at_task_creation": state.get("inherited", []), "completed_turns": state["turns"]}
+        if include_history:
+            data = {"parent_at_task_creation": state.get("inherited", []),
+                    "completed_turns": state["turns"]}
+        else:
+            # Resumed CLI sessions retain their own turns. Only deliver newly
+            # completed background task results, at most once per provider.
+            seen = int(state.get("delivered", {}).get(consumer, 0)) if consumer else 0
+            pending = [e for e in state.get("handoffs", [])
+                       if consumer and int(e.get("id", 0)) > seen]
+            if not pending:
+                return request
+            data = {"new_completed_task_results": pending}
         if not any(data.values()):
             return request
         return (
