@@ -287,7 +287,16 @@ def route_text(text: str, config: TaskRouterConfig | None = None) -> RouterDecis
             delegate_score += rule.weight
         else:
             direct_score += rule.weight
-    route = Route.DELEGATE if delegate_score >= cfg.threshold and delegate_score > direct_score else Route.DIRECT
+    # Implementation intent should not lose to incidental status words on a tie.
+    implementation_intent = any(
+        m.id in ("coding_implementation", "full_delivery_pipeline", "explicit_worker_delegation")
+        and m.route == Route.DELEGATE for m in matched
+    )
+    route = (
+        Route.DELEGATE if delegate_score >= cfg.threshold
+        and (delegate_score > direct_score or (implementation_intent and delegate_score == direct_score))
+        else Route.DIRECT
+    )
     return RouterDecision(route, delegate_score, direct_score, cfg.threshold, tuple(matched))
 
 
