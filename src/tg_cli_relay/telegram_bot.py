@@ -271,6 +271,17 @@ _CONTINUATION_RE = re.compile(
 )
 
 
+_CONTEXTUAL_FOLLOWUP_RE = re.compile(
+    r"^(?:剛剛|剛才|前面|上面|那個|這個|這部分|這一段|同一個|"
+    r"再修|再改|再補|繼續|接著|往下|還沒|還有問題|還是不行|又出錯|改成|順便把)",
+    re.IGNORECASE,
+)
+
+
+def _is_contextual_followup(text: str) -> bool:
+    return bool(_CONTEXTUAL_FOLLOWUP_RE.match((text or "").strip()))
+
+
 def _is_progress_query(text: str) -> bool:
     return bool(_PROGRESS_QUERY_RE.match((text or "").strip()))
 
