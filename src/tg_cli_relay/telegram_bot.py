@@ -1556,6 +1556,20 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
     if reply_id is not None:
         bound = registry.get_task_for_message(key, reply_id)
         if bound is None:
+            # Parent replies are explicit session routing, even when other
+            # background tasks exist or a different task has current focus.
+            parent_backend = registry.get_parent_message_backend(key, reply_id)
+            if parent_backend is not None:
+                turn = QueuedTurn(
+                    msg=msg, key=key, backend=parent_backend,
+                    prompt=prompt, store_path=store_path,
+                    attachment_config=attachment_config, route=Route.DIRECT,
+                )
+                if key in _ACTIVE_RELAY_THREADS or _PENDING_TURNS.get(key):
+                    await _enqueue_turn(turn)
+                else:
+                    await _run_direct_turn(turn)
+                return
             tasks = registry.list_tasks(key)
             if tasks:
                 await _reply_text_with_retry(msg, _unbound_reply_instructions(tasks))
