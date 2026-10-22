@@ -6,7 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tg_cli_relay.relay import effective_model_for_backend, resolve_cursor_model
+from tg_cli_relay.providers.base import RunResult
+from tg_cli_relay.relay import effective_model_for_backend, relay_turn, resolve_cursor_model
 from tg_cli_relay.session_store import SessionStore
 
 
@@ -59,6 +60,73 @@ class CursorAgentModelFlagTest(unittest.TestCase):
             cmd = run.call_args.args[0]
             self.assertIn("--model", cmd)
             self.assertEqual(cmd[cmd.index("--model") + 1], "auto")
+
+    def test_delegate_task_uses_long_cursor_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            with patch("tg_cli_relay.relay.CursorAgentProvider") as provider_cls, patch.dict(
+                os.environ,
+                {"TGR_ROUTER_CONFIG": str(Path(tmp) / "missing-router.toml")},
+                clear=False,
+            ):
+                provider_cls.return_value.create_session.return_value = "cursor-1"
+                provider_cls.return_value.run_turn.return_value = RunResult(
+                    stdout="done", stderr="", returncode=0
+                )
+                relay_turn(
+                    thread_key="private:1",
+                    backend="cursor",
+                    prompt="請實作一個新功能",
+                    store=store,
+                    workspace=tmp,
+                )
+            self.assertEqual(provider_cls.call_args.kwargs["timeout_seconds"], 3600)
+
+    def test_direct_task_keeps_short_cursor_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            with patch("tg_cli_relay.relay.CursorAgentProvider") as provider_cls, patch.dict(
+                os.environ,
+                {"TGR_ROUTER_CONFIG": str(Path(tmp) / "missing-router.toml")},
+                clear=False,
+            ):
+                provider_cls.return_value.create_session.return_value = "cursor-2"
+                provider_cls.return_value.run_turn.return_value = RunResult(
+                    stdout="one", stderr="", returncode=0
+                )
+                relay_turn(
+                    thread_key="private:2",
+                    backend="cursor",
+                    prompt="目前版本是什麼？",
+                    store=store,
+                    workspace=tmp,
+                )
+            self.assertEqual(provider_cls.call_args.kwargs["timeout_seconds"], 600)
+
+    def test_relay_job_executes_as_worker_without_router_delegation_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "sessions.sqlite3")
+            with patch("tg_cli_relay.relay.CursorAgentProvider") as provider_cls, patch.dict(
+                os.environ,
+                {"TGR_ROUTER_CONFIG": str(Path(tmp) / "missing-router.toml")},
+                clear=False,
+            ):
+                provider_cls.return_value.create_session.return_value = "cursor-worker-1"
+                provider_cls.return_value.run_turn.return_value = RunResult(
+                    stdout="done", stderr="", returncode=0
+                )
+                relay_turn(
+                    thread_key="private:2:job:abcd1234",
+                    backend="cursor",
+                    prompt="請實作功能並跑完整測試",
+                    store=store,
+                    workspace=tmp,
+                )
+            sent = provider_cls.return_value.run_turn.call_args.kwargs["prompt"]
+            self.assertIn("Relay role: WORKER", sent)
+            self.assertIn("do not dispatch, spawn, or delegate", sent)
+            self.assertNotIn("Task Router decision: DELEGATE", sent)
+            self.assertEqual(provider_cls.call_args.kwargs["timeout_seconds"], 3600)
 
 
 if __name__ == "__main__":

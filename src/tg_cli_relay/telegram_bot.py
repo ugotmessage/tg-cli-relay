@@ -6,6 +6,9 @@ import hashlib
 import logging
 import os
 import re
+import time
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 from tg_cli_relay.attachments import (
@@ -22,10 +25,17 @@ from tg_cli_relay.attachments import (
     prepare_download_path,
     resolve_outbound_files,
 )
-from tg_cli_relay.job_store import JobStore
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
+from tg_cli_relay.conversation_context import ConversationContext
 from tg_cli_relay.session_store import Backend, SessionStore
-from tg_cli_relay.task_router import route_prompt
+from tg_cli_relay.task_registry import TaskRecord, TaskRegistry, make_task_title
+from tg_cli_relay.task_router import (
+    Route,
+    format_router_status,
+    format_router_test,
+    load_task_router_config,
+    route_text,
+)
 from tg_cli_relay.telegram_app import build_resilient_application
 from tg_cli_relay.thread_key import TelegramIds, telegram_thread_key
 
@@ -33,9 +43,326 @@ log = logging.getLogger(__name__)
 
 TG_CHUNK = 3800
 _BOT_LOCK_FILE = None
-SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
+_ACTIVE_RELAY_THREADS: set[str] = set()
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
-_THREAD_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+@dataclass(slots=True)
+class RelayJob:
+    job_id: str
+    parent_key: str
+    worker_key: str
+    backend: Backend
+    started_at: float
+    finished_at: float | None = None
+    status: str = "starting"
+    latest_progress: str = "等待 worker 啟動"
+    title: str = ""
+
+
+@dataclass(slots=True)
+class QueuedTurn:
+    msg: object
+    key: str
+    backend: Backend
+    prompt: str
+    store_path: Path
+    attachment_config: AttachmentConfig
+    route: Route
+    task_id: str | None = None
+    worker_key: str | None = None
+    title: str = ""
+    kind: str = "parent"
+
+
+_ACTIVE_JOBS: dict[str, RelayJob] = {}
+_RECENT_JOBS: dict[str, RelayJob] = {}
+_RUNNING_TASKS: dict[str, RelayJob] = {}
+_PENDING_TURNS: dict[str, deque[QueuedTurn]] = {}
+_PENDING_TASK_TURNS: dict[str, deque[QueuedTurn]] = {}
+_QUEUE_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
+_TASK_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
+SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
+
+
+def _task_banner(job: RelayJob | TaskRecord | None) -> str:
+    if job is None:
+        return ""
+    task_id = job.job_id if isinstance(job, RelayJob) else job.task_id
+    title = (job.title or "").strip() or "untitled"
+    return f"[task {task_id}] {title}"
+
+
+def _with_task_banner(job: RelayJob | TaskRecord | None, text: str) -> str:
+    banner = _task_banner(job)
+    if not banner:
+        return text
+    body = text or ""
+    if body.startswith(banner):
+        return body
+    return f"{banner}\n{body}" if body else banner
+
+
+def _job_status_text(job: RelayJob) -> str:
+    end = job.finished_at if job.finished_at is not None else time.monotonic()
+    elapsed = max(0, int(end - job.started_at))
+    latest = job.latest_progress.strip() or "尚無進度訊息"
+    if len(latest) > 600:
+        latest = latest[-600:]
+    title = job.title.strip() or "untitled"
+    return _with_task_banner(
+        job,
+        (
+            f"背景工作 {job.job_id}\n"
+            f"標題: {title}\n"
+            f"狀態: {job.status}\n"
+            f"已執行: {elapsed} 秒\n"
+            f"最新進度: {latest}"
+        ),
+    )
+
+
+def _task_status_text(task: TaskRecord, job: RelayJob | None = None) -> str:
+    if job is not None and job.job_id == task.task_id:
+        return _job_status_text(job)
+    return _with_task_banner(
+        task,
+        (
+            f"背景工作 {task.task_id}\n"
+            f"標題: {task.title}\n"
+            f"狀態: {task.status}\n"
+            "最新進度: （程序重啟後僅保留登錄狀態，不會自動重跑）"
+        ),
+    )
+
+
+def _format_task_list(tasks: list[TaskRecord]) -> str:
+    if not tasks:
+        return (
+            "目前這個對話還沒有孤立任務。\n"
+            "普通訊息仍走原本對話；新的背景工作會自動建立任務。\n"
+            "用法: /task new <說明>\n"
+            "用法: /task <id> [說明]"
+        )
+    lines = ["本對話的任務："]
+    for task in tasks:
+        lines.append(f"- {task.task_id} [{task.status}] {task.title}")
+    lines.extend(
+        [
+            "",
+            "回覆帶有 [task …] 的訊息可繼續該任務。",
+            "用法: /task <id> [說明]",
+            "用法: /task new <說明>",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _task_choice_text(tasks: list[TaskRecord]) -> str:
+    lines = [
+        "有多個任務可能符合，請回覆該任務的訊息或指定 /task <id>，不要直接當成舊的主對話。",
+        "",
+    ]
+    lines.append(_format_task_list(tasks))
+    return "\n".join(lines).strip()
+
+
+def _unbound_reply_instructions(tasks: list[TaskRecord]) -> str:
+    return (
+        "這則訊息沒有綁定任務，無法判斷要繼續哪一項。"
+        "請回覆帶有 [task …] 的訊息，或使用 /task <id>。\n\n"
+        + _format_task_list(tasks)
+    )
+
+
+def _reply_to_message_id(msg) -> int | None:  # type: ignore[no-untyped-def]
+    reply = getattr(msg, "reply_to_message", None)
+    if reply is None:
+        return None
+    mid = getattr(reply, "message_id", None)
+    return mid if isinstance(mid, int) else None
+
+
+def _sent_message_id(sent) -> int | None:  # type: ignore[no-untyped-def]
+    mid = getattr(sent, "message_id", None)
+    return mid if isinstance(mid, int) else None
+
+
+def _bind_sent_message(
+    registry: TaskRegistry | None,
+    job: RelayJob | TaskRecord | None,
+    sent,
+    role: str,
+) -> None:
+    if registry is None or job is None:
+        return
+    mid = _sent_message_id(sent)
+    if mid is None:
+        return
+    task_id = job.job_id if isinstance(job, RelayJob) else job.task_id
+    registry.bind_message(
+        parent_key=job.parent_key,
+        message_id=mid,
+        task_id=task_id,
+        backend=job.backend,
+        role=role,
+    )
+
+
+def _bind_source_message(registry: TaskRegistry, task: TaskRecord, msg) -> None:  # type: ignore[no-untyped-def]
+    mid = getattr(msg, "message_id", None)
+    if not isinstance(mid, int):
+        return
+    registry.bind_message(
+        parent_key=task.parent_key,
+        message_id=mid,
+        task_id=task.task_id,
+        backend=task.backend,
+        role="source",
+    )
+
+
+def _copy_parent_model_pref(store: SessionStore, parent_key: str, worker_key: str, backend: Backend) -> None:
+    model = store.get_pref(parent_key, _model_pref_key(backend))
+    if model:
+        store.set_pref(worker_key, _model_pref_key(backend), model)
+
+
+def _register_new_task(turn: QueuedTurn, store: SessionStore, registry: TaskRegistry, status: str) -> TaskRecord:
+    task = registry.create_task(
+        parent_key=turn.key,
+        backend=turn.backend,
+        title=make_task_title(turn.prompt),
+        status=status,
+    )
+    _copy_parent_model_pref(store, turn.key, task.worker_key, turn.backend)
+    ConversationContext(store.db_path).bind_task(turn.key, task.worker_key)
+    _bind_source_message(registry, task, turn.msg)
+    turn.task_id = task.task_id
+    turn.worker_key = task.worker_key
+    turn.title = task.title
+    turn.kind = "new_task"
+    return task
+
+
+_PROGRESS_QUERY_RE = re.compile(
+    r"^(?:"
+    r"進度(?:如何|怎樣)?"
+    r"|現在進度(?:如何|怎樣)?"
+    r"|做到哪(?:裡)?(?:了)?"
+    r"|現在怎樣|現在如何"
+    r"|還在跑(?:嗎)?"
+    r"|做好了嗎|好了嗎|做完了嗎|完成了嗎|跑完了嗎"
+    r"|job\s*status"
+    r"|progress"
+    r")[\s?？!！.。]*$",
+    re.IGNORECASE,
+)
+_CONTINUATION_RE = re.compile(
+    r"^(?:"
+    r"(?:請)?繼續(?:做|下去|吧)?"
+    r"|接著(?:做|下去)?"
+    r"|往下(?:做|去)?"
+    r"|continue(?:\s+please)?"
+    r"|keep\s+going"
+    r"|go\s+on"
+    r")[\s?？!！.。]*$",
+    re.IGNORECASE,
+)
+
+
+_CONTEXTUAL_FOLLOWUP_RE = re.compile(
+    r"^(?:剛剛|剛才|前面|上面|那個|這個|這部分|這一段|同一個|"
+    r"再修|再改|再補|繼續|接著|往下|還沒|還有問題|還是不行|又出錯|改成|順便把)",
+    re.IGNORECASE,
+)
+
+
+def _is_contextual_followup(text: str) -> bool:
+    return bool(_CONTEXTUAL_FOLLOWUP_RE.match((text or "").strip()))
+
+
+def _is_progress_query(text: str) -> bool:
+    return bool(_PROGRESS_QUERY_RE.match((text or "").strip()))
+
+
+def _is_bare_continuation(text: str) -> bool:
+    return bool(_CONTINUATION_RE.match((text or "").strip()))
+
+
+def _job_like_from_turn(turn: QueuedTurn) -> RelayJob | None:
+    if not turn.task_id:
+        return None
+    return RelayJob(
+        job_id=turn.task_id,
+        parent_key=turn.key,
+        worker_key=turn.worker_key or "",
+        backend=turn.backend,
+        started_at=time.monotonic(),
+        title=turn.title,
+    )
+
+
+def _discard_queued_turn(pending: dict[str, deque[QueuedTurn]], key: str, turn: QueuedTurn) -> None:
+    queue = pending.get(key)
+    if queue is None:
+        return
+    try:
+        queue.remove(turn)
+    except ValueError:
+        return
+    if not queue:
+        pending.pop(key, None)
+
+
+def _pending_parent_turn_for_task(task_id: str) -> QueuedTurn | None:
+    for queue in _PENDING_TURNS.values():
+        for turn in queue:
+            if turn.task_id == task_id:
+                return turn
+    return None
+
+
+def _task_session_busy(task_id: str, worker_key: str | None) -> bool:
+    if task_id in _RUNNING_TASKS:
+        return True
+    if worker_key and worker_key in _ACTIVE_RELAY_THREADS:
+        return True
+    return False
+
+
+def _manual_resume_text(task: TaskRecord) -> str:
+    return _with_task_banner(
+        task,
+        (
+            f"任務 {task.task_id} 的原始請求尚未執行，不會自動跑後續訊息。\n"
+            f"請回覆該任務的訊息，或使用 /task {task.task_id} <說明> 手動繼續。"
+        ),
+    )
+
+
+async def _reply_task_status(
+    msg,
+    task: TaskRecord,
+    registry: TaskRegistry,
+    job: RelayJob | None = None,
+) -> None:
+    await _reply_text_with_retry(
+        msg,
+        _task_status_text(task, job),
+        job=task,
+        registry=registry,
+        role="status",
+    )
+
+
+def _queue_limit() -> int:
+    raw = os.environ.get("TGR_THREAD_QUEUE_MAX", "20").strip() or "20"
+    return max(1, int(raw))
+
+
+def _queue_size(thread_key: str) -> int:
+    return len(_PENDING_TURNS.get(thread_key, ()))
 
 
 def _allowed_ids() -> set[int] | None:
@@ -110,13 +437,24 @@ def _models_for_backend(backend: Backend) -> list[str]:
     return []
 
 
-def _format_model_catalog(store: SessionStore, thread_key: str, active_backend: Backend) -> str:
+async def _models_for_backend_live(backend: Backend) -> list[str]:
+    if backend == "cursor":
+        from tg_cli_relay.providers.cursor_agent import list_cursor_models
+
+        agent_bin = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
+        return await asyncio.to_thread(list_cursor_models, agent_bin)
+    return _models_for_backend(backend)
+
+
+async def _format_model_catalog(
+    store: SessionStore, thread_key: str, active_backend: Backend
+) -> str:
     lines = [f"目前 provider: {active_backend}", ""]
     for backend in _enabled_backends():
         marker = "*" if backend == active_backend else "-"
         current = effective_model_for_backend(store, thread_key, backend)
         lines.append(f"{marker} {backend} 目前模型: {current}")
-        models = _models_for_backend(backend)
+        models = await _models_for_backend_live(backend)
         if models:
             lines.extend(f"  {model}" for model in models)
         else:
@@ -131,24 +469,6 @@ def _format_model_catalog(store: SessionStore, thread_key: str, active_backend: 
 def _get_store() -> SessionStore:
     store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
     return SessionStore(store_path)
-
-
-def _get_job_store() -> JobStore:
-    store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
-    return JobStore(store_path)
-
-
-def _thread_lock(thread_key: str) -> asyncio.Lock:
-    lock = _THREAD_LOCKS.get(thread_key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _THREAD_LOCKS[thread_key] = lock
-    return lock
-
-
-def _track_background_task(task: asyncio.Task[None]) -> None:
-    _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
 def _get_thread_key(update) -> str:  # type: ignore[no-untyped-def]
@@ -169,9 +489,14 @@ async def _cmd_reset(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
     key = _get_thread_key(update)
+    if key in _ACTIVE_RELAY_THREADS or _PENDING_TURNS.get(key):
+        await update.message.reply_text("主對話仍在執行或排隊，請完成後再重置。")
+        return
     store = _get_store()
     backend = _backend_for_thread(store, key)
     store.delete(key, backend)
+    TaskRegistry(store.db_path).clear_focus(key)
+    ConversationContext(store.db_path).reset(key)
     await update.message.reply_text(f"對話已重置，下一則訊息將開啟新的 {backend} session。")
 
 
@@ -190,57 +515,16 @@ async def _cmd_status(update, context) -> None:  # type: ignore[no-untyped-def]
         f"模型: {effective_model_for_backend(store, key, backend)}",
         f"可用 providers: {', '.join(_enabled_backends())}",
     ]
-    await update.message.reply_text("\n".join(lines))
-
-
-async def _cmd_jobs(update, context) -> None:  # type: ignore[no-untyped-def]
-    if not _check_auth(update):
-        return
-    key = _get_thread_key(update)
-    jobs = _get_job_store().list_for_thread(key, limit=10)
-    if not jobs:
-        await update.message.reply_text("目前沒有 delegated jobs。")
-        return
-
-    lines = ["最近 jobs:"]
-    for job in jobs:
-        reason = f" · {job.reason}" if job.reason else ""
-        lines.append(f"#{job.id} {job.status} · {job.backend}{reason}")
-    lines.append("")
-    lines.append("用法: /job <id>")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def _cmd_job(update, context) -> None:  # type: ignore[no-untyped-def]
-    if not _check_auth(update):
-        return
-    args: list[str] = context.args or []
-    if not args or not args[0].isdigit():
-        await update.message.reply_text("用法: /job <id>")
-        return
-
-    key = _get_thread_key(update)
-    job = _get_job_store().get(int(args[0]))
-    if job is None or job.thread_key != key:
-        await update.message.reply_text("找不到這個 job。")
-        return
-
-    lines = [
-        f"Job #{job.id}",
-        f"狀態: {job.status}",
-        f"Provider: {job.backend}",
-        f"建立: {job.created_at}",
-    ]
-    if job.started_at:
-        lines.append(f"開始: {job.started_at}")
-    if job.finished_at:
-        lines.append(f"結束: {job.finished_at}")
-    if job.reason:
-        lines.append(f"派工原因: {job.reason}")
-    if job.error:
-        lines.extend(["", "錯誤:", job.error])
-    elif job.result_preview and job.status == "completed":
-        lines.extend(["", "結果預覽:", job.result_preview[:1200]])
+    job = _ACTIVE_JOBS.get(key) or _RECENT_JOBS.get(key)
+    if job is not None:
+        lines.extend(["", _job_status_text(job)])
+    registry = TaskRegistry(store.db_path)
+    tasks = registry.list_tasks(key)
+    if tasks:
+        lines.extend(["", _format_task_list(tasks)])
+    queued = _queue_size(key)
+    if queued:
+        lines.extend(["", f"等待中的訊息: {queued}"])
     await update.message.reply_text("\n".join(lines))
 
 
@@ -283,7 +567,9 @@ async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
     args: list[str] = context.args or []
 
     if not args:
-        await update.message.reply_text(_format_model_catalog(store, key, backend))
+        catalog = await _format_model_catalog(store, key, backend)
+        for chunk in _chunk_reply(catalog):
+            await update.message.reply_text(chunk)
         return
 
     maybe_backend = _parse_backend(args[0])
@@ -297,22 +583,170 @@ async def _cmd_model(update, context) -> None:  # type: ignore[no-untyped-def]
         store.set_pref(key, "backend", backend)
         if len(args) == 1:
             current = effective_model_for_backend(store, key, backend)
-            models = "\n".join(f"  {m}" for m in _models_for_backend(backend))
-            await update.message.reply_text(
-                f"Provider 已切換至 {backend}\n目前模型: {current}\n\n可用模型:\n{models}"
-            )
+            models = "\n".join(f"  {m}" for m in await _models_for_backend_live(backend))
+            body = f"Provider 已切換至 {backend}\n目前模型: {current}\n\n可用模型:\n{models}"
+            for chunk in _chunk_reply(body):
+                await update.message.reply_text(chunk)
             return
         chosen = args[1]
     else:
         chosen = args[0]
 
-    models = _models_for_backend(backend)
+    models = await _models_for_backend_live(backend)
     if models and chosen not in models:
         await update.message.reply_text(f"不支援的模型: {chosen}\n可用: {', '.join(models)}")
         return
 
     store.set_pref(key, _model_pref_key(backend), chosen)
     await update.message.reply_text(f"{backend} 模型已切換至 {chosen}（下一輪起生效）。")
+
+
+async def _cmd_router(update, context) -> None:  # type: ignore[no-untyped-def]
+    if not _check_auth(update):
+        return
+    args: list[str] = context.args or []
+    if args and args[0].lower() == "test":
+        text = " ".join(args[1:]).strip()
+        if not text:
+            await update.message.reply_text("用法: /router test <文字>")
+            return
+        await update.message.reply_text(format_router_test(text))
+        return
+    await update.message.reply_text(format_router_status())
+
+
+async def _cmd_jobs(update, context) -> None:  # type: ignore[no-untyped-def]
+    """Legacy alias: show new tasks plus prior JobStore jobs, if present."""
+    if not _check_auth(update):
+        return
+    key = _get_thread_key(update)
+    db = _get_store().db_path
+    lines = [_format_task_list(TaskRegistry(db).list_tasks(key))]
+    try:
+        from tg_cli_relay.job_store import JobStore
+        legacy = JobStore(db).list_for_thread(key, limit=5)
+        if legacy:
+            lines.append("舊版背景 Jobs：")
+            lines.extend(f"#{j.id} [{j.status}] {j.backend}" for j in legacy)
+    except ImportError:
+        pass
+    await update.message.reply_text("\n\n".join(lines))
+
+
+async def _cmd_job(update, context) -> None:  # type: ignore[no-untyped-def]
+    """Accept task IDs and retained numeric JobStore IDs."""
+    if not _check_auth(update):
+        return
+    args = list(context.args or [])
+    if not args:
+        await update.message.reply_text("用法: /job <id>（新版任務亦可用 /task <id>）")
+        return
+    key = _get_thread_key(update)
+    db = _get_store().db_path
+    task = TaskRegistry(db).get_task(args[0])
+    if task is not None and task.parent_key == key:
+        await _reply_task_status(update.message, task, TaskRegistry(db))
+        return
+    if args[0].isdigit():
+        try:
+            from tg_cli_relay.job_store import JobStore
+            job = JobStore(db).get(int(args[0]))
+        except ImportError:
+            job = None
+        if job is not None and job.thread_key == key:
+            body = f"Job #{job.id}\n狀態: {job.status}\nProvider: {job.backend}"
+            if job.result_preview:
+                body += "\n結果預覽: " + job.result_preview[:1200]
+            if job.error:
+                body += "\n錯誤: " + job.error
+            await update.message.reply_text(body)
+            return
+    await update.message.reply_text("找不到此對話的 Job。")
+
+
+async def _cmd_task(update, context) -> None:  # type: ignore[no-untyped-def]
+    if not _check_auth(update):
+        return
+    msg = update.message
+    if msg is None:
+        return
+    key = _get_thread_key(update)
+    store = _get_store()
+    registry = TaskRegistry(store.db_path)
+    args: list[str] = list(context.args or [])
+    if not args:
+        await msg.reply_text(_format_task_list(registry.list_tasks(key)))
+        return
+    if args[0].lower() == "clear":
+        registry.clear_focus(key)
+        await msg.reply_text("已清除目前任務焦點。")
+        return
+    if args[0].lower() == "active":
+        task = registry.focused_task(key)
+        await msg.reply_text(_task_status_text(task) if task else "目前沒有選定任務。")
+        return
+    if args[0].lower() == "use":
+        task_id = args[1] if len(args) > 1 else ""
+        if not task_id or not registry.focus_task(key, task_id):
+            await msg.reply_text("用法: /task use <本對話任務ID>")
+            return
+        task = registry.focused_task(key)
+        assert task is not None
+        await msg.reply_text(f"目前任務已切換至 [{task.task_id}] {task.title}。")
+        return
+    if args[0].lower() == "new":
+        prompt = " ".join(args[1:]).strip()
+        if not prompt:
+            await msg.reply_text("用法: /task new <說明>")
+            return
+        attachment_config = _attachment_config()
+        store_path = store.db_path
+        backend = _backend_for_thread(store, key)
+        decision = route_text(prompt, load_task_router_config().config)
+        turn = QueuedTurn(
+            msg=msg,
+            key=key,
+            backend=backend,
+            prompt=prompt,
+            store_path=store_path,
+            attachment_config=attachment_config,
+            route=decision.route,
+            kind="new_task",
+        )
+        busy = key in _ACTIVE_RELAY_THREADS or key in _ACTIVE_JOBS or bool(_PENDING_TURNS.get(key))
+        _register_new_task(turn, store, registry, "queued" if busy else "starting")
+        if busy:
+            queued_ok = await _enqueue_turn(turn)
+            if not queued_ok:
+                registry.update_status(turn.task_id, "failed")
+            return
+        await _start_background_job(turn)
+        return
+
+    task_id = args[0]
+    prompt = " ".join(args[1:]).strip()
+    task = registry.get_task(task_id)
+    if task is None:
+        await msg.reply_text(f"找不到任務 {task_id}。請用 /task 查看本對話的任務。")
+        return
+    if task.parent_key != key:
+        await msg.reply_text(
+            f"任務 {task_id} [{task.title}] 不屬於這個對話／主題，無法在此繼續。"
+        )
+        return
+    registry.focus_task(key, task.task_id)
+    if not prompt:
+        job = _RUNNING_TASKS.get(task.task_id)
+        await _reply_task_status(msg, task, registry, job)
+        return
+    await _resume_existing_task(
+        task,
+        msg=msg,
+        prompt=prompt,
+        store_path=store.db_path,
+        attachment_config=_attachment_config(),
+        registry=registry,
+    )
 
 
 async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
@@ -324,11 +758,14 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
         "/status — 查看目前後端與 session 狀態",
         "/provider [名稱] — 查看或切換 CLI provider",
         "/model [provider] [名稱] — 查看或切換模型",
-        "/jobs — 查看最近派工",
-        "/job <id> — 查看派工狀態與結果預覽",
+        "/router — 查看 Task Router 規則與設定來源",
+        "/router test <文字> — 測試 DIRECT / DELEGATE 判斷",
+        "/task — 列出本對話的孤立任務",
+        "/task <id> [說明] — 查看或繼續指定任務",
+        "/task new <說明> — 開新的孤立任務（含小型 DIRECT）",
+        "進度 — 查詢目前背景 worker 狀態",
+        "忙碌期間的新訊息會依序排隊，完成後自動處理。",
         "/help — 顯示此說明",
-        "",
-        "路由覆寫：訊息前加 !job 強制派工；!direct 強制主 session 直接執行。",
         "",
         "附件：可傳 document / photo / audio / voice / video（含 caption）。",
         f"下載上限：{cfg.max_download_bytes} bytes；回傳上限：{cfg.max_upload_bytes} bytes。",
@@ -383,12 +820,22 @@ def _is_transient_telegram_error(exc: Exception) -> bool:
     return is_transient_telegram_error(exc)
 
 
-async def _reply_text_with_retry(message, text: str, retries: int = 2, delay_seconds: float = 2.0) -> None:  # type: ignore[no-untyped-def]
+async def _reply_text_with_retry(  # type: ignore[no-untyped-def]
+    message,
+    text: str,
+    retries: int = 2,
+    delay_seconds: float = 2.0,
+    *,
+    job: RelayJob | TaskRecord | None = None,
+    registry: TaskRegistry | None = None,
+    role: str = "progress",
+):
     attempt = 0
     while True:
         try:
-            await message.reply_text(text)
-            return
+            sent = await message.reply_text(text)
+            _bind_sent_message(registry, job, sent, role)
+            return sent
         except Exception as exc:
             if attempt >= retries or not _is_transient_telegram_error(exc):
                 raise
@@ -397,13 +844,23 @@ async def _reply_text_with_retry(message, text: str, retries: int = 2, delay_sec
             await asyncio.sleep(delay_seconds)
 
 
-async def _reply_document_with_retry(message, path: Path, retries: int = 2, delay_seconds: float = 2.0) -> None:  # type: ignore[no-untyped-def]
+async def _reply_document_with_retry(  # type: ignore[no-untyped-def]
+    message,
+    path: Path,
+    retries: int = 2,
+    delay_seconds: float = 2.0,
+    *,
+    job: RelayJob | TaskRecord | None = None,
+    registry: TaskRegistry | None = None,
+    role: str = "attachment",
+):
     attempt = 0
     while True:
         try:
             with path.open("rb") as fh:
-                await message.reply_document(document=fh, filename=path.name)
-            return
+                sent = await message.reply_document(document=fh, filename=path.name)
+            _bind_sent_message(registry, job, sent, role)
+            return sent
         except Exception as exc:
             if attempt >= retries or not _is_transient_telegram_error(exc):
                 raise
@@ -506,6 +963,8 @@ async def _send_relay_output(
     sid: str | None,
     attachment_config: AttachmentConfig,
     segments: list[str] | None = None,
+    job: RelayJob | None = None,
+    registry: TaskRegistry | None = None,
 ) -> None:
     parsed = parse_tgr_file_markers(body)
     upload_paths, upload_errors = resolve_outbound_files(
@@ -541,88 +1000,487 @@ async def _send_relay_output(
         chunks = ["(無輸出)"]
 
     for i, part in enumerate(chunks):
-        await _reply_text_with_retry(msg, part + (footer if i == len(chunks) - 1 else ""))
+        role = "final" if i == len(chunks) - 1 and not upload_paths else "final"
+        await _reply_text_with_retry(
+            msg,
+            _with_task_banner(job, part + (footer if i == len(chunks) - 1 else "")),
+            job=job,
+            registry=registry,
+            role=role,
+        )
 
     upload_failures: list[str] = []
     for path in upload_paths:
         try:
-            await _reply_document_with_retry(msg, path)
+            await _reply_document_with_retry(msg, path, job=job, registry=registry, role="attachment")
         except Exception:
             log.exception("Telegram 附件上傳失敗 path=%s", path.name)
             upload_failures.append(f"無法傳送附件：{path.name}")
 
     if upload_failures:
-        await _reply_text_with_retry(msg, "\n".join(upload_failures))
+        await _reply_text_with_retry(
+            msg,
+            _with_task_banner(job, "\n".join(upload_failures)),
+            job=job,
+            registry=registry,
+            role="error",
+        )
 
 
-def _run_result_body(res) -> str:  # type: ignore[no-untyped-def]
-    out = res.stdout or ""
-    err = res.stderr or ""
-    if res.returncode == 0:
-        return out
-    if err.strip():
-        return f"{out}\n\n--- stderr ---\n{err}".strip()
-    return out
-
-
-async def _run_delegated_job(
+async def _execute_relay_turn(
     *,
     msg,
-    job_id: int,
-    worker_thread_key: str,
+    key: str,
     backend: Backend,
     prompt: str,
+    store: SessionStore,
     attachment_config: AttachmentConfig,
-) -> None:  # type: ignore[no-untyped-def]
-    jobs = _get_job_store()
-    store = _get_store()
-    jobs.mark_running(job_id)
-    loop = asyncio.get_running_loop()
-
-    def _live_progress(text: str) -> None:
-        future = asyncio.run_coroutine_threadsafe(
-            _reply_text_with_retry(msg, f"Job #{job_id}: {text}"), loop
-        )
-        try:
-            future.result()
-        except Exception as exc:
-            log.warning("delegated Codex progress delivery failed job=%s: %s", job_id, exc)
-
+    show_typing: bool,
+    job: RelayJob | None = None,
+) -> None:
+    typing_task: asyncio.Task[None] | None = None
     try:
-        res = await asyncio.to_thread(
-            relay_turn,
-            thread_key=worker_thread_key,
-            backend=backend,
-            prompt=prompt,
-            store=store,
-            on_progress=_live_progress if backend == "codex" else None,
-        )
-        body = _run_result_body(res)
-        sid = store.get(worker_thread_key, backend)
-        model = effective_model_for_backend(store, worker_thread_key, backend)
+        from telegram.constants import ChatAction
 
+        async def _typing_loop() -> None:
+            while True:
+                try:
+                    await msg.chat.send_action(action=ChatAction.TYPING)
+                except Exception as exc:
+                    log.warning(
+                        "Telegram typing action failed; continuing without typing indicator: %s",
+                        exc,
+                    )
+                await asyncio.sleep(4)
+
+        if show_typing:
+            typing_task = asyncio.create_task(_typing_loop())
+
+        loop = asyncio.get_running_loop()
+        registry = TaskRegistry(store.db_path) if job is not None else None
+
+        def _live_progress(text: str) -> None:
+            if job is not None:
+                job.status = "running"
+                job.latest_progress = text
+                if registry is not None:
+                    registry.update_status(job.job_id, "running")
+            future = asyncio.run_coroutine_threadsafe(
+                _reply_text_with_retry(
+                    msg,
+                    _with_task_banner(job, text),
+                    job=job,
+                    registry=registry,
+                    role="progress",
+                ),
+                loop,
+            )
+            try:
+                future.result()
+            except Exception as exc:
+                log.warning("Codex live progress delivery failed: %s", exc)
+
+        try:
+            res = await asyncio.to_thread(
+                relay_turn,
+                thread_key=key,
+                backend=backend,
+                prompt=prompt,
+                store=store,
+                on_progress=_live_progress if backend == "codex" else None,
+            )
+        except Exception as exc:
+            log.exception("relay_turn 失敗 thread=%s", key)
+            if job is not None:
+                job.status = "failed"
+                job.latest_progress = f"relay 執行失敗: {type(exc).__name__}"
+                if registry is not None:
+                    registry.update_status(job.job_id, "failed")
+            await _reply_text_with_retry(
+                msg,
+                _with_task_banner(job, "執行失敗，請查看伺服器日誌。"),
+                job=job,
+                registry=registry,
+                role="error",
+            )
+            return
+
+        out = res.stdout or ""
+        err = res.stderr or ""
         if res.returncode == 0:
-            jobs.complete(job_id, body)
-            header = f"Job #{job_id} 完成"
+            body = out
+            if job is not None:
+                job.status = "completed"
+                job.latest_progress = "worker 已完成並回傳結果"
+                if registry is not None:
+                    registry.update_status(job.job_id, "completed")
+        elif err.strip():
+            body = f"{out}\n\n--- stderr ---\n{err}".strip()
+            if job is not None:
+                job.status = "failed"
+                job.latest_progress = f"worker 結束，return code {res.returncode}"
+                if registry is not None:
+                    registry.update_status(job.job_id, "failed")
         else:
-            jobs.fail(job_id, res.stderr or f"returncode={res.returncode}", body)
-            header = f"Job #{job_id} 執行失敗"
+            body = out
+            if job is not None:
+                job.status = "failed"
+                job.latest_progress = f"worker 結束，return code {res.returncode}"
+                if registry is not None:
+                    registry.update_status(job.job_id, "failed")
 
+        sid = store.get(key, backend)
+        model = effective_model_for_backend(store, key, backend)
         await _send_relay_output(
             msg,
-            f"{header}\n\n{body}".strip(),
+            body,
             backend=backend,
             model=model,
             sid=sid,
             attachment_config=attachment_config,
+            segments=res.stdout_segments,
+            job=job,
+            registry=registry,
+        )
+    finally:
+        _ACTIVE_RELAY_THREADS.discard(key)
+        if typing_task is not None:
+            typing_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await typing_task
+
+
+def _job_from_turn(turn: QueuedTurn, *, occupy_parent: bool) -> RelayJob:
+    if not turn.task_id or not turn.worker_key:
+        raise RuntimeError("task routing must be frozen before execution")
+    job = RelayJob(
+        job_id=turn.task_id,
+        parent_key=turn.key,
+        worker_key=turn.worker_key,
+        backend=turn.backend,
+        started_at=time.monotonic(),
+        title=turn.title,
+        status="starting",
+    )
+    if occupy_parent:
+        _ACTIVE_JOBS[turn.key] = job
+    _RUNNING_TASKS[job.job_id] = job
+    TaskRegistry(turn.store_path).update_status(job.job_id, "running")
+    return job
+
+
+async def _run_background_job(
+    *,
+    msg,
+    job: RelayJob,
+    prompt: str,
+    store_path: Path,
+    attachment_config: AttachmentConfig,
+    occupy_parent: bool,
+) -> None:
+    registry = TaskRegistry(store_path)
+    try:
+        job.status = "running"
+        job.latest_progress = "Orchestrator 已啟動獨立 worker session"
+        registry.update_status(job.job_id, "running")
+        await _execute_relay_turn(
+            msg=msg,
+            key=job.worker_key,
+            backend=job.backend,
+            prompt=prompt,
+            store=SessionStore(store_path),
+            attachment_config=attachment_config,
+            show_typing=False,
+            job=job,
         )
     except Exception as exc:
-        log.exception("delegated job failed job=%s thread=%s", job_id, worker_thread_key)
-        jobs.fail(job_id, str(exc))
-        try:
-            await _reply_text_with_retry(msg, f"Job #{job_id} 執行失敗，請查看伺服器日誌。")
-        except Exception:
-            log.exception("failed to deliver delegated job error job=%s", job_id)
+        job.status = "failed"
+        job.latest_progress = f"背景工作異常中止: {type(exc).__name__}"
+        registry.update_status(job.job_id, "failed")
+        log.exception("背景 relay job 失敗 job=%s", job.job_id)
+    finally:
+        job.finished_at = time.monotonic()
+        _RUNNING_TASKS.pop(job.job_id, None)
+        current = _ACTIVE_JOBS.get(job.parent_key)
+        if occupy_parent and current is not None and current.job_id == job.job_id:
+            _ACTIVE_JOBS.pop(job.parent_key, None)
+            _RECENT_JOBS[job.parent_key] = job
+            _schedule_queue_drain(job.parent_key)
+        _schedule_task_drain(job.job_id)
+
+
+async def _start_background_job(turn: QueuedTurn) -> None:
+    if turn.task_id and _task_session_busy(turn.task_id, turn.worker_key):
+        _PENDING_TURNS.setdefault(turn.key, deque()).appendleft(turn)
+        return
+    registry = TaskRegistry(turn.store_path)
+    job = _job_from_turn(turn, occupy_parent=True)
+    try:
+        await _reply_text_with_retry(
+            turn.msg,
+            _with_task_banner(
+                job,
+                f"已派出背景 worker（job {job.job_id}）。主對話可繼續使用；傳送「進度」可隨時查詢，完成後會自動回報。",
+            ),
+            job=job,
+            registry=registry,
+            role="ack",
+        )
+    except Exception:
+        _ACTIVE_JOBS.pop(turn.key, None)
+        _RUNNING_TASKS.pop(job.job_id, None)
+        registry.update_status(job.job_id, "failed")
+        _PENDING_TASK_TURNS.pop(job.job_id, None)
+        _schedule_queue_drain(turn.key)
+        raise
+    task = asyncio.create_task(
+        _run_background_job(
+            msg=turn.msg,
+            job=job,
+            prompt=turn.prompt,
+            store_path=turn.store_path,
+            attachment_config=turn.attachment_config,
+            occupy_parent=True,
+        )
+    )
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _start_task_followup(turn: QueuedTurn) -> None:
+    if not turn.task_id:
+        raise RuntimeError("follow-up routing must be frozen at arrival")
+    if _task_session_busy(turn.task_id, turn.worker_key) or _pending_parent_turn_for_task(turn.task_id):
+        _PENDING_TASK_TURNS.setdefault(turn.task_id, deque()).appendleft(turn)
+        return
+    registry = TaskRegistry(turn.store_path)
+    job = _job_from_turn(turn, occupy_parent=False)
+    try:
+        await _reply_text_with_retry(
+            turn.msg,
+            _with_task_banner(job, f"已傳送到任務 {job.job_id}，完成後會回覆同一任務。"),
+            job=job,
+            registry=registry,
+            role="ack",
+        )
+    except Exception:
+        _RUNNING_TASKS.pop(job.job_id, None)
+        registry.update_status(job.job_id, "failed")
+        _schedule_task_drain(job.job_id)
+        raise
+    task = asyncio.create_task(
+        _run_background_job(
+            msg=turn.msg,
+            job=job,
+            prompt=turn.prompt,
+            store_path=turn.store_path,
+            attachment_config=turn.attachment_config,
+            occupy_parent=False,
+        )
+    )
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _enqueue_task_followup(turn: QueuedTurn) -> bool:
+    if not turn.task_id:
+        raise RuntimeError("follow-up routing must be frozen at arrival")
+    queue = _PENDING_TASK_TURNS.setdefault(turn.task_id, deque())
+    job_like = _job_like_from_turn(turn)
+    registry = TaskRegistry(turn.store_path)
+    if len(queue) >= _queue_limit():
+        await _reply_text_with_retry(
+            turn.msg,
+            _with_task_banner(
+                job_like,
+                f"任務 {turn.task_id} 的等待佇列已滿（上限 {_queue_limit()} 則），請稍後再傳。",
+            ),
+            job=job_like,
+            registry=registry,
+            role="error",
+        )
+        return False
+    queue.append(turn)
+    try:
+        await _reply_text_with_retry(
+            turn.msg,
+            _with_task_banner(
+                job_like,
+                f"已加入任務 {turn.task_id} 的等待佇列，目前順位 {len(queue)}；前一項完成後會自動處理並回覆。",
+            ),
+            job=job_like,
+            registry=registry,
+            role="ack",
+        )
+    except Exception:
+        _discard_queued_turn(_PENDING_TASK_TURNS, turn.task_id, turn)
+        _schedule_task_drain(turn.task_id)
+        raise
+    _schedule_task_drain(turn.task_id)
+    return True
+
+
+async def _drain_task_queue(task_id: str) -> None:
+    try:
+        while True:
+            queue = _PENDING_TASK_TURNS.get(task_id)
+            if not queue:
+                _PENDING_TASK_TURNS.pop(task_id, None)
+                return
+            turn = queue[0]
+            if _task_session_busy(task_id, turn.worker_key) or _pending_parent_turn_for_task(task_id):
+                return
+            record = TaskRegistry(turn.store_path).get_task(task_id)
+            if record is not None and record.status in ("queued", "starting") and task_id not in _RUNNING_TASKS:
+                return
+            queue.popleft()
+            await _start_task_followup(turn)
+    finally:
+        _TASK_DRAIN_TASKS.pop(task_id, None)
+
+
+def _schedule_task_drain(task_id: str) -> None:
+    current = _TASK_DRAIN_TASKS.get(task_id)
+    if current is not None and not current.done():
+        return
+    task = asyncio.create_task(_drain_task_queue(task_id))
+    _TASK_DRAIN_TASKS[task_id] = task
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _resume_existing_task(
+    task: TaskRecord,
+    *,
+    msg,
+    prompt: str,
+    store_path: Path,
+    attachment_config: AttachmentConfig,
+    registry: TaskRegistry,
+) -> None:
+    registry.focus_task(task.parent_key, task.task_id)
+    _bind_source_message(registry, task, msg)
+    turn = QueuedTurn(
+        msg=msg,
+        key=task.parent_key,
+        backend=task.backend,  # type: ignore[arg-type]
+        prompt=prompt,
+        store_path=store_path,
+        attachment_config=attachment_config,
+        route=Route.DIRECT,
+        task_id=task.task_id,
+        worker_key=task.worker_key,
+        title=task.title,
+        kind="task_followup",
+    )
+    initial_pending = _pending_parent_turn_for_task(task.task_id) is not None
+    session_busy = _task_session_busy(task.task_id, task.worker_key)
+    if task.status in ("queued", "starting") and not session_busy:
+        if initial_pending or task.status == "starting":
+            await _enqueue_task_followup(turn)
+            return
+        await _reply_text_with_retry(
+            msg,
+            _manual_resume_text(task),
+            job=task,
+            registry=registry,
+            role="error",
+        )
+        return
+    if session_busy or initial_pending or _PENDING_TASK_TURNS.get(task.task_id):
+        await _enqueue_task_followup(turn)
+        return
+    await _start_task_followup(turn)
+
+
+async def _run_direct_turn(turn: QueuedTurn) -> None:
+    _ACTIVE_RELAY_THREADS.add(turn.key)
+    await _execute_relay_turn(
+        msg=turn.msg,
+        key=turn.key,
+        backend=turn.backend,
+        prompt=turn.prompt,
+        store=SessionStore(turn.store_path),
+        attachment_config=turn.attachment_config,
+        show_typing=True,
+    )
+    _schedule_queue_drain(turn.key)
+
+
+async def _drain_thread_queue(key: str) -> None:
+    try:
+        while True:
+            queue = _PENDING_TURNS.get(key)
+            if not queue:
+                _PENDING_TURNS.pop(key, None)
+                return
+            turn = queue[0]
+            if key in _ACTIVE_RELAY_THREADS:
+                return
+            if turn.kind == "new_task" or turn.route == Route.DELEGATE:
+                if key in _ACTIVE_JOBS:
+                    return
+                if turn.task_id and _task_session_busy(turn.task_id, turn.worker_key):
+                    return
+                queue.popleft()
+                if not turn.task_id or not turn.worker_key:
+                    store = SessionStore(turn.store_path)
+                    _register_new_task(turn, store, TaskRegistry(turn.store_path), "starting")
+                await _start_background_job(turn)
+                continue
+            queue.popleft()
+            await _run_direct_turn(turn)
+    finally:
+        _QUEUE_DRAIN_TASKS.pop(key, None)
+
+
+def _schedule_queue_drain(key: str) -> None:
+    current = _QUEUE_DRAIN_TASKS.get(key)
+    if current is not None and not current.done():
+        return
+    task = asyncio.create_task(_drain_thread_queue(key))
+    _QUEUE_DRAIN_TASKS[key] = task
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _enqueue_turn(turn: QueuedTurn) -> bool:
+    queue = _PENDING_TURNS.setdefault(turn.key, deque())
+    job = _job_like_from_turn(turn)
+    registry = TaskRegistry(turn.store_path) if turn.task_id else None
+    if len(queue) >= _queue_limit():
+        await _reply_text_with_retry(
+            turn.msg,
+            _with_task_banner(
+                job,
+                f"等待佇列已滿（上限 {_queue_limit()} 則），請稍後再傳。",
+            ),
+            job=job,
+            registry=registry,
+            role="error",
+        )
+        return False
+    queue.append(turn)
+    extra = f"（task {turn.task_id}）" if turn.task_id else ""
+    try:
+        await _reply_text_with_retry(
+            turn.msg,
+            _with_task_banner(
+                job,
+                f"已加入等待佇列{extra}，目前順位 {len(queue)}；前一項完成後會自動處理並回覆。",
+            ),
+            job=job,
+            registry=registry,
+            role="ack",
+        )
+    except Exception:
+        _discard_queued_turn(_PENDING_TURNS, turn.key, turn)
+        if turn.task_id:
+            TaskRegistry(turn.store_path).update_status(turn.task_id, "failed")
+        _schedule_queue_drain(turn.key)
+        raise
+    _schedule_queue_drain(turn.key)
+    return True
 
 
 async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
@@ -665,114 +1523,111 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         await update.effective_chat.send_message(_supported_types_hint())
         return
 
-    # 先顯示 typing，讓使用者知道訊息已收到且正在處理。
-    from telegram.constants import ChatAction
-
-    async def _typing_loop() -> None:
-        while True:
-            try:
-                await msg.chat.send_action(action=ChatAction.TYPING)
-            except Exception as exc:
-                log.warning("Telegram typing action failed; continuing without typing indicator: %s", exc)
-            await asyncio.sleep(4)
-
-    typing_task = asyncio.create_task(_typing_loop())
-
     chat = update.effective_chat
     thread_id = msg.message_thread_id
     key = telegram_thread_key(chat_type=str(chat.type), ids=TelegramIds(chat.id, thread_id))
 
+    decision = route_text(prompt, load_task_router_config().config)
     store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
     store = SessionStore(store_path)
+    registry = TaskRegistry(store_path)
     backend = _backend_for_thread(store, key)
-    loop = asyncio.get_running_loop()
 
-    decision = route_prompt(prompt)
-    prompt = decision.prompt
-    if decision.mode == "delegate":
-        reason = ", ".join(decision.reasons) if decision.reasons else f"score={decision.score}"
-        job = _get_job_store().create(
-            thread_key=key,
-            backend=backend,
-            prompt=prompt,
-            reason=reason,
-        )
-
-        # A delegated job gets an independent provider session.  Copy only the
-        # active model preference; conversation/session history stays isolated.
-        model_pref = store.get_pref(key, _model_pref_key(backend))
-        if model_pref:
-            store.set_pref(job.worker_thread_key, _model_pref_key(backend), model_pref)
-
-        typing_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await typing_task
-
-        task = asyncio.create_task(
-            _run_delegated_job(
+    reply_id = _reply_to_message_id(msg)
+    if reply_id is not None:
+        bound = registry.get_task_for_message(key, reply_id)
+        if bound is None:
+            tasks = registry.list_tasks(key)
+            if tasks:
+                await _reply_text_with_retry(msg, _unbound_reply_instructions(tasks))
+                return
+        elif bound.parent_key != key:
+            await _reply_text_with_retry(
+                msg,
+                f"任務 {bound.task_id} [{bound.title}] 不屬於這個對話／主題，無法在此繼續。",
+            )
+            return
+        else:
+            registry.focus_task(key, bound.task_id)
+            if _is_progress_query(prompt):
+                job = _RUNNING_TASKS.get(bound.task_id)
+                await _reply_task_status(msg, bound, registry, job)
+                return
+            await _resume_existing_task(
+                bound,
                 msg=msg,
-                job_id=job.id,
-                worker_thread_key=job.worker_thread_key,
-                backend=backend,
                 prompt=prompt,
+                store_path=store_path,
                 attachment_config=attachment_config,
+                registry=registry,
             )
+            return
+
+    active_job = _ACTIVE_JOBS.get(key)
+    tasks = registry.list_tasks(key)
+    focused = registry.focused_task(key)
+
+    # References to the ongoing task take precedence over new-task classification.
+    if _is_progress_query(prompt):
+        if focused is not None:
+            await _reply_task_status(msg, focused, registry, _RUNNING_TASKS.get(focused.task_id))
+            return
+        running = [t for t in tasks if t.status in ("queued", "starting", "running")]
+        if len(running) == 1:
+            await _reply_task_status(msg, running[0], registry, _RUNNING_TASKS.get(running[0].task_id))
+            return
+        if len(tasks) == 1:
+            await _reply_task_status(msg, tasks[0], registry, _RUNNING_TASKS.get(tasks[0].task_id))
+            return
+        if tasks:
+            await _reply_text_with_retry(msg, _task_choice_text(tasks))
+            return
+        if active_job is not None:
+            await _reply_text_with_retry(msg, _job_status_text(active_job))
+            return
+
+    if _is_bare_continuation(prompt) or _is_contextual_followup(prompt):
+        target = focused or (tasks[0] if len(tasks) == 1 else None)
+        if target is not None:
+            await _resume_existing_task(
+                target, msg=msg, prompt=prompt, store_path=store_path,
+                attachment_config=attachment_config, registry=registry,
+            )
+            return
+        if tasks:
+            await _reply_text_with_retry(msg, _task_choice_text(tasks))
+            return
+
+    if decision.route == Route.DELEGATE:
+        turn = QueuedTurn(
+            msg=msg, key=key, backend=backend, prompt=prompt,
+            store_path=store_path, attachment_config=attachment_config,
+            route=decision.route,
         )
-        _track_background_task(task)
-        await _reply_text_with_retry(
-            msg,
-            f"已派工 Job #{job.id}（{backend}）。主對話可繼續使用；"
-            f"用 /job {job.id} 查看狀態。",
-        )
+        busy = active_job is not None or key in _ACTIVE_RELAY_THREADS or bool(_PENDING_TURNS.get(key))
+        _register_new_task(turn, store, registry, "queued" if busy else "starting")
+        if not busy:
+            await _start_background_job(turn)
+            return
+        queued_ok = await _enqueue_turn(turn)
+        if not queued_ok:
+            registry.update_status(turn.task_id, "failed")
         return
 
-    def _live_progress(text: str) -> None:
-        # Called from the Codex subprocess worker thread. Block until Telegram
-        # accepts the message so progress ordering stays deterministic.
-        future = asyncio.run_coroutine_threadsafe(
-            _reply_text_with_retry(msg, text), loop
-        )
-        try:
-            future.result()
-        except Exception as exc:
-            # A transient progress-send failure must not abort the Codex
-            # subprocess; the final response still has a chance to arrive.
-            log.warning("Codex live progress delivery failed: %s", exc)
-
-    try:
-        # relay_turn 內部會跑 subprocess，改放到 thread 避免阻塞 event loop，
-        # 才能持續送出 Telegram typing 狀態。
-        async with _thread_lock(key):
-            res = await asyncio.to_thread(
-                relay_turn,
-                thread_key=key,
-                backend=backend,
-                prompt=prompt,
-                store=store,
-                on_progress=_live_progress if backend == "codex" else None,
-            )
-    except Exception:
-        log.exception("relay_turn 失敗 thread=%s", key)
-        await _reply_text_with_retry(msg, "執行失敗，請查看伺服器日誌。")
-        return
-    finally:
-        typing_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await typing_task
-
-    body = _run_result_body(res)
-
-    sid = store.get(key, backend)
-    model = effective_model_for_backend(store, key, backend)
-    await _send_relay_output(
-        msg,
-        body,
+    turn = QueuedTurn(
+        msg=msg,
+        key=key,
         backend=backend,
-        model=model,
-        sid=sid,
+        prompt=prompt,
+        store_path=store_path,
         attachment_config=attachment_config,
-        segments=res.stdout_segments,
+        route=decision.route,
     )
+
+    if key in _ACTIVE_RELAY_THREADS or _PENDING_TURNS.get(key):
+        await _enqueue_turn(turn)
+        return
+    await _run_direct_turn(turn)
 
 
 def _bot_singleton_lock_path(token: str) -> Path:
@@ -837,8 +1692,6 @@ def run_bot() -> None:
 
     _acquire_bot_singleton(token)
 
-    interrupted = _get_job_store().mark_interrupted_jobs()
-
     log_level = os.environ.get("TGR_LOG_LEVEL", "INFO")
     log_dir = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3")).parent
     log_file = log_dir / "bot.log"
@@ -859,16 +1712,27 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("status", _cmd_status))
     app.add_handler(CommandHandler("provider", _cmd_provider))
     app.add_handler(CommandHandler("model", _cmd_model))
+    app.add_handler(CommandHandler("router", _cmd_router))
+    app.add_handler(CommandHandler("task", _cmd_task))
     app.add_handler(CommandHandler("jobs", _cmd_jobs))
     app.add_handler(CommandHandler("job", _cmd_job))
     app.add_handler(CommandHandler("help", _cmd_help))
     content_filter = (
         filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VOICE | filters.VIDEO
     ) & ~filters.COMMAND
-    app.add_handler(MessageHandler(content_filter, _on_message))
-    log.info(
-        "啟動 Telegram bot（default_backend=%s, interrupted_jobs=%s）",
-        _default_backend(),
-        interrupted,
-    )
+    # block=False isolates each relay turn from Telegram's update loop.  A slow
+    # provider can no longer prevent commands or other chats from being handled.
+    app.add_handler(MessageHandler(content_filter, _on_message, block=False))
+    store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
+    interrupted = TaskRegistry(store_path).interrupt_inflight()
+    # Existing installations may still have jobs created by the earlier
+    # JobStore dispatcher. Preserve their history, but never auto-rerun them.
+    try:
+        from tg_cli_relay.job_store import JobStore
+        JobStore(store_path).mark_interrupted_jobs()
+    except ImportError:
+        pass
+    if interrupted:
+        log.warning("啟動時將 %s 筆 queued/running 任務標為 interrupted，不會自動重跑", interrupted)
+    log.info("啟動 Telegram bot（default_backend=%s）", _default_backend())
     app.run_polling(allowed_updates=["message"], drop_pending_updates=True, bootstrap_retries=-1)

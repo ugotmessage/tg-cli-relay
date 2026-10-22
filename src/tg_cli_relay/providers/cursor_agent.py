@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+import time
 from dataclasses import dataclass
 
 from tg_cli_relay.providers.base import RunResult
@@ -24,6 +26,39 @@ CURSOR_MODELS: list[str] = [
     "gemini-3.1-pro",
     "grok-4.3",
 ]
+
+_MODEL_CACHE: tuple[float, list[str]] | None = None
+
+
+def list_cursor_models(agent_bin: str = "agent", *, cache_seconds: int = 3600) -> list[str]:
+    """Return live Cursor model ids, with a bounded cache and curated fallback."""
+    global _MODEL_CACHE
+
+    now = time.monotonic()
+    if _MODEL_CACHE is not None and now - _MODEL_CACHE[0] < cache_seconds:
+        return list(_MODEL_CACHE[1])
+    try:
+        proc = subprocess.run(
+            [agent_bin, "--list-models"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=os.environ.copy(),
+            timeout=45,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return list(CURSOR_MODELS)
+    if proc.returncode != 0:
+        return list(CURSOR_MODELS)
+    models: list[str] = []
+    for line in proc.stdout.splitlines():
+        match = re.match(r"^([a-z0-9][a-z0-9._-]*)\s+-\s+", line.strip(), re.IGNORECASE)
+        if match:
+            models.append(match.group(1))
+    if not models:
+        return list(CURSOR_MODELS)
+    _MODEL_CACHE = (now, models)
+    return list(models)
 
 
 @dataclass(slots=True)

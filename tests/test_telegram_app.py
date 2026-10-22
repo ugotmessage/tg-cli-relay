@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
 from tg_cli_relay import telegram_app
 
 
@@ -59,3 +62,27 @@ def test_build_resilient_application_wires_requests(monkeypatch):
     transport = request.kwargs["httpx_kwargs"]["transport"]
     assert isinstance(transport, FakeTransport)
     assert transport.fallback_ips == ["149.154.167.220"]
+
+
+def test_run_bot_registers_message_handler_as_nonblocking(monkeypatch, tmp_path):
+    from telegram.ext import MessageHandler
+
+    from tg_cli_relay import telegram_bot
+
+    handlers = []
+    app = SimpleNamespace(
+        add_handler=lambda handler: handlers.append(handler),
+        run_polling=Mock(),
+    )
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TGR_SESSION_DB", str(tmp_path / "sessions.sqlite3"))
+
+    with patch.object(telegram_bot, "_acquire_bot_singleton"), patch.object(
+        telegram_bot, "build_resilient_application", return_value=app
+    ):
+        telegram_bot.run_bot()
+
+    message_handlers = [h for h in handlers if isinstance(h, MessageHandler)]
+    assert len(message_handlers) == 1
+    assert message_handlers[0].block is False
+    app.run_polling.assert_called_once()

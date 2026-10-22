@@ -7,6 +7,7 @@ from pathlib import Path
 
 from tg_cli_relay.relay import relay_turn
 from tg_cli_relay.session_store import SessionStore
+from tg_cli_relay.task_router import load_task_router_config
 
 
 def _load_dotenv() -> None:
@@ -70,6 +71,9 @@ def main(argv: list[str] | None = None) -> int:
         print("TGR_OPENCODE_BIN =", os.environ.get("TGR_OPENCODE_BIN", "opencode"))
         print("TELEGRAM_BOT_TOKEN =", "(已設定)" if os.environ.get("TELEGRAM_BOT_TOKEN") else "(未設定)")
         print("TGR_BACKEND =", os.environ.get("TGR_BACKEND", "cursor"))
+        router = load_task_router_config()
+        print("TGR_ROUTER_CONFIG =", os.environ.get("TGR_ROUTER_CONFIG", "(auto: router.toml, config/router.toml)"))
+        print("Task Router =", ("fallback" if router.fallback_used else "external"), router.source)
         return 0
 
     if args.cmd == "bot":
