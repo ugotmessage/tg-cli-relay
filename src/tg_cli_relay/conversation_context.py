@@ -30,6 +30,7 @@ class ConversationContext:
     @contextmanager
     def _conn(self):
         conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA busy_timeout = 5000")
         try:
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
