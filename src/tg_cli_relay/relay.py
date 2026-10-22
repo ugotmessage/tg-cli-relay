@@ -149,7 +149,7 @@ def _run_codex_cursor_worker(
             session_id=sid,
             prompt=_codex_cursor_worker_prompt(
                 ConversationContext(store.db_path).prompt(
-                    thread_key, prompt, include_history=fresh
+                    thread_key, prompt, include_history=fresh, consumer="cursor-worker"
                 )
             ),
         )
@@ -218,7 +218,9 @@ def relay_turn(
     ws = workspace or _default_workspace()
     st = store or SessionStore(_default_db_path())
     context = ConversationContext(st.db_path)
-    epoch = context.snapshot(thread_key)["epoch"]
+    state = context.snapshot(thread_key)
+    epoch = state["epoch"]
+    delivered_through = int(state.get("next_handoff_id", 0))
 
     if backend == "cursor":
         result = _relay_cursor(st, thread_key, ws, prompt)
@@ -231,6 +233,7 @@ def relay_turn(
     else:
         raise ValueError(f"未知後端: {backend}")
     if result.returncode == 0:
+        context.acknowledge(thread_key, epoch, backend, delivered_through)
         context.complete(thread_key, epoch, prompt, result.stdout)
     return result
 
@@ -259,7 +262,7 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
         else apply_cursor_harness_prefix(prompt)
     )
     effective_prompt = ConversationContext(store.db_path).prompt(
-        thread_key, effective_prompt, include_history=fresh
+        thread_key, effective_prompt, include_history=fresh, consumer="cursor"
     )
     return prov.run_turn(
         workspace=workspace,
@@ -288,7 +291,7 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
     raw = prov.run_turn(
         workspace=workspace, session_id=sid,
         prompt=ConversationContext(store.db_path).prompt(
-            thread_key, prompt, include_history=not sid
+            thread_key, prompt, include_history=not sid, consumer="opencode", consumer="claude"
         ),
     )
     display_text, new_sid = parse_claude_output(raw.stdout)
@@ -350,7 +353,7 @@ def _relay_codex(
     res = prov.run_turn(
         workspace=workspace, session_id=sid,
         prompt=ConversationContext(store.db_path).prompt(
-            thread_key, codex_prompt, include_history=not sid
+            thread_key, codex_prompt, include_history=not sid, consumer="codex"
         ),
         on_progress=on_progress,
     )
