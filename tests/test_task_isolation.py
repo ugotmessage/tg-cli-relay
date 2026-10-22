@@ -262,8 +262,10 @@ def test_handler_task_isolation_routing(monkeypatch, tmp_path: Path) -> None:
             await bot._on_message(_update(ambiguous, chat_a), SimpleNamespace())
             assert len(calls) == provider_before
             choice = ambiguous.sent[-1].text
-            assert a_id in choice and b_id in choice
-            assert "/task" in choice
+            # Explicit replies focus Task A, so an unqualified status query
+            # reports Task A rather than prompting across all historical tasks.
+            assert a_id in choice and b_id not in choice
+            assert "狀態:" in choice
 
             other_chat = FakeMessage(
                 text="follow stolen",
