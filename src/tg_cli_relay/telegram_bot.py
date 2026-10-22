@@ -495,6 +495,7 @@ async def _cmd_reset(update, context) -> None:  # type: ignore[no-untyped-def]
     store = _get_store()
     backend = _backend_for_thread(store, key)
     store.delete(key, backend)
+    TaskRegistry(store.db_path).clear_focus(key)
     ConversationContext(store.db_path).reset(key)
     await update.message.reply_text(f"對話已重置，下一則訊息將開啟新的 {backend} session。")
 
@@ -627,6 +628,23 @@ async def _cmd_task(update, context) -> None:  # type: ignore[no-untyped-def]
     if not args:
         await msg.reply_text(_format_task_list(registry.list_tasks(key)))
         return
+    if args[0].lower() == "clear":
+        registry.clear_focus(key)
+        await msg.reply_text("已清除目前任務焦點。")
+        return
+    if args[0].lower() == "active":
+        task = registry.focused_task(key)
+        await msg.reply_text(_task_status_text(task) if task else "目前沒有選定任務。")
+        return
+    if args[0].lower() == "use":
+        task_id = args[1] if len(args) > 1 else ""
+        if not task_id or not registry.focus_task(key, task_id):
+            await msg.reply_text("用法: /task use <本對話任務ID>")
+            return
+        task = registry.focused_task(key)
+        assert task is not None
+        await msg.reply_text(f"目前任務已切換至 [{task.task_id}] {task.title}。")
+        return
     if args[0].lower() == "new":
         prompt = " ".join(args[1:]).strip()
         if not prompt:
@@ -667,6 +685,7 @@ async def _cmd_task(update, context) -> None:  # type: ignore[no-untyped-def]
             f"任務 {task_id} [{task.title}] 不屬於這個對話／主題，無法在此繼續。"
         )
         return
+    registry.focus_task(key, task.task_id)
     if not prompt:
         job = _RUNNING_TASKS.get(task.task_id)
         await _reply_task_status(msg, task, registry, job)
@@ -1290,6 +1309,7 @@ async def _resume_existing_task(
     attachment_config: AttachmentConfig,
     registry: TaskRegistry,
 ) -> None:
+    registry.focus_task(task.parent_key, task.task_id)
     _bind_source_message(registry, task, msg)
     turn = QueuedTurn(
         msg=msg,
@@ -1479,6 +1499,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
             )
             return
         else:
+            registry.focus_task(key, bound.task_id)
             if _is_progress_query(prompt):
                 job = _RUNNING_TASKS.get(bound.task_id)
                 await _reply_task_status(msg, bound, registry, job)
