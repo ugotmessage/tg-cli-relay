@@ -96,6 +96,11 @@ keywords = ["ping"]
                     any(rule.id == "coding_implementation" for rule in decision.matched_rules)
                 )
 
+    def test_legacy_message_overrides_still_work(self) -> None:
+        cfg = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"}).config
+        self.assertEqual(route_text("!job 查個版本", cfg).route, Route.DELEGATE)
+        self.assertEqual(route_text("!direct 請實作登入頁", cfg).route, Route.DIRECT)
+
     def test_implementation_beats_incidental_status_on_score_tie(self) -> None:
         cfg = load_task_router_config(env={"TGR_ROUTER_CONFIG": "/missing/router.toml"}).config
         result = route_text("現在修 bug", cfg)
