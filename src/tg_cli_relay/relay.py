@@ -306,7 +306,9 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
     sid = store.get(thread_key, "opencode")
     raw = prov.run_turn(
         workspace=workspace, session_id=sid,
-        prompt=ConversationContext(store.db_path).prompt(thread_key, prompt),
+        prompt=ConversationContext(store.db_path).prompt(
+            thread_key, prompt, include_history=not sid
+        ),
     )
     display_text, new_sid = parse_opencode_output(raw.stdout)
     # 優先存真正的 session id；若 JSON 沒有則存 marker 讓下次加 -c
