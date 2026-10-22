@@ -124,7 +124,9 @@ def _run_codex_cursor_worker(
     if not _env_enabled("TGR_CODEX_DELEGATE_TO_CURSOR", default=True):
         return None
     decision = route_text(prompt, load_task_router_config().config)
-    if decision.route != Route.DELEGATE:
+    # Follow-ups to an isolated task remain execution work even when the
+    # short utterance itself lacks implementation keywords.
+    if decision.route != Route.DELEGATE and not _is_relay_worker_thread(thread_key):
         return None
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
@@ -135,15 +137,24 @@ def _run_codex_cursor_worker(
         timeout_seconds=int(timeout_raw),
     )
     try:
-        # Worker memory is explicit, never an independently drifting session.
-        sid = provider.create_session()
+        # One nested Cursor session per parent task: resume within the same
+        # task, never share that session with sibling tasks or chat topics.
+        worker_key = f"{thread_key}:codex-cursor-worker"
+        sid = store.get(worker_key, "cursor")
+        fresh = not sid
+        if sid is None:
+            sid = provider.create_session()
         result = provider.run_turn(
             workspace=workspace,
             session_id=sid,
             prompt=_codex_cursor_worker_prompt(
-                ConversationContext(store.db_path).prompt(thread_key, prompt)
+                ConversationContext(store.db_path).prompt(
+                    thread_key, prompt, include_history=fresh
+                )
             ),
         )
+        if result.returncode == 0:
+            store.upsert(worker_key, "cursor", sid, workspace=workspace)
     except Exception:
         return None
     return result if result.returncode == 0 else None
@@ -238,6 +249,7 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
     model = _get_model(store, thread_key, "cursor")
     prov = CursorAgentProvider(agent_bin=bin_name, model=model, timeout_seconds=timeout_seconds)
     sid = store.get(thread_key, "cursor")
+    fresh = not sid
     if not sid:
         sid = prov.create_session()
         store.upsert(thread_key, "cursor", sid, workspace=workspace)
@@ -246,7 +258,9 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
         if _is_relay_worker_thread(thread_key)
         else apply_cursor_harness_prefix(prompt)
     )
-    effective_prompt = ConversationContext(store.db_path).prompt(thread_key, effective_prompt)
+    effective_prompt = ConversationContext(store.db_path).prompt(
+        thread_key, effective_prompt, include_history=fresh
+    )
     return prov.run_turn(
         workspace=workspace,
         session_id=sid,
@@ -273,7 +287,9 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
     sid = store.get(thread_key, "claude")
     raw = prov.run_turn(
         workspace=workspace, session_id=sid,
-        prompt=ConversationContext(store.db_path).prompt(thread_key, prompt),
+        prompt=ConversationContext(store.db_path).prompt(
+            thread_key, prompt, include_history=not sid
+        ),
     )
     display_text, new_sid = parse_claude_output(raw.stdout)
     if new_sid and new_sid != sid:
@@ -331,7 +347,9 @@ def _relay_codex(
     )
     res = prov.run_turn(
         workspace=workspace, session_id=sid,
-        prompt=ConversationContext(store.db_path).prompt(thread_key, codex_prompt),
+        prompt=ConversationContext(store.db_path).prompt(
+            thread_key, codex_prompt, include_history=not sid
+        ),
         on_progress=on_progress,
     )
     if res.session_id and res.session_id != sid:
