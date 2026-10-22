@@ -615,6 +615,55 @@ async def _cmd_router(update, context) -> None:  # type: ignore[no-untyped-def]
     await update.message.reply_text(format_router_status())
 
 
+async def _cmd_jobs(update, context) -> None:  # type: ignore[no-untyped-def]
+    """Legacy alias: show new tasks plus prior JobStore jobs, if present."""
+    if not _check_auth(update):
+        return
+    key = _get_thread_key(update)
+    db = _get_store().db_path
+    lines = [_format_task_list(TaskRegistry(db).list_tasks(key))]
+    try:
+        from tg_cli_relay.job_store import JobStore
+        legacy = JobStore(db).list_for_thread(key, limit=5)
+        if legacy:
+            lines.append("舊版背景 Jobs：")
+            lines.extend(f"#{j.id} [{j.status}] {j.backend}" for j in legacy)
+    except ImportError:
+        pass
+    await update.message.reply_text("\n\n".join(lines))
+
+
+async def _cmd_job(update, context) -> None:  # type: ignore[no-untyped-def]
+    """Accept task IDs and retained numeric JobStore IDs."""
+    if not _check_auth(update):
+        return
+    args = list(context.args or [])
+    if not args:
+        await update.message.reply_text("用法: /job <id>（新版任務亦可用 /task <id>）")
+        return
+    key = _get_thread_key(update)
+    db = _get_store().db_path
+    task = TaskRegistry(db).get_task(args[0])
+    if task is not None and task.parent_key == key:
+        await _reply_task_status(update.message, task, TaskRegistry(db))
+        return
+    if args[0].isdigit():
+        try:
+            from tg_cli_relay.job_store import JobStore
+            job = JobStore(db).get(int(args[0]))
+        except ImportError:
+            job = None
+        if job is not None and job.thread_key == key:
+            body = f"Job #{job.id}\n狀態: {job.status}\nProvider: {job.backend}"
+            if job.result_preview:
+                body += "\n結果預覽: " + job.result_preview[:1200]
+            if job.error:
+                body += "\n錯誤: " + job.error
+            await update.message.reply_text(body)
+            return
+    await update.message.reply_text("找不到此對話的 Job。")
+
+
 async def _cmd_task(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
@@ -1665,6 +1714,8 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("model", _cmd_model))
     app.add_handler(CommandHandler("router", _cmd_router))
     app.add_handler(CommandHandler("task", _cmd_task))
+    app.add_handler(CommandHandler("jobs", _cmd_jobs))
+    app.add_handler(CommandHandler("job", _cmd_job))
     app.add_handler(CommandHandler("help", _cmd_help))
     content_filter = (
         filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VOICE | filters.VIDEO
