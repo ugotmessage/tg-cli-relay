@@ -142,6 +142,8 @@ cp env.example .env
 
 任務訊息綁定、追問與上下文交接見 [task-isolation.md](docs/task-isolation.md)。新任務會取得已完成主對話的有界快照；成功結果會提供給主對話後續回合參考，任務 session 仍各自隔離。
 
+**模糊追問辨識（預設啟用）**：若訊息沒有 Reply／Task ID，但內容疑似延續既有工作，Relay 只提供當前 Telegram 對話最多 8 個 Task 的 ID、標題、狀態，由目前選用的 Codex／Claude／Cursor／OpenCode 主 CLI 回傳嚴格的 `task / new / ask` 判斷；Relay 驗證同一 chat/topic 的 Task ID 才派送，無法確定就列出選項。明確新需求仍走原本 Router，一般閒聊不觸發辨識。這**不需要 MCP 或額外模型**，但模糊訊息可能增加一次主 CLI 的判斷回合（會消耗既有訂閱的使用量）。可設 `TGR_TASK_CONTEXT_RESOLVER=0` 關閉。詳見 [Task Context Resolver](docs/task-context-resolver.md)。
+
 Cursor relay 會在送入 `agent --print` 前，用 **rule-based** Task Router 產生前綴，標示本輪應走：
 
 - `DIRECT`：小型查詢、狀態檢查、單步操作，留在目前 Cursor session 直接處理。
