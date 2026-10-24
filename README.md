@@ -49,6 +49,8 @@ SQLite            ← sessions 表（thread_key → session_id）
 | 指令 | 後端 | 說明 |
 |------|------|------|
 | `/reset` `/new` | 全部 | 清除 session，下一則訊息開啟新對話 |
+| `/force <指令>` | 全部 | 執行中立即修正：Codex App Server 優先即時 steer；其他 CLI 中止原回合並優先續送修正指令 |
+| `/stop` | 全部 | 要求中止目前主對話執行，保留原本待處理訊息，不會自動重跑被中止的工作 |
 | `/status` | 全部 | 顯示目前 provider、工作目錄、session 狀態 |
 | `/provider` | 全部 | 列出可切換的 CLI provider |
 | `/provider <id>` | 全部 | 切換 provider（例如 `claude`、`codex`） |
@@ -75,6 +77,13 @@ SQLite            ← sessions 表（thread_key → session_id）
 - **舊的未綁定父對話回覆不會自動遷移或猜測任務**。請用 `/task new <說明>` 一次建立孤立任務，之後再回覆帶 `[task …]` 的訊息。
 
 ---
+
+## 即時修正與停止
+
+- `/force <修正內容>`：只有主對話正在執行時可用。若 Codex 使用 `TGR_CODEX_TRANSPORT=app-server`，Relay 優先將內容送入原本執行中的 Turn。Cursor、Claude、OpenCode、Codex CLI 不支援相同的即時輸入介面，因此改為**中止目前回合**並將修正內容插在主對話 FIFO 佇列最前方，以原 Session 接續；未完成的操作及檔案不會自動回復。
+- `/stop`：要求停止目前的**主對話執行**，不清空後面的佇列，也不重新執行已停止的工作。獨立於 Relay 的 Agent 自行管理的背景 Worker 不在控制範圍內。
+- 此功能不替 Agent 判斷派工方式，也不替代未來的超時恢復機制。注意這裡的 CLI 停止是依程序／Codex App Server 中斷請求，Provider 自己啟動且完全脫離控制的背景進程可能繼續運作。
+- 每次 Telegram Bot 正常啟動時，會透過 `set_my_commands` **重新註冊完整的指令選單**；若 Telegram API 當下不可用，會記錄錯誤，但不阻止 Bot 提供訊息服務。
 
 ## 安裝
 
