@@ -381,8 +381,8 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
     )
     display_text, new_sid = parse_opencode_output(raw.stdout)
     # 優先存真正的 session id；若 JSON 沒有則存 marker 讓下次加 -c
-    stored_sid = new_sid or "active"
-    if stored_sid != sid:
+    stored_sid = new_sid or (sid if raw.returncode != 0 else "active")
+    if stored_sid and stored_sid != sid:
         store.upsert(thread_key, "opencode", stored_sid, workspace=workspace)
     return RunResult(stdout=display_text, stderr=raw.stderr, returncode=raw.returncode)
 
