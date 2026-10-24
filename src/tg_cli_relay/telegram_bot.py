@@ -26,6 +26,7 @@ from tg_cli_relay.attachments import (
     resolve_outbound_files,
 )
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
+from tg_cli_relay.providers.codex_app_server import steer_codex_turn
 from tg_cli_relay.conversation_context import ConversationContext
 from tg_cli_relay.session_store import Backend, SessionStore
 from tg_cli_relay.task_registry import TaskRecord, TaskRegistry, make_task_title
@@ -1572,6 +1573,30 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
             # background tasks exist or a different task has current focus.
             parent_backend = registry.get_parent_message_backend(key, reply_id)
             if parent_backend is not None:
+                if (
+                    parent_backend == "codex"
+                    and key in _ACTIVE_RELAY_THREADS
+                    and os.environ.get("TGR_CODEX_TRANSPORT", "cli").lower() == "app-server"
+                    and os.environ.get("TGR_CODEX_APP_STEER", "1").lower()
+                    not in ("0", "false", "no", "off")
+                ):
+                    # Explicit Reply to the main Codex session is an instruction
+                    # to that running turn, not a new task. If steer races with
+                    # completion or is unsupported, use the existing FIFO queue.
+                    steered = await asyncio.to_thread(
+                        steer_codex_turn, key, prompt,
+                        os.environ.get("TGR_CODEX_BIN", "codex"),
+                    )
+                    if steered:
+                        registry.bind_parent_message(
+                            parent_key=key, message_id=msg.message_id,
+                            backend="codex",
+                        )
+                        await _reply_text_with_retry(
+                            msg, "已追加到目前執行中的 Codex 工作。",
+                            registry=registry, parent_key=key, parent_backend="codex",
+                        )
+                        return
                 turn = QueuedTurn(
                     msg=msg, key=key, backend=parent_backend,
                     prompt=prompt, store_path=store_path,
