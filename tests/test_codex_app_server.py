@@ -133,7 +133,7 @@ def test_codex_app_server_opt_in_and_native_delegation(tmp_path: Path, monkeypat
     assert result.stdout == "完成"
     app.return_value.run_turn.assert_called_once()
     assert app.return_value.run_turn.call_args.kwargs["session_id"] == "existing-thread"
-    assert "native agent tools" in app.return_value.run_turn.call_args.kwargs["prompt"]
+    assert app.return_value.run_turn.call_args.kwargs["prompt"] == "請批次修復補檔並跑測試"
     cli.assert_not_called()
     cursor.assert_not_called()
 
@@ -197,10 +197,12 @@ def test_telegram_reply_steers_or_queues_if_active(tmp_path, monkeypatch, steere
     async def run():
         _reset(bot)
         bot._ACTIVE_RELAY_THREADS.add("private:101")
+        bot._ACTIVE_PARENT_BACKENDS["private:101"] = "codex"
         try:
             with patch.object(bot, "steer_codex_turn", return_value=steered) as steer:
                 await bot._on_message(_update(msg, 101), SimpleNamespace())
                 steer.assert_called_once()
+                assert "telegram_message_id" in steer.call_args.args[1]
                 assert reg.get_parent_message_backend("private:101", 12) == (
                     "codex" if steered else None
                 )
@@ -212,6 +214,7 @@ def test_telegram_reply_steers_or_queues_if_active(tmp_path, monkeypatch, steere
                     assert "已加入等待佇列" in msg.sent[-1].text
         finally:
             _reset(bot)
+            bot._ACTIVE_PARENT_BACKENDS.clear()
 
     asyncio.run(run())
 
