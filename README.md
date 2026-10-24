@@ -81,8 +81,28 @@ SQLite            ← sessions 表（thread_key → session_id）
 - **正常主對話超時**：保留原始 Telegram 訊息 ID 和有界原文（最多 12,000 字元），在主對話等待佇列最前面插入一次系統恢復提示。由原本的主 Agent 根據自己的知識庫、既有 Session 與工作目錄檢查進度，決定接續或派工。Relay 不指定 Cursor 或其他 Worker。
 - **恢復指令再次超時**：停止自動恢復這筆工作，下一則等待中的訊息照常送進主 CLI；避免無限重試。使用者手動 `/stop` 或 `/force` 的中斷不會觸發自動恢復。
 - **顯式 Task**：`/task new` 產生的獨立 Task 若超時會回報失敗，不會再由 Relay 自動分派新的工作。
-- **佇列保護**：顯式背景 Task 等待同時另一個 Task 結束時，不阻擋後面的普通主對話。Telegram Bot 重啟時也不會丟棄 Telegram 伺服器上尚未取回的更新；但**已經取回、保存在 Relay 記憶體中的等待佇列，若程序突然中斷仍不會自動還原**。
+- **佇列保護**：顯式背景 Task 等待同時另一個 Task 結束時，不阻擋後面的普通主對話。等待佇列會先寫入同一份 SQLite Session DB 再 ACK。Telegram Bot 重啟時也不會丟棄伺服器尚未取回的更新。重啟時僅自動補送 **尚未開始執行** 的 `queued` 訊息；若偵測到上一輪已在執行卻無法確認結果，會暫停該 chat/topic 的佇列，以免重複修改程式、資料庫或重複交易。
 - **Session 注意事項**：Codex App Server、既有 Cursor Session 等可接續先前歷史；Claude／OpenCode 首輪若還沒輸出 Session ID 就遭到中斷，原生 Session 恢復不一定可行。Relay 的恢復提示仍會提供原始工作與可用的上下文，但不是保證原生 Session 100% 完整還原。
+
+## 持久化等待佇列（SQLite）
+
+Telegram 的主對話不會驗證 Agent 是否真的將工作派出去：它只會在**超時恢復指令本身的 CLI 回合正常結束／逾時結束**後，再執行下一則等待訊息。Agent 是否派 Cursor 或其他 Worker 仍由 Agent 知識庫決定，Relay 不監督派工成敗。
+
+Relay 將原始 Telegram message ID、chat/topic、Provider、佇列類型、已解析的 Prompt、Task ID 和執行狀態保存在既有 `TGR_SESSION_DB` 下的 `relay_pending_turns` 資料表：
+
+| SQLite 狀態 | 意義 | 服務重啟後 |
+|---|---|---|
+| `queued` | 已收到、尚未開始跑 | 若同對話沒有不明執行，就依 FIFO／恢復優先順序**自動續送** |
+| `running` | CLI 已開始執行 | 重啟時改為 `needs_review`，**絕不自動重跑** |
+| `needs_review` | 先前程序中斷，結果不明 | 暫停同一 chat/topic 其餘等待訊息，供人工查詢 |
+| `done` / `cancelled` / `reviewed` | 已處理、取消或人工確認 | 不自動續送 |
+
+- `/queue`：顯示這個 Telegram chat/topic 的等待與結果不明項目。
+- `/queue resume`：使用者自行確認已檢查中斷工作後，將 `needs_review` 標為已確認，**不重跑**它們，只恢復後續 `queued` 訊息。恢復本身仍會尊重主對話與 Task Session 的執行序。
+- 如果上一輪是「超時後的自動恢復指令」，則等其 CLI 回合結束才會釋放後續 FIFO；CLI 回傳成功**不代表 Relay 已證實 Worker 成功啟動或完成**。
+- Telegram Bot 啟動時才檢查舊的 `running` 轉為結果不明；服務正常運作時的訊息不需要 `/queue resume`。
+- 不提供跨程序的 exactly-once 保證：Crash 發生於 Telegram 收到更新但 SQLite 尚未完成寫入等非常小的時間窗，仍可能需要由 Telegram 重新推送，或由使用者確認。
+- **安全性**：SQLite 會保存排隊的訊息文字與 Prompt，請限制資料庫檔案／備份的存取權限；已下載的附件檔案若過期或遺失，恢復前需人工確認。
 
 ## 即時修正與停止
 
@@ -151,7 +171,7 @@ cp env.example .env
 - **Reply 至主對話訊息**：使用 Telegram 的 `reply_to_message` 內文提供有界引用文字（最長 4,000 字元）、原訊息 ID 與這次使用者要求。被引用的內容只作參考，不是另一條指令。沒有內文時標示為未知；不會因此進入其他 Task。
 - **Reply 至 Relay Task 訊息**：依已記錄的 Telegram message→Task 綁定，直接轉給對應 Task Session（限定同一 chat/topic）。
 - **明確 `/task new`**：使用者自行建立獨立 Task；CLI 的原生 Worker／Cursor 派工仍由它自己的知識庫與規則管理，Relay 不介入。
-- **等待佇列**：忙碌期間的普通訊息按順序處理（記憶體 FIFO，預設最多 20 則）；重啟不會自動恢復尚未執行的記憶體佇列。所有 Relay 管理的回合預設 10 分鐘超時。主對話超時時，Relay 會優先插入**一輪**同 Session 的恢復指令，再繼續普通訊息 FIFO；恢復指令再超時不會無限重試。
+- **等待佇列**：忙碌期間的普通訊息按順序處理（SQLite 持久化＋持久 FIFO，預設最多 20 則）；重啟會載入尚未啟動的訊息，遇到結果不明的工作則暫停，等待明確 `/queue resume`。所有 Relay 管理的回合預設 10 分鐘超時。主對話超時時，Relay 會優先插入**一輪**同 Session 的恢復指令，再繼續普通訊息 FIFO；恢復指令再超時不會無限重試。
 
 舊的 `task_router.py`、`worker_selector.py` 及其設定是遷移相容的歷史程式碼，不再參與 Telegram 普通訊息的預設執行路徑。
 
