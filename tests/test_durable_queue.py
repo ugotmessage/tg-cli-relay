@@ -119,6 +119,10 @@ def test_uncertain_turn_pauses_backlog_until_queue_resume(monkeypatch, tmp_path)
 
     asyncio.run(scenario())
     assert calls == ["等待中的下一則訊息"]
+    assert any(
+        "狀態不明" in c.kwargs.get("text", "")
+        for c in bot_api.send_message.await_args_list
+    )
     assert DurableQueue(db).review_threads() == set()
     assert DurableQueue(db).open_items("private:7") == []
 
@@ -145,3 +149,61 @@ def test_duplicate_telegram_update_does_not_reexecute(monkeypatch, tmp_path):
 
     asyncio.run(scenario())
     assert calls == ["請不要重複執行"]
+
+
+def test_cancelled_inflight_turn_is_never_marked_done(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    started = asyncio.Event()
+
+    async def never_finishes(**kw):
+        started.set()
+        await asyncio.Future()
+
+    async def scenario():
+        _reset(bot)
+        bot._REVIEW_REQUIRED_THREADS.clear()
+        try:
+            msg = FakeMessage(text="可能有副作用的操作", chat_id=7, message_id=900)
+            turn = bot.QueuedTurn(
+                msg=msg, key="private:7", backend="codex", prompt=msg.text,
+                store_path=tmp_path / "sessions.sqlite3",
+                attachment_config=bot._attachment_config(), route=bot.Route.DIRECT,
+            )
+            with patch.object(bot, "_execute_relay_turn", side_effect=never_finishes):
+                running = asyncio.create_task(bot._run_direct_turn(turn))
+                await started.wait()
+                running.cancel()
+                try:
+                    await running
+                except asyncio.CancelledError:
+                    pass
+                else:
+                    raise AssertionError("cancelled task did not propagate")
+            pending = DurableQueue(tmp_path / "sessions.sqlite3").open_items("private:7")
+            assert len(pending) == 1
+            assert pending[0].status == "needs_review"
+            assert "private:7" in bot._REVIEW_REQUIRED_THREADS
+        finally:
+            _reset(bot)
+            bot._REVIEW_REQUIRED_THREADS.clear()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_history_can_be_pruned_without_dropping_waiting_turns(tmp_path):
+    db = tmp_path / "sessions.sqlite3"
+    store = DurableQueue(db)
+    done = _add(db, mid=77)
+    waiting = _add(db, mid=78)
+    store.start(done)
+    store.finish(done)
+    import sqlite3
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE relay_pending_turns SET updated_at=datetime('now','-45 days') WHERE id=?",
+            (done,),
+        )
+    assert store.prune_terminal(retention_days=30) == 1
+    assert [r.id for r in store.load_queued()] == [waiting]
