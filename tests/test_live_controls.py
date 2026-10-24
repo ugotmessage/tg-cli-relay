@@ -31,6 +31,7 @@ def test_force_interrupts_and_prioritizes_same_main_session(monkeypatch, tmp_pat
         _reset(bot)
         bot._ACTIVE_PARENT_BACKENDS["private:38"] = backend
         bot._ACTIVE_RELAY_THREADS.add("private:38")
+        bot._ACTIVE_PARENT_REQUESTS["private:38"] = "原本的長任務，請修正 A 系統"
         waiting = bot.QueuedTurn(
             msg=original, key="private:38", backend=backend,
             prompt=original.text, store_path=tmp_path / "sessions.sqlite3",
@@ -45,7 +46,9 @@ def test_force_interrupts_and_prioritizes_same_main_session(monkeypatch, tmp_pat
                 stop.assert_awaited_once_with("private:38", backend)
                 queue = bot._PENDING_TURNS["private:38"]
                 assert len(queue) == 2
-                assert queue[0].prompt == "請停止修改 A，改成 B"
+                assert "原本的長任務" in queue[0].prompt
+                assert "請停止修改 A，改成 B" in queue[0].prompt
+                assert "context ONLY" in queue[0].prompt
                 assert queue[0].backend == backend
                 assert queue[0].kind == "parent"
                 assert queue[1] is waiting
@@ -54,6 +57,7 @@ def test_force_interrupts_and_prioritizes_same_main_session(monkeypatch, tmp_pat
         finally:
             _reset(bot)
             bot._ACTIVE_PARENT_BACKENDS.clear()
+            bot._ACTIVE_PARENT_REQUESTS.clear()
     asyncio.run(run())
 
 
@@ -81,6 +85,7 @@ def test_native_codex_steer_keeps_running_turn(monkeypatch, tmp_path: Path):
         finally:
             _reset(bot)
             bot._ACTIVE_PARENT_BACKENDS.clear()
+            bot._ACTIVE_PARENT_REQUESTS.clear()
     asyncio.run(run())
 
 
@@ -104,6 +109,7 @@ def test_stop_does_not_enqueue_or_auto_retry(monkeypatch, tmp_path: Path):
         finally:
             _reset(bot)
             bot._ACTIVE_PARENT_BACKENDS.clear()
+            bot._ACTIVE_PARENT_REQUESTS.clear()
     asyncio.run(run())
 
 
