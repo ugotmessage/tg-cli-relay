@@ -78,6 +78,7 @@ class CursorAgentProvider:
             text=True,
             check=False,
             env=os.environ.copy(),
+            timeout=self.timeout_seconds if self.timeout_seconds > 0 else None,
         )
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "create-chat failed")
@@ -114,10 +115,15 @@ class CursorAgentProvider:
                 env=os.environ.copy(), timeout=timeout,
             ))
         except subprocess.TimeoutExpired as exc:
-            err = (exc.stderr or "").strip()
+            err = exc.stderr or ""
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", "replace")
+            output = exc.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", "replace")
             msg = f"agent 執行逾時（>{self.timeout_seconds} 秒）"
             return RunResult(
-                stdout=exc.stdout or "",
+                stdout=output,
                 stderr=f"{err}\n{msg}".strip() if err else msg,
                 returncode=124,
             )
