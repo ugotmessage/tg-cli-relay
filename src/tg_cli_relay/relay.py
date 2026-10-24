@@ -426,6 +426,7 @@ def _relay_codex(
             thread_key, codex_prompt, include_history=not sid, consumer="codex"
         ),
         on_progress=on_progress,
+        **({"thread_key": thread_key} if transport == "app-server" else {}),
     )
     if res.session_id and res.session_id != sid:
         store.upsert(thread_key, "codex", res.session_id, workspace=workspace)
