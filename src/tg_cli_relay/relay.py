@@ -259,6 +259,20 @@ def _get_model(store: SessionStore, thread_key: str, backend: Backend) -> str | 
     return store.get_pref(thread_key, _model_pref_key(backend))
 
 
+def _relay_turn_timeout_seconds() -> float:
+    """All Relay-owned turns share one bounded duration, regardless of provider.
+
+    External workers launched by the Agent itself are outside the Relay runtime.
+    0 explicitly disables this limit for local troubleshooting.
+    """
+    import os
+
+    value = float(os.environ.get("TGR_TURN_TIMEOUT", "600"))
+    if value < 0:
+        raise ValueError("TGR_TURN_TIMEOUT must be >= 0")
+    return value
+
+
 def relay_turn(
     *,
     thread_key: str,
@@ -298,18 +312,35 @@ def _relay_cursor(
     *, routing_only: bool = False,
 ) -> RunResult:
     import os
+    import subprocess
+    import time
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
     # Relay never classifies work as DIRECT/DELEGATE. The Agent owns delegation.
-    timeout_raw = os.environ.get("TGR_CURSOR_TIMEOUT", "600").strip() or "600"
-    timeout_seconds = int(timeout_raw)
+    timeout_seconds = _relay_turn_timeout_seconds()
     model = _get_model(store, thread_key, "cursor")
     prov = CursorAgentProvider(agent_bin=bin_name, model=model, timeout_seconds=timeout_seconds)
     sid = store.get(thread_key, "cursor")
     fresh = not sid
     if not sid:
-        sid = prov.create_session()
+        started = time.monotonic()
+        try:
+            sid = prov.create_session(thread_key=thread_key)
+        except subprocess.TimeoutExpired:
+            return RunResult(
+                stdout="", stderr="Cursor session initialization exceeded timeout",
+                returncode=124,
+            )
         store.upsert(thread_key, "cursor", sid, workspace=workspace)
+        # Starting a fresh Cursor session counts toward the same turn limit.
+        if timeout_seconds > 0:
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                return RunResult(
+                    stdout="", stderr="Cursor session initialization exceeded timeout",
+                    returncode=124,
+                )
+            prov.timeout_seconds = remaining
     effective_prompt = ConversationContext(store.db_path).prompt(
         thread_key, prompt, include_history=fresh, consumer="cursor"
     )
@@ -326,8 +357,7 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
 
     bin_name = os.environ.get("TGR_CLAUDE_BIN", "claude").strip() or "claude"
     skip_perms = os.environ.get("TGR_CLAUDE_SKIP_PERMISSIONS", "").strip().lower() in ("1", "true", "yes")
-    timeout_raw = os.environ.get("TGR_CLAUDE_TIMEOUT", "1800").strip() or "1800"
-    timeout_seconds = int(timeout_raw)
+    timeout_seconds = _relay_turn_timeout_seconds()
     run_as = os.environ.get("TGR_CLAUDE_RUN_AS", "").strip() or None
     model = _get_model(store, thread_key, "claude")
     prov = ClaudeCliProvider(
@@ -356,7 +386,9 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
 
     bin_name = os.environ.get("TGR_OPENCODE_BIN", "opencode").strip() or "opencode"
     model = _get_model(store, thread_key, "opencode")
-    prov = OpencodeCliProvider(opencode_bin=bin_name, model=model)
+    prov = OpencodeCliProvider(
+        opencode_bin=bin_name, model=model, timeout_seconds=_relay_turn_timeout_seconds(),
+    )
     sid = store.get(thread_key, "opencode")
     raw = prov.run_turn(
         workspace=workspace, session_id=sid,
@@ -367,8 +399,8 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
     )
     display_text, new_sid = parse_opencode_output(raw.stdout)
     # 優先存真正的 session id；若 JSON 沒有則存 marker 讓下次加 -c
-    stored_sid = new_sid or "active"
-    if stored_sid != sid:
+    stored_sid = new_sid or (sid if raw.returncode != 0 else "active")
+    if stored_sid and stored_sid != sid:
         store.upsert(thread_key, "opencode", stored_sid, workspace=workspace)
     return RunResult(stdout=display_text, stderr=raw.stderr, returncode=raw.returncode)
 
@@ -396,11 +428,13 @@ def _relay_codex(
         prov = CodexCliProvider(
             codex_bin=bin_name, dangerously_bypass_approvals_and_sandbox=bypass,
             model=model,
+            timeout_seconds=_relay_turn_timeout_seconds(),
         )
     elif transport == "app-server":
         prov = CodexAppServerProvider(
             codex_bin=bin_name, dangerously_bypass_approvals_and_sandbox=bypass,
             model=model,
+            timeout_seconds=_relay_turn_timeout_seconds(),
         )
     else:
         raise ValueError("TGR_CODEX_TRANSPORT must be cli or app-server")

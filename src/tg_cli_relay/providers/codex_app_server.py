@@ -179,10 +179,12 @@ class CodexAppServerProvider:
     def __init__(
         self, codex_bin: str = "codex", model: str | None = None,
         dangerously_bypass_approvals_and_sandbox: bool = False,
+        timeout_seconds: float | None = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.model = model
         self.bypass = dangerously_bypass_approvals_and_sandbox
+        self.timeout_seconds = timeout_seconds
 
     def run_turn(
         self, *, workspace: str, session_id: str | None, prompt: str,
@@ -190,7 +192,8 @@ class CodexAppServerProvider:
         thread_key: str | None = None,
         on_session: Callable[[str], None] | None = None,
     ) -> RunResult:
-        timeout = float(os.environ.get("TGR_CODEX_APP_TURN_TIMEOUT", "7200"))
+        timeout = (float(os.environ.get("TGR_CODEX_APP_TURN_TIMEOUT", "7200"))
+                   if self.timeout_seconds is None else self.timeout_seconds)
         runtime = _runtime_for(self.codex_bin)
         return runtime.run(
             _run_turn(
@@ -235,6 +238,7 @@ async def _run_turn(
     messages: list[str] = []
     pending: str | None = None
     error: str | None = None
+    timed_out = False
     try:
         args = {
             "threadId": thread_id, "cwd": workspace,
@@ -291,6 +295,7 @@ async def _run_turn(
             try:
                 await asyncio.wait_for(receive(), timeout)
             except asyncio.TimeoutError:
+                timed_out = True
                 error = f"Codex App Server turn exceeded {timeout:g} seconds"
                 try:
                     await client.request(
@@ -316,7 +321,7 @@ async def _run_turn(
         messages.append(pending)
     text = "\n".join(messages)
     return RunResult(
-        stdout=text, stderr=error or "", returncode=1 if error else 0,
+        stdout=text, stderr=error or "", returncode=124 if timed_out else (1 if error else 0),
         session_id=thread_id, stdout_segments=messages if len(messages) > 1 else None,
     )
 

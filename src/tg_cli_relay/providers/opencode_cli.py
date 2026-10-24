@@ -32,6 +32,7 @@ class OpencodeCliProvider:
 
     opencode_bin: str = "opencode"
     model: str | None = None
+    timeout_seconds: float = 600
     name: str = "opencode"
 
     def run_turn(
@@ -48,12 +49,26 @@ class OpencodeCliProvider:
         if session_id:
             cmd.append("-c")  # 有過 session 就接續（最後一個）
         cmd.append(prompt)
-        proc = (interruptible_run(
-            cmd, thread_key=thread_key, cwd=workspace, env=os.environ.copy(),
-        ) if thread_key is not None else subprocess.run(
-            cmd, capture_output=True, text=True, check=False,
-            cwd=workspace, env=os.environ.copy(),
-        ))
+        timeout = self.timeout_seconds if self.timeout_seconds > 0 else None
+        try:
+            proc = (interruptible_run(
+                cmd, thread_key=thread_key, cwd=workspace, env=os.environ.copy(),
+                timeout=timeout,
+            ) if thread_key is not None else subprocess.run(
+                cmd, capture_output=True, text=True, check=False,
+                cwd=workspace, env=os.environ.copy(), timeout=timeout,
+            ))
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8", "replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", "replace")
+            return RunResult(
+                stdout=stdout, stderr=(stderr + "\nOpenCode turn exceeded timeout").strip(),
+                returncode=124,
+            )
         return RunResult(stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode)
 
 

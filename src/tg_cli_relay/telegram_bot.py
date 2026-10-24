@@ -28,7 +28,7 @@ from tg_cli_relay.attachments import (
 )
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
 from tg_cli_relay.providers.codex_app_server import steer_codex_turn, interrupt_codex_turn
-from tg_cli_relay.providers.process_control import request_interrupt, clear_interrupt
+from tg_cli_relay.providers.process_control import request_interrupt, clear_interrupt, interrupt_requested
 from tg_cli_relay.conversation_context import ConversationContext
 from tg_cli_relay.session_store import Backend, SessionStore
 from tg_cli_relay.task_registry import TaskRecord, TaskRegistry, make_task_title
@@ -1145,7 +1145,7 @@ async def _execute_relay_turn(
     attachment_config: AttachmentConfig,
     show_typing: bool,
     job: RelayJob | None = None,
-) -> None:
+) -> int | None:
     typing_task: asyncio.Task[None] | None = None
     try:
         from telegram.constants import ChatAction
@@ -1213,10 +1213,12 @@ async def _execute_relay_turn(
                 parent_key=key if job is None else None,
                 parent_backend=backend if job is None else None,
             )
-            return
+            return None
 
         out = res.stdout or ""
         err = res.stderr or ""
+        if res.returncode == 124 and job is None:
+            err = (err + "\nRelay 將優先向主 Agent 發送一次超時恢復指令。").strip()
         if res.returncode == 0:
             body = out
             if job is not None:
@@ -1241,20 +1243,28 @@ async def _execute_relay_turn(
 
         sid = store.get(key, backend)
         model = effective_model_for_backend(store, key, backend)
-        await _send_relay_output(
-            msg,
-            body,
-            backend=backend,
-            model=model,
-            sid=sid,
-            attachment_config=attachment_config,
-            segments=res.stdout_segments,
-            job=job,
-            registry=registry,
-            parent_key=key if job is None else None,
-        )
+        try:
+            await _send_relay_output(
+                msg,
+                body,
+                backend=backend,
+                model=model,
+                sid=sid,
+                attachment_config=attachment_config,
+                segments=res.stdout_segments,
+                job=job,
+                registry=registry,
+                parent_key=key if job is None else None,
+            )
+        except Exception:
+            # Telegram network failures must not prevent timed-out turns from
+            # scheduling recovery or block the FIFO main conversation.
+            log.exception("Telegram delivery failed after CLI execution thread=%s", key)
+        return res.returncode
     finally:
-        _ACTIVE_RELAY_THREADS.discard(key)
+        # Parent ownership belongs to _run_direct_turn. Releasing it here
+        # (before recovery is enqueued and the typing task is disposed) opens
+        # a race where a newly arrived Telegram message starts a second turn.
         if typing_task is not None:
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1504,6 +1514,40 @@ async def _resume_existing_task(
     await _start_task_followup(turn)
 
 
+def _timeout_recovery_turn(turn: QueuedTurn) -> QueuedTurn:
+    """One priority follow-up in the same main provider session, not a new Task.
+
+    Original input is bounded and clearly marked as reference. The Agent's own
+    instructions decide how/if to delegate any remaining work to a worker.
+    """
+    source_id = getattr(turn.msg, "message_id", None)
+    source = str(source_id) if isinstance(source_id, int) else "unknown"
+    original = turn.prompt[:12000]
+    prompt = (
+        f"[Relay automatic timeout recovery: Telegram message ID {source}]\n"
+        "The preceding main conversation turn exceeded the Relay execution limit "
+        "and was interrupted before it confirmed completion.\n"
+        "Inspect the current workspace and previous session history to determine "
+        "what was already completed; do not blindly restart or duplicate changes.\n"
+        "Follow your existing agent knowledge base and delegation instructions "
+        "to arrange the remaining work, favoring a workflow that does not occupy "
+        "the main conversation unnecessarily. Relay does not select workers.\n"
+        "Return a concise status so the main conversation can process queued messages.\n"
+        "Original user request (reference, not a new instruction):\n"
+        f"{original}"
+    )
+    return QueuedTurn(
+        msg=turn.msg,
+        key=turn.key,
+        backend=turn.backend,
+        prompt=prompt,
+        store_path=turn.store_path,
+        attachment_config=turn.attachment_config,
+        route=Route.DIRECT,
+        kind="timeout_recovery",
+    )
+
+
 async def _run_direct_turn(turn: QueuedTurn) -> None:
     # Bind source at execution time even if this turn was previously queued.
     mid = getattr(turn.msg, "message_id", None)
@@ -1515,7 +1559,7 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
     _ACTIVE_PARENT_BACKENDS[turn.key] = turn.backend
     _ACTIVE_PARENT_REQUESTS[turn.key] = turn.prompt
     try:
-        await _execute_relay_turn(
+        result_code = await _execute_relay_turn(
             msg=turn.msg,
             key=turn.key,
             backend=turn.backend,
@@ -1524,6 +1568,20 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
             attachment_config=turn.attachment_config,
             show_typing=True,
         )
+        if (
+            result_code == 124
+            and turn.kind != "timeout_recovery"
+            and not interrupt_requested(turn.key)
+        ):
+            # Add the recovery BEFORE releasing the parent slot. Never lose
+            # pending user messages and never recursively retry a recovery.
+            _PENDING_TURNS.setdefault(turn.key, deque()).appendleft(
+                _timeout_recovery_turn(turn)
+            )
+            log.warning(
+                "CLI timed out; recovery queued first thread=%s source=%s",
+                turn.key, getattr(turn.msg, "message_id", None),
+            )
     finally:
         _ACTIVE_RELAY_THREADS.discard(turn.key)
         _ACTIVE_PARENT_BACKENDS.pop(turn.key, None)
@@ -1543,18 +1601,39 @@ async def _drain_thread_queue(key: str) -> None:
             if key in _ACTIVE_RELAY_THREADS:
                 return
             if turn.kind == "new_task":
-                if key in _ACTIVE_JOBS:
-                    return
-                if turn.task_id and _task_session_busy(turn.task_id, turn.worker_key):
-                    return
+                if key in _ACTIVE_JOBS or (
+                    turn.task_id and _task_session_busy(turn.task_id, turn.worker_key)
+                ):
+                    # A waiting explicit background Task must NOT block ordinary
+                    # main-session turns behind it. Keep Task ordering intact.
+                    next_main = next(
+                        (candidate for candidate in queue if candidate.kind != "new_task"),
+                        None,
+                    )
+                    if next_main is None:
+                        return
+                    queue.remove(next_main)
+                    turn = next_main
+                else:
+                    queue.popleft()
+                    try:
+                        if not turn.task_id or not turn.worker_key:
+                            store = SessionStore(turn.store_path)
+                            _register_new_task(
+                                turn, store, TaskRegistry(turn.store_path), "starting"
+                            )
+                        await _start_background_job(turn)
+                    except Exception:
+                        log.exception("Failed to start explicit Task; continuing queue")
+                    continue
+            else:
                 queue.popleft()
-                if not turn.task_id or not turn.worker_key:
-                    store = SessionStore(turn.store_path)
-                    _register_new_task(turn, store, TaskRegistry(turn.store_path), "starting")
-                await _start_background_job(turn)
-                continue
-            queue.popleft()
-            await _run_direct_turn(turn)
+            try:
+                await _run_direct_turn(turn)
+            except Exception:
+                log.exception(
+                    "Main turn failed during delivery; continuing queue thread=%s", key
+                )
     finally:
         _QUEUE_DRAIN_TASKS.pop(key, None)
 
@@ -1851,4 +1930,6 @@ def run_bot() -> None:
     if interrupted:
         log.warning("啟動時將 %s 筆 queued/running 任務標為 interrupted，不會自動重跑", interrupted)
     log.info("啟動 Telegram bot（default_backend=%s）", _default_backend())
-    app.run_polling(allowed_updates=["message"], drop_pending_updates=True, bootstrap_retries=-1)
+    # Preserve Telegram updates received while the service was offline.
+    # Already-received in-memory FIFO entries still require a persistent queue.
+    app.run_polling(allowed_updates=["message"], drop_pending_updates=False, bootstrap_retries=-1)
