@@ -26,6 +26,7 @@ from tg_cli_relay.attachments import (
     resolve_outbound_files,
 )
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
+from tg_cli_relay.task_context_resolver import might_refer_to_task, parse_resolution, resolution_prompt
 from tg_cli_relay.providers.codex_app_server import steer_codex_turn
 from tg_cli_relay.conversation_context import ConversationContext
 from tg_cli_relay.session_store import Backend, SessionStore
@@ -1419,7 +1420,95 @@ async def _resume_existing_task(
     await _start_task_followup(turn)
 
 
+def _task_context_enabled() -> bool:
+    return os.environ.get("TGR_TASK_CONTEXT_RESOLVER", "1").strip().lower() not in (
+        "0", "false", "off", "no"
+    )
+
+
+async def _run_context_resolution(turn: QueuedTurn) -> None:
+    """Ask the same primary CLI for a routing decision; Relay alone dispatches it."""
+    _ACTIVE_RELAY_THREADS.add(turn.key)
+    registry = TaskRegistry(turn.store_path)
+    try:
+        tasks = registry.list_tasks(turn.key, limit=8)
+        if not tasks:
+            # Jobs may have been deleted while queued; do not guess a target.
+            decision = None
+        else:
+            try:
+                result = await asyncio.to_thread(
+                    relay_turn,
+                    thread_key=turn.key, backend=turn.backend,
+                    prompt=resolution_prompt(turn.prompt, tasks),
+                    store=SessionStore(turn.store_path),
+                    routing_only=True,
+                )
+                decision = parse_resolution(result.stdout, tasks) if result.returncode == 0 else None
+            except Exception as exc:
+                log.warning("Primary CLI task routing failed, require explicit choice: %s", exc)
+                decision = None
+
+        if decision is not None and decision.action == "task" and decision.task_id:
+            task = registry.get_task(decision.task_id)
+            # IDs returned by an LLM are always untrusted: enforce chat/topic ownership.
+            if task is None or task.parent_key != turn.key:
+                decision = None
+            else:
+                if turn.kind == "resolve_status":
+                    registry.focus_task(turn.key, task.task_id)
+                    _bind_source_message(registry, task, turn.msg)
+                    await _reply_task_status(
+                        turn.msg, task, registry, _RUNNING_TASKS.get(task.task_id)
+                    )
+                else:
+                    await _resume_existing_task(
+                        task, msg=turn.msg, prompt=turn.prompt,
+                        store_path=turn.store_path,
+                        attachment_config=turn.attachment_config, registry=registry,
+                    )
+                return
+
+        if not tasks or (decision is not None and decision.action == "new"):
+            # A new request continues through the regular router, not a forced
+            # old task. Preserve the user's exact text, not the routing prompt.
+            route = route_text(turn.prompt, load_task_router_config().config).route
+            if route == Route.DELEGATE:
+                next_turn = QueuedTurn(
+                    msg=turn.msg, key=turn.key, backend=turn.backend,
+                    prompt=turn.prompt, store_path=turn.store_path,
+                    attachment_config=turn.attachment_config, route=route,
+                )
+                store = SessionStore(turn.store_path)
+                _register_new_task(next_turn, store, registry, "queued")
+                queued = await _enqueue_turn(next_turn)
+                if not queued:
+                    registry.update_status(next_turn.task_id, "failed")
+            else:
+                mid = getattr(turn.msg, "message_id", None)
+                if isinstance(mid, int):
+                    registry.bind_parent_message(
+                        parent_key=turn.key, message_id=mid, backend=turn.backend
+                    )
+                await _execute_relay_turn(
+                    msg=turn.msg, key=turn.key, backend=turn.backend,
+                    prompt=turn.prompt, store=SessionStore(turn.store_path),
+                    attachment_config=turn.attachment_config, show_typing=True,
+                )
+            return
+
+        # Malformed output, provider error, or genuine uncertainty: fail
+        # closed and let the human select. Never execute a guessed task.
+        await _reply_text_with_retry(turn.msg, _task_choice_text(tasks))
+    finally:
+        _ACTIVE_RELAY_THREADS.discard(turn.key)
+        _schedule_queue_drain(turn.key)
+
+
 async def _run_direct_turn(turn: QueuedTurn) -> None:
+    if turn.kind in ("resolve_task", "resolve_status"):
+        await _run_context_resolution(turn)
+        return
     # Bind source at execution time even if this turn was previously queued.
     mid = getattr(turn.msg, "message_id", None)
     if isinstance(mid, int):
