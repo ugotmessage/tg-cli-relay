@@ -1420,6 +1420,17 @@ async def _resume_existing_task(
     await _start_task_followup(turn)
 
 
+_EXPLICIT_NEW_WORK_RE = re.compile(
+    r"^\s*(?:(?:請|幫我|麻煩你|可以幫我)\s*)?"
+    r"(?:實作|開發|新增|建立|建置|製作|寫一個|做一個)"
+)
+
+
+def _is_explicit_new_work(text: str) -> bool:
+    """Protect clearly new work requests from accidental title-overlap routes."""
+    return bool(_EXPLICIT_NEW_WORK_RE.match((text or "").strip()))
+
+
 def _task_context_enabled() -> bool:
     return os.environ.get("TGR_TASK_CONTEXT_RESOLVER", "1").strip().lower() not in (
         "0", "false", "off", "no"
@@ -1771,7 +1782,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
 
     if tasks and (
         bare_continuation or contextual_followup
-        or (decision.route != Route.DELEGATE and might_refer_to_task(prompt, tasks))
+        or (not _is_explicit_new_work(prompt) and might_refer_to_task(prompt, tasks))
     ):
         if _task_context_enabled():
             turn = QueuedTurn(
