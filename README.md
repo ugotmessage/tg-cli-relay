@@ -110,7 +110,10 @@ cp env.example .env
 | `TGR_THREAD_QUEUE_MAX` | `20` | 每個 Telegram thread 忙碌時可緩存的訊息上限；FIFO 自動接續處理 |
 | `TGR_CODEX_BIN` | `codex` | OpenAI Codex CLI 路徑 |
 | `TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX` | （未設定） | 設為 `1` 啟用 `--dangerously-bypass-approvals-and-sandbox` |
-| `TGR_CODEX_DELEGATE_TO_CURSOR` | `1` | Codex 收到 coding、實作、大量簡易或其他 `DELEGATE` 工作時，先交給獨立 Cursor Worker 執行，再由 Codex 審核；設為 `0` 關閉，Cursor 失敗會自動回退 Codex |
+| `TGR_WORKER_PROVIDER` | `auto` | `auto` 偵測 Cursor，沒有 Cursor 即改用 Codex 原生派工能力；亦可設 `native`、`off`、`cursor`、`claude`、`opencode` |
+| `TGR_CODEX_TRANSPORT` | `cli` | 預設沿用 `codex exec`；設 `app-server` 啟用持續連線、原生 Session 與執行中 Reply steering |
+| `TGR_CODEX_APP_TURN_TIMEOUT` | `7200` | App Server 單輪逾時（秒）；0 不設限制 |
+| `TGR_CODEX_DELEGATE_TO_CURSOR` | （未設定） | 舊版相容設定；若未設 `TGR_WORKER_PROVIDER` 則 `1` 強制嘗試 Cursor、`0` 不自動派工 |
 | `TGR_CODEX_CURSOR_RESULT_MAX_CHARS` | `24000` | 傳回 Codex 的 Cursor Worker 報告字元上限，避免 Worker 輸出耗用過多 Codex context |
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
 | `TGR_CLAUDE_SKIP_PERMISSIONS` | （未設定） | 設為 `1` 啟用 `--dangerously-skip-permissions` |
@@ -146,7 +149,7 @@ Cursor relay 會在送入 `agent --print` 前，用 **rule-based** Task Router �
 
 Router 不使用 LLM classifier；只依 TOML 規則的 `keywords` / regex `patterns` / `weight` / `threshold` 加總判斷。批次補檔會依「回補、分批、長時間監控、背景工作」等任務語意判斷，不綁定某個固定檔案數量。設定檔遺失或格式錯誤時會使用內建 fallback 規則，不會讓 bot 啟動失敗。
 
-Codex backend 預設也使用同一份判定，遵守知識庫的「勞力活外包，決策活自己做」原則。coding／實作與大量簡易工作會先由隔離的 Cursor session 執行，再把精簡報告交給原 Codex session 檢查 workspace、review diff、驗證與下最後結論；需求理解、架構決策、高風險判斷與審核留給 Codex。`DIRECT` 問答仍只呼叫 Codex。若 Cursor CLI、認證、額度或執行失敗，relay 會以原始 prompt 回退到 Codex。
+Codex backend 預設使用同一份 Task Router 判定；當 `TGR_WORKER_PROVIDER=auto` 時，只有偵測到 Cursor CLI 才使用跨 Provider Worker，否則由 Codex 自行選擇可用的原生 Subagent 與模型或自行執行。可指定其他外部 Worker；失敗時退回 Codex，避免 Cursor 成為必要依賴。App Server 傳輸與其 `turn/steer` 需要明確開啟，詳見 [Codex App Server／Worker 說明](docs/codex-app-server-workers.md)。
 
 `DELEGATE` 任務會建立獨立的 job session，先回覆 job id，然後立即釋放主對話；背景 worker 完成後會自動回報。執行期間可傳送「進度」或使用 `/status` 查詢 job 狀態、執行秒數、最近一則進度與排隊數量，其他 DIRECT 訊息仍由主 session 處理。同一 thread 同時只執行一個背景 job；忙碌期間收到的新訊息不會丟棄，而是放入記憶體 FIFO queue，前一輪完成後自動執行並回覆。queue 預設最多 20 則，可用 `TGR_THREAD_QUEUE_MAX` 調整；服務重啟時尚未執行的記憶體 queue 不會保留。
 
