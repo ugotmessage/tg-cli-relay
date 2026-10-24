@@ -214,3 +214,41 @@ def test_telegram_reply_steers_or_queues_if_active(tmp_path, monkeypatch, steere
             _reset(bot)
 
     asyncio.run(run())
+
+
+def test_app_server_thread_checkpoint_happens_before_turn_finishes():
+    async def run():
+        client = FakeAppServer()
+        saved = []
+        result = await _run_turn(
+            client, workspace="/tmp/repo", session_id=None, prompt="研究",
+            model=None, bypass=False, timeout=1, on_progress=None,
+            on_session=saved.append,
+        )
+        assert result.returncode == 0
+        assert saved == ["t1"]
+    asyncio.run(run())
+
+
+def test_app_server_timeout_interrupts_and_returns_resumable_session():
+    class SlowAppServer(FakeAppServer):
+        async def request(self, method, params, **kwargs):
+            if method == "turn/start":
+                self.calls.append((method, params))
+                return {"turn": {"id": "r1"}}
+            if method == "turn/interrupt":
+                self.calls.append((method, params))
+                return {}
+            return await super().request(method, params, **kwargs)
+
+    async def run():
+        client = SlowAppServer()
+        result = await _run_turn(
+            client, workspace="/tmp/repo", session_id=None, prompt="長任務",
+            model=None, bypass=False, timeout=0.01, on_progress=None
+        )
+        assert result.returncode != 0
+        assert result.session_id == "t1"
+        assert "exceeded" in result.stderr
+        assert ("turn/interrupt", {"threadId": "t1", "turnId": "r1"}) in client.calls
+    asyncio.run(run())
