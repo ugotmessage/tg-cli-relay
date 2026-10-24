@@ -61,7 +61,7 @@ class CursorAgentModelFlagTest(unittest.TestCase):
             self.assertIn("--model", cmd)
             self.assertEqual(cmd[cmd.index("--model") + 1], "auto")
 
-    def test_delegate_task_uses_long_cursor_timeout(self) -> None:
+    def test_complex_task_does_not_change_cursor_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / "sessions.sqlite3")
             with patch("tg_cli_relay.relay.CursorAgentProvider") as provider_cls, patch.dict(
@@ -80,7 +80,7 @@ class CursorAgentModelFlagTest(unittest.TestCase):
                     store=store,
                     workspace=tmp,
                 )
-            self.assertEqual(provider_cls.call_args.kwargs["timeout_seconds"], 3600)
+            self.assertEqual(provider_cls.call_args.kwargs["timeout_seconds"], 600)
 
     def test_direct_task_keeps_short_cursor_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,10 +123,8 @@ class CursorAgentModelFlagTest(unittest.TestCase):
                     workspace=tmp,
                 )
             sent = provider_cls.return_value.run_turn.call_args.kwargs["prompt"]
-            self.assertIn("Relay role: WORKER", sent)
-            self.assertIn("do not dispatch, spawn, or delegate", sent)
-            self.assertNotIn("Task Router decision: DELEGATE", sent)
-            self.assertEqual(provider_cls.call_args.kwargs["timeout_seconds"], 3600)
+            self.assertEqual(sent, "請實作功能並跑完整測試")
+            self.assertEqual(provider_cls.call_args.kwargs["timeout_seconds"], 600)
 
 
 if __name__ == "__main__":
