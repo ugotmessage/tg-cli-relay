@@ -155,6 +155,10 @@ async def _restore_durable_queue(bot) -> None:
     """Replay only unstarted turns. Unknown in-flight work stops that thread."""
     db = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3"))
     ledger = DurableQueue(db)
+    try:
+        ledger.prune_terminal()
+    except Exception:
+        log.exception("Could not prune old terminal queue ledger records")
     uncertain = ledger.mark_interrupted_uncertain()
     _REVIEW_REQUIRED_THREADS.update(ledger.review_threads())
     restored = 0
