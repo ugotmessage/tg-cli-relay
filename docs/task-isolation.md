@@ -1,3 +1,5 @@
+> **2026/10 更新：** Relay 已取消普通 Telegram 訊息的 DIRECT／DELEGATE 自動分類與模糊追問分派。本文舊版路由範例只作歷史參考；目前只有明確的 `/task new` 與 Reply 到已綁定 Task 訊息才會進入 Relay Task Session。其餘 Reply/訊息均交給主 Agent CLI，Agent 自行依知識庫派工。
+
 # Telegram 任務隔離（task isolation）
 
 每個背景任務使用獨立 CLI session（`{parent}:job:{task_id}`），並把 Telegram 訊息綁到該任務。回覆任務相關訊息會繼續**同一個**任務 session，不會因為另一個任務正在跑、或 bot 重啟，就掉回混在一起的父對話。
