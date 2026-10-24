@@ -312,6 +312,8 @@ def _relay_cursor(
     *, routing_only: bool = False,
 ) -> RunResult:
     import os
+    import subprocess
+    import time
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
     # Relay never classifies work as DIRECT/DELEGATE. The Agent owns delegation.
@@ -321,8 +323,24 @@ def _relay_cursor(
     sid = store.get(thread_key, "cursor")
     fresh = not sid
     if not sid:
-        sid = prov.create_session()
+        started = time.monotonic()
+        try:
+            sid = prov.create_session(thread_key=thread_key)
+        except subprocess.TimeoutExpired:
+            return RunResult(
+                stdout="", stderr="Cursor session initialization exceeded timeout",
+                returncode=124,
+            )
         store.upsert(thread_key, "cursor", sid, workspace=workspace)
+        # Starting a fresh Cursor session counts toward the same turn limit.
+        if timeout_seconds > 0:
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                return RunResult(
+                    stdout="", stderr="Cursor session initialization exceeded timeout",
+                    returncode=124,
+                )
+            prov.timeout_seconds = remaining
     effective_prompt = ConversationContext(store.db_path).prompt(
         thread_key, prompt, include_history=fresh, consumer="cursor"
     )
