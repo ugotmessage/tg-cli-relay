@@ -75,6 +75,15 @@ SQLite            ← sessions 表（thread_key → session_id）
 
 ---
 
+## 統一 10 分鐘超時與自動恢復
+
+- `TGR_TURN_TIMEOUT=600`（預設）統一限制由 Relay 發起的每個 CLI 回合，包括 Codex CLI、Codex App Server、Cursor、Claude、OpenCode，以及使用者明確要求的 Relay Task。Agent 自己啟動的獨立背景 Worker 不由 Relay 控制；這不是自動建立新的 Worker。
+- **正常主對話超時**：保留原始 Telegram 訊息 ID 和有界原文（最多 12,000 字元），在主對話等待佇列最前面插入一次系統恢復提示。由原本的主 Agent 根據自己的知識庫、既有 Session 與工作目錄檢查進度，決定接續或派工。Relay 不指定 Cursor 或其他 Worker。
+- **恢復指令再次超時**：停止自動恢復這筆工作，下一則等待中的訊息照常送進主 CLI；避免無限重試。使用者手動 `/stop` 或 `/force` 的中斷不會觸發自動恢復。
+- **顯式 Task**：`/task new` 產生的獨立 Task 若超時會回報失敗，不會再由 Relay 自動分派新的工作。
+- **佇列保護**：顯式背景 Task 等待同時另一個 Task 結束時，不阻擋後面的普通主對話。Telegram Bot 重啟時也不會丟棄 Telegram 伺服器上尚未取回的更新；但**已經取回、保存在 Relay 記憶體中的等待佇列，若程序突然中斷仍不會自動還原**。
+- **Session 注意事項**：Codex App Server、既有 Cursor Session 等可接續先前歷史；Claude／OpenCode 首輪若還沒輸出 Session ID 就遭到中斷，原生 Session 恢復不一定可行。Relay 的恢復提示仍會提供原始工作與可用的上下文，但不是保證原生 Session 100% 完整還原。
+
 ## 即時修正與停止
 
 - `/force <修正內容>`：只有主對話正在執行時可用。若 Codex 使用 `TGR_CODEX_TRANSPORT=app-server`，Relay 優先將內容送入原本執行中的 Turn。Cursor、Claude、OpenCode、Codex CLI 不支援相同的即時輸入介面，因此改為**中止目前回合**並將修正內容插在主對話 FIFO 佇列最前方，以原 Session 接續；未完成的操作及檔案不會自動回復。
@@ -108,12 +117,11 @@ cp env.example .env
 | `TGR_DEFAULT_WORKSPACE` | （必填） | 代理操作的 git 工作目錄 |
 | `TGR_CURSOR_AGENT_BIN` | `agent` | Cursor Agent CLI 路徑 |
 | `TGR_CURSOR_MODEL` | `auto` | Cursor relay 預設模型；僅影響本 relay，不受其它 CLI 呼叫或舊版 `model` 偏好影響。可用 Telegram `/model <id>` 或 `model:cursor` 覆寫 |
-| `TGR_CURSOR_TIMEOUT` | `600` | Cursor agent 單輪逾時秒數；`0` 表示不限制 |
+| `TGR_TURN_TIMEOUT` | `600` | 所有由 Relay 啟動的 Codex CLI／App Server、Cursor、Claude、OpenCode 回合統一超時秒數；`0` 表示不限制 |
 | `TGR_THREAD_QUEUE_MAX` | `20` | 每個 Telegram thread 忙碌時可緩存的訊息上限；FIFO 自動接續處理 |
 | `TGR_CODEX_BIN` | `codex` | OpenAI Codex CLI 路徑 |
 | `TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX` | （未設定） | 設為 `1` 啟用 `--dangerously-bypass-approvals-and-sandbox` |
 | `TGR_CODEX_TRANSPORT` | `cli` | 預設沿用 `codex exec`；設 `app-server` 啟用持續連線、原生 Session 與執行中 Reply steering |
-| `TGR_CODEX_APP_TURN_TIMEOUT` | `7200` | App Server 單輪逾時（秒）；0 不設限制 |
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
 | `TGR_CLAUDE_SKIP_PERMISSIONS` | （未設定） | 設為 `1` 啟用 `--dangerously-skip-permissions` |
 | `TGR_OPENCODE_BIN` | `opencode` | OpenCode CLI 路徑 |
@@ -143,7 +151,7 @@ cp env.example .env
 - **Reply 至主對話訊息**：使用 Telegram 的 `reply_to_message` 內文提供有界引用文字（最長 4,000 字元）、原訊息 ID 與這次使用者要求。被引用的內容只作參考，不是另一條指令。沒有內文時標示為未知；不會因此進入其他 Task。
 - **Reply 至 Relay Task 訊息**：依已記錄的 Telegram message→Task 綁定，直接轉給對應 Task Session（限定同一 chat/topic）。
 - **明確 `/task new`**：使用者自行建立獨立 Task；CLI 的原生 Worker／Cursor 派工仍由它自己的知識庫與規則管理，Relay 不介入。
-- **等待佇列**：忙碌期間的普通訊息按順序處理（記憶體 FIFO，預設最多 20 則）；重啟不會自動恢復尚未執行的記憶體佇列。統一 10 分鐘超時／自動恢復仍是**獨立的待開發項目**，不是本次變更。
+- **等待佇列**：忙碌期間的普通訊息按順序處理（記憶體 FIFO，預設最多 20 則）；重啟不會自動恢復尚未執行的記憶體佇列。所有 Relay 管理的回合預設 10 分鐘超時。主對話超時時，Relay 會優先插入**一輪**同 Session 的恢復指令，再繼續普通訊息 FIFO；恢復指令再超時不會無限重試。
 
 舊的 `task_router.py`、`worker_selector.py` 及其設定是遷移相容的歷史程式碼，不再參與 Telegram 普通訊息的預設執行路徑。
 
