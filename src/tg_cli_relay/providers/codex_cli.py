@@ -4,11 +4,12 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from typing import Callable
 
 from tg_cli_relay.providers.base import RunResult
-from tg_cli_relay.providers.process_control import interruptible_run, tracked_process
+from tg_cli_relay.providers.process_control import interruptible_run, tracked_process, _terminate
 
 # 完整清單執行 `codex models status` 或查官方文件
 CODEX_MODELS: list[str] = [
@@ -29,6 +30,7 @@ class CodexCliProvider:
     codex_bin: str = "codex"
     dangerously_bypass_approvals_and_sandbox: bool = False
     model: str | None = None
+    timeout_seconds: float = 600
     name: str = "codex"
 
     def run_turn(
@@ -56,13 +58,23 @@ class CodexCliProvider:
             cmd: list[str] = base + exec_args + ["resume", session_id, prompt]
         else:
             cmd = base + exec_args + [prompt]
+        timeout = self.timeout_seconds if self.timeout_seconds > 0 else None
         if on_progress is None:
-            proc = (interruptible_run(
-                cmd, thread_key=thread_key, env=os.environ.copy(),
-            ) if thread_key is not None else subprocess.run(
-                cmd, capture_output=True, text=True, check=False, env=os.environ.copy()
-            ))
-            raw_stdout, raw_stderr, returncode = proc.stdout, proc.stderr, proc.returncode
+            try:
+                proc = (interruptible_run(
+                    cmd, thread_key=thread_key, env=os.environ.copy(), timeout=timeout,
+                ) if thread_key is not None else subprocess.run(
+                    cmd, capture_output=True, text=True, check=False,
+                    env=os.environ.copy(), timeout=timeout,
+                ))
+                raw_stdout, raw_stderr, returncode = proc.stdout, proc.stderr, proc.returncode
+            except subprocess.TimeoutExpired as exc:
+                raw_stdout, raw_stderr, returncode = exc.stdout or "", exc.stderr or "", 124
+                if isinstance(raw_stdout, bytes):
+                    raw_stdout = raw_stdout.decode("utf-8", "replace")
+                if isinstance(raw_stderr, bytes):
+                    raw_stderr = raw_stderr.decode("utf-8", "replace")
+                raw_stderr = (raw_stderr + "\\nCodex CLI turn exceeded timeout").strip()
             messages = parse_messages_from_jsonl(raw_stdout)
         else:
             raw_lines: list[str] = []
@@ -76,19 +88,38 @@ class CodexCliProvider:
                     cmd, stdout=subprocess.PIPE, stderr=stderr_file,
                     text=True, env=os.environ.copy(), **opts,
                 )
-                with tracked_process(thread_key, proc_live):
-                    assert proc_live.stdout is not None
-                    for line in proc_live.stdout:
-                        raw_lines.append(line)
-                        message = parse_agent_message_line(line)
-                        if message is None:
-                            continue
-                        if pending is not None:
-                            on_progress(pending)
-                        pending = message
-                    returncode = proc_live.wait()
+                timed_out = threading.Event()
+
+                def stop_on_deadline() -> None:
+                    if proc_live.poll() is None:
+                        timed_out.set()
+                        _terminate(proc_live)
+
+                watchdog = threading.Timer(timeout, stop_on_deadline) if timeout else None
+                if watchdog is not None:
+                    watchdog.daemon = True
+                try:
+                    with tracked_process(thread_key, proc_live):
+                        if watchdog is not None:
+                            watchdog.start()
+                        assert proc_live.stdout is not None
+                        for line in proc_live.stdout:
+                            raw_lines.append(line)
+                            message = parse_agent_message_line(line)
+                            if message is None:
+                                continue
+                            if pending is not None:
+                                on_progress(pending)
+                            pending = message
+                        returncode = proc_live.wait()
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
                 stderr_file.seek(0)
                 raw_stderr = stderr_file.read()
+                if timed_out.is_set():
+                    returncode = 124
+                    raw_stderr = (raw_stderr + "\\nCodex CLI turn exceeded timeout").strip()
             raw_stdout = "".join(raw_lines)
             if pending is not None:
                 messages.append(pending)
