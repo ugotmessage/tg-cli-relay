@@ -40,9 +40,9 @@ disabled, so never enable unrestricted tool permissions for untrusted chats.
 Task context resolution is enabled by default. To roll back independently of
 App Server and TaskRegistry:
 
-\`\`\`dotenv
+```dotenv
 TGR_TASK_CONTEXT_RESOLVER=0
-\`\`\`
+```
 
 When disabled, ambiguous continuations fall back to the older candidate-list
 behavior. Existing Reply and Task ID routing still work. Neither this feature
