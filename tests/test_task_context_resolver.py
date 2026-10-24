@@ -47,120 +47,62 @@ def test_model_selection_is_fail_closed(tmp_path: Path):
     assert parse_resolution('{"action":"new"}', available).action == "new"
 
 
-def test_primary_agent_selects_task_even_if_focus_points_elsewhere(monkeypatch, tmp_path: Path):
+def test_relay_does_not_invoke_semantic_classifier(monkeypatch, tmp_path: Path):
     from tg_cli_relay import telegram_bot as bot
 
     _env(monkeypatch, tmp_path, "codex")
-    registry = TaskRegistry(tmp_path / "sessions.sqlite3")
-    target = registry.create_task(parent_key="private:101", backend="codex", title="分點補檔修復", status="completed")
-    other = registry.create_task(parent_key="private:101", backend="codex", title="三箭報告", status="completed")
-    assert registry.focused_task("private:101").task_id == other.task_id
-    calls = []
-    msg = FakeMessage(text="補檔那邊不要全部重跑", chat_id=101, message_id=321)
-
-    def relay(**kwargs):
-        calls.append(kwargs)
-        if kwargs.get("routing_only"):
-            assert target.task_id in kwargs["prompt"]
-            assert other.task_id in kwargs["prompt"]
-            return RunResult(json.dumps({"action": "task", "task_id": target.task_id}), "", 0)
-        return RunResult("處理完成", "", 0)
-
-    async def scenario():
-        _reset(bot)
-        try:
-            with patch.object(bot, "relay_turn", side_effect=relay):
-                await bot._on_message(_update(msg, 101), SimpleNamespace())
-                await _drain(bot)
-        finally:
-            _reset(bot)
-
-    asyncio.run(scenario())
-    assert len(calls) == 2
-    assert calls[0]["thread_key"] == "private:101" and calls[0]["routing_only"]
-    assert calls[1]["thread_key"] == target.worker_key
-    assert calls[1]["prompt"] == "補檔那邊不要全部重跑"
-    assert registry.get_task_for_message("private:101", 321).task_id == target.task_id
-
-
-def test_primary_agent_says_new_and_preserves_original_text(monkeypatch, tmp_path: Path):
-    from tg_cli_relay import telegram_bot as bot
-
-    _env(monkeypatch, tmp_path, "codex")
-    registry = TaskRegistry(tmp_path / "sessions.sqlite3")
-    registry.create_task(parent_key="private:13", backend="codex", title="三箭報告", status="completed")
-    msg = FakeMessage(text="那個報告是哪天發表的？", chat_id=13, message_id=9)
-    calls = []
-
-    def relay(**kwargs):
-        calls.append(kwargs)
-        if kwargs.get("routing_only"):
-            return RunResult('{"action":"new"}', "", 0)
-        return RunResult("主對話回答", "", 0)
-
-    async def scenario():
-        _reset(bot)
-        try:
-            with patch.object(bot, "relay_turn", side_effect=relay):
-                await bot._on_message(_update(msg, 13), SimpleNamespace())
-                await _drain(bot)
-        finally:
-            _reset(bot)
-
-    asyncio.run(scenario())
-    assert len(calls) == 2
-    assert calls[0]["routing_only"]
-    assert calls[1]["thread_key"] == "private:13"
-    assert calls[1]["prompt"] == "那個報告是哪天發表的？"
-    assert registry.get_parent_message_backend("private:13", 9) == "codex"
-
-
-def test_invalid_cross_chat_choice_never_dispatches(monkeypatch, tmp_path: Path):
-    from tg_cli_relay import telegram_bot as bot
-
-    _env(monkeypatch, tmp_path, "claude")
-    registry = TaskRegistry(tmp_path / "sessions.sqlite3")
-    a = registry.create_task(parent_key="private:13", backend="claude", title="三箭報告", status="completed")
-    b = registry.create_task(parent_key="private:14", backend="claude", title="不屬於這個對話", status="completed")
-    msg = FakeMessage(text="那個報告繼續處理", chat_id=13, message_id=12)
-    calls = []
-
-    def relay(**kwargs):
-        calls.append(kwargs)
-        return RunResult(json.dumps({"action": "task", "task_id": b.task_id}), "", 0)
-
-    async def scenario():
-        _reset(bot)
-        try:
-            with patch.object(bot, "relay_turn", side_effect=relay):
-                await bot._on_message(_update(msg, 13), SimpleNamespace())
-                await _drain(bot)
-        finally:
-            _reset(bot)
-
-    asyncio.run(scenario())
-    assert len(calls) == 1 and calls[0]["routing_only"]
-    assert a.task_id in msg.sent[-1].text
-    assert b.task_id not in msg.sent[-1].text
-    assert registry.get_task_for_message("private:13", 12) is None
-
-
-def test_unrelated_question_does_not_call_classifier(monkeypatch, tmp_path: Path):
-    from tg_cli_relay import telegram_bot as bot
-
-    _env(monkeypatch, tmp_path, "codex")
-    TaskRegistry(tmp_path / "sessions.sqlite3").create_task(
-        parent_key="private:13", backend="codex", title="分點補檔修復", status="completed"
-    )
-    msg = FakeMessage(text="今天要吃什麼？", chat_id=13, message_id=7)
+    reg = TaskRegistry(tmp_path / "sessions.sqlite3")
+    reg.create_task(parent_key="private:101", backend="codex", title="分點補檔修復")
+    reg.create_task(parent_key="private:101", backend="codex", title="三箭報告")
     calls = []
 
     async def scenario():
         _reset(bot)
         try:
             with patch.object(bot, "relay_turn", side_effect=lambda **kw: (
-                calls.append(kw) or RunResult("主對話回覆", "", 0)
+                calls.append(kw) or RunResult("主 Agent 自行判斷", "", 0)
             )):
+                for i, text in enumerate((
+                    "補檔那邊不要全部重跑", "那個報告是哪天發表的？",
+                    "進度", "現在進度如何", "繼續", "今天要吃什麼？",
+                )):
+                    msg = FakeMessage(text=text, chat_id=101, message_id=321 + i)
+                    await bot._on_message(_update(msg, 101), SimpleNamespace())
+                    await _drain(bot)
+        finally:
+            _reset(bot)
+
+    asyncio.run(scenario())
+    assert len(calls) == 6
+    assert all(c["thread_key"] == "private:101" for c in calls)
+    assert all(not c.get("routing_only") for c in calls)
+    assert [c["prompt"] for c in calls] == [
+        "補檔那邊不要全部重跑", "那個報告是哪天發表的？",
+        "進度", "現在進度如何", "繼續", "今天要吃什麼？",
+    ]
+    assert reg.list_tasks("private:101")
+    assert all(reg.get_task_for_message("private:101", 321 + i) is None for i in range(6))
+
+
+def test_explicit_cross_chat_reply_cannot_select_other_task(monkeypatch, tmp_path: Path):
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, "claude")
+    reg = TaskRegistry(tmp_path / "sessions.sqlite3")
+    other = reg.create_task(parent_key="private:14", backend="claude", title="別人的工作")
+    reg.bind_message(
+        parent_key="private:14", message_id=40, task_id=other.task_id,
+        backend="claude", role="source",
+    )
+    calls = []
+
+    async def scenario():
+        _reset(bot)
+        try:
+            with patch.object(bot, "relay_turn", side_effect=lambda **kw: (
+                calls.append(kw) or RunResult("ok", "", 0)
+            )):
+                msg = FakeMessage(text="要繼續這個", chat_id=13, message_id=41, reply_to=40)
                 await bot._on_message(_update(msg, 13), SimpleNamespace())
                 await _drain(bot)
         finally:
@@ -168,35 +110,5 @@ def test_unrelated_question_does_not_call_classifier(monkeypatch, tmp_path: Path
 
     asyncio.run(scenario())
     assert len(calls) == 1
-    assert calls[0]["prompt"] == "今天要吃什麼？"
-    assert not calls[0].get("routing_only", False)
-
-
-def test_ambiguous_status_uses_only_status_not_worker(monkeypatch, tmp_path: Path):
-    from tg_cli_relay import telegram_bot as bot
-
-    _env(monkeypatch, tmp_path, "codex")
-    registry = TaskRegistry(tmp_path / "sessions.sqlite3")
-    a = registry.create_task(parent_key="private:13", backend="codex", title="補檔", status="running")
-    registry.create_task(parent_key="private:13", backend="codex", title="報告", status="running")
-    registry.clear_focus("private:13")
-    msg = FakeMessage(text="進度", chat_id=13, message_id=42)
-    calls = []
-
-    async def scenario():
-        _reset(bot)
-        try:
-            with patch.object(bot, "relay_turn", side_effect=lambda **kw: (
-                calls.append(kw) or RunResult(
-                    json.dumps({"action":"task","task_id":a.task_id}), "", 0
-                )
-            )):
-                await bot._on_message(_update(msg, 13), SimpleNamespace())
-                await _drain(bot)
-        finally:
-            _reset(bot)
-
-    asyncio.run(scenario())
-    assert len(calls) == 1 and calls[0]["routing_only"]
-    assert a.task_id in msg.sent[-1].text
-    assert registry.get_task_for_message("private:13", 42).task_id == a.task_id
+    assert calls[0]["thread_key"] == "private:13"
+    assert "telegram_message_id" in calls[0]["prompt"]

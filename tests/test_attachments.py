@@ -527,7 +527,7 @@ def test_delegate_message_acknowledges_without_typing(monkeypatch, tmp_path):
             return_value=RunResult(stdout="started", stderr="", returncode=0),
         ):
             with patch.object(telegram_bot, "_send_relay_output", new=AsyncMock()):
-                await telegram_bot._on_message(update, SimpleNamespace())
+                await telegram_bot._cmd_task(update, SimpleNamespace(args=["new", msg.text]))
                 assert msg.reply_text.await_count == 1
                 assert "背景" in msg.reply_text.await_args.args[0]
                 msg.chat.send_action.assert_not_awaited()
@@ -590,12 +590,14 @@ def test_delegate_runs_in_isolated_job_and_progress_remains_responsive(monkeypat
         with patch.object(telegram_bot, "relay_turn", side_effect=slow_relay), patch.object(
             telegram_bot, "_send_relay_output", new=AsyncMock()
         ):
-            await telegram_bot._on_message(delegate, SimpleNamespace())
+            await telegram_bot._cmd_task(delegate, SimpleNamespace(args=["new", delegate.message.text]))
             assert "主對話可繼續使用" in delegate.message.reply_text.await_args.args[0]
             await asyncio.to_thread(worker_started.wait, 2)
             await telegram_bot._on_message(direct, SimpleNamespace())
             assert main_turn_seen.is_set()
-            await telegram_bot._on_message(progress, SimpleNamespace())
+            from tg_cli_relay.task_registry import TaskRegistry
+            task = TaskRegistry(tmp_path / "sessions.sqlite3").list_tasks("private:31")[0]
+            await telegram_bot._cmd_task(progress, SimpleNamespace(args=[task.task_id]))
             progress_text = progress.message.reply_text.await_args.args[0]
             assert "背景工作" in progress_text
             assert "狀態: running" in progress_text
@@ -643,7 +645,7 @@ def test_delegate_ack_failure_releases_active_thread(monkeypatch, tmp_path):
             new=AsyncMock(side_effect=RuntimeError("ack failed")),
         ), patch.object(telegram_bot, "relay_turn") as relay:
             with pytest.raises(RuntimeError, match="ack failed"):
-                await telegram_bot._on_message(update, SimpleNamespace())
+                await telegram_bot._cmd_task(update, SimpleNamespace(args=["new", msg.text]))
             assert key not in telegram_bot._ACTIVE_RELAY_THREADS
             relay.assert_not_called()
 
@@ -748,8 +750,8 @@ def test_second_delegate_is_queued_then_starts_after_first_job(monkeypatch, tmp_
         with patch.object(telegram_bot, "relay_turn", side_effect=relay), patch.object(
             telegram_bot, "_send_relay_output", new=AsyncMock()
         ):
-            await telegram_bot._on_message(first, SimpleNamespace())
-            await telegram_bot._on_message(second, SimpleNamespace())
+            await telegram_bot._cmd_task(first, SimpleNamespace(args=["new", first.message.text]))
+            await telegram_bot._cmd_task(second, SimpleNamespace(args=["new", second.message.text]))
             assert "已加入等待佇列" in second.message.reply_text.await_args.args[0]
             assert telegram_bot._queue_size("private:77") == 1
             first_release.set()

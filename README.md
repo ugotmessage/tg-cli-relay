@@ -14,7 +14,7 @@ Telegram 訊息
     ▼
 telegram_bot.py   ← 解析 thread key、處理指令、顯示回覆
     │
-    ├── task_router.py  ← rule-based DIRECT / DELEGATE 判斷與 prompt 前綴
+    ├── Reply / Task ID → 明確指定既有工作，普通訊息不做語意分類
     │
     ▼
 relay.py          ← 查 session、呼叫 provider、存回 session
@@ -27,7 +27,7 @@ SQLite            ← sessions 表（thread_key → session_id）
                      preferences 表（thread_key → model 等偏好）
 ```
 
-**歷史紀錄由各 CLI 本身維護**；本專案只存 session ID，不存對話內容。
+**各 CLI 自行維護完整的 Session 歷史及 Agent 派工策略**。Relay 儲存 Session ID、Task 對應與有界的工作交接摘要；不按訊息內容猜測是否建立背景工作。
 
 ---
 
@@ -57,8 +57,6 @@ SQLite            ← sessions 表（thread_key → session_id）
 | `/model` | 全部 | 依 provider 列出常用模型清單 |
 | `/model <id>` | 全部 | 切換目前 provider 的模型（下一輪起生效） |
 | `/model <provider> <id>` | 全部 | 切換 provider 並設定該 provider 的模型 |
-| `/router` | `cursor` | 查看目前 Task Router 規則、設定來源與 fallback 狀態 |
-| `/router test <文字>` | `cursor` | 用目前規則測試文字會被判斷為 `DIRECT` 或 `DELEGATE` |
 | `/task` | 全部 | 列出本對話的孤立任務 |
 | `/task <id>` | 全部 | 顯示該任務狀態（此回覆會綁定該任務，回覆它可以繼續） |
 | `/task <id> <說明>` | 全部 | 把說明送到該任務的獨立 session |
@@ -69,12 +67,11 @@ SQLite            ← sessions 表（thread_key → session_id）
 
 ### 任務隔離（task isolation）
 
-`DELEGATE` 與 `/task new` 會建立 `{parent}:job:{task_id}` 獨立 session，來源／ACK／進度／狀態／結果都綁在該任務上。回覆綁定訊息會繼續**同一個**任務，不會掉回混在一起的父對話。細節見 `docs/task-isolation.md`。
+只有**明確**的 `/task new` 會建立 `{parent}:job:{task_id}` 獨立 session，來源／ACK／進度／狀態／結果都綁在該任務上。Reply 至已綁定任務訊息會繼續**同一個**任務。細節見 `docs/task-isolation.md`。
 
-- 未串接且整句是 `繼續`／`接著做`／`往下做`：多個任務時請選擇，**不**走父 session；只有一個明確任務時恢復該任務。
-- 未串接且整句是 `進度`／`做好了嗎` 等：只回狀態，不重跑。回覆已綁定的進度查詢同樣只回狀態。
-- 新的 DELEGATE（即使內文提到「進度」）仍開新任務。延續／進度用整句錨定，不會用子字串把「請繼續實作…」當成舊任務。
-- **舊的未綁定父對話回覆不會自動遷移或猜測任務**。請用 `/task new <說明>` 一次建立孤立任務，之後再回覆帶 `[task …]` 的訊息。
+- 普通訊息不論是「繼續」、「進度」或新開發要求，**全部交給主 Agent CLI**；Relay 不會根據關鍵字或最近 Task 焦點更換 Session。
+- Reply 至主對話訊息（或未綁定的舊訊息）會附上 Telegram 引用訊息的 ID 與可用文字，交給主 Agent；無引用文字時只提供 ID，不猜測內容。
+- 想直接操作 Relay 建立的 Task，請 Reply 帶 `[task ...]` 的訊息，或使用 `/task <id> <說明>`。Agent CLI 自己啟動的 Cursor／Subagent 不屬於 Relay Task，仍交由主 Agent 管理。
 
 ---
 
@@ -112,18 +109,11 @@ cp env.example .env
 | `TGR_CURSOR_AGENT_BIN` | `agent` | Cursor Agent CLI 路徑 |
 | `TGR_CURSOR_MODEL` | `auto` | Cursor relay 預設模型；僅影響本 relay，不受其它 CLI 呼叫或舊版 `model` 偏好影響。可用 Telegram `/model <id>` 或 `model:cursor` 覆寫 |
 | `TGR_CURSOR_TIMEOUT` | `600` | Cursor agent 單輪逾時秒數；`0` 表示不限制 |
-| `TGR_CURSOR_DELEGATE_TIMEOUT` | `3600` | Cursor `DELEGATE`／Codex→Cursor Worker 長工作逾時秒數；仍維持有界，避免永久卡死 |
-| `TGR_ROUTER_CONFIG` | `router.toml` / `config/router.toml` | Task Router TOML 設定檔；遺失或錯誤會 fallback 至內建規則 |
-| `TGR_CURSOR_HARNESS_PREFIX` | `1` | 設為 `0` 可關閉 Cursor Task Router / harness prompt 前綴 |
-| `TGR_CURSOR_PROMPT_PREFIX` | （未設定） | 完全覆寫 Cursor prompt 前綴；設定後不使用 Task Router 產生的前綴 |
 | `TGR_THREAD_QUEUE_MAX` | `20` | 每個 Telegram thread 忙碌時可緩存的訊息上限；FIFO 自動接續處理 |
 | `TGR_CODEX_BIN` | `codex` | OpenAI Codex CLI 路徑 |
 | `TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX` | （未設定） | 設為 `1` 啟用 `--dangerously-bypass-approvals-and-sandbox` |
-| `TGR_WORKER_PROVIDER` | `auto` | `auto` 偵測 Cursor，沒有 Cursor 即改用 Codex 原生派工能力；亦可設 `native`、`off`、`cursor`、`claude`、`opencode` |
 | `TGR_CODEX_TRANSPORT` | `cli` | 預設沿用 `codex exec`；設 `app-server` 啟用持續連線、原生 Session 與執行中 Reply steering |
 | `TGR_CODEX_APP_TURN_TIMEOUT` | `7200` | App Server 單輪逾時（秒）；0 不設限制 |
-| `TGR_CODEX_DELEGATE_TO_CURSOR` | （未設定） | 舊版相容設定；若未設 `TGR_WORKER_PROVIDER` 則 `1` 強制嘗試 Cursor、`0` 不自動派工 |
-| `TGR_CODEX_CURSOR_RESULT_MAX_CHARS` | `24000` | 傳回 Codex 的 Cursor Worker 報告字元上限，避免 Worker 輸出耗用過多 Codex context |
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
 | `TGR_CLAUDE_SKIP_PERMISSIONS` | （未設定） | 設為 `1` 啟用 `--dangerously-skip-permissions` |
 | `TGR_OPENCODE_BIN` | `opencode` | OpenCode CLI 路徑 |
@@ -147,37 +137,15 @@ cp env.example .env
 
 ---
 
-## Task Router
+## 明確路由與 Agent 派工
 
-任務訊息綁定、追問與上下文交接見 [task-isolation.md](docs/task-isolation.md)。新任務會取得已完成主對話的有界快照；成功結果會提供給主對話後續回合參考，任務 session 仍各自隔離。
+- **普通訊息**：直接送至 Telegram chat/topic 對應的主 CLI Session，保留該 Provider 的完整歷史。Relay 不執行 Task Router、分類器、模糊追問判斷或 Codex→Cursor 強制派工。
+- **Reply 至主對話訊息**：使用 Telegram 的 `reply_to_message` 內文提供有界引用文字（最長 4,000 字元）、原訊息 ID 與這次使用者要求。被引用的內容只作參考，不是另一條指令。沒有內文時標示為未知；不會因此進入其他 Task。
+- **Reply 至 Relay Task 訊息**：依已記錄的 Telegram message→Task 綁定，直接轉給對應 Task Session（限定同一 chat/topic）。
+- **明確 `/task new`**：使用者自行建立獨立 Task；CLI 的原生 Worker／Cursor 派工仍由它自己的知識庫與規則管理，Relay 不介入。
+- **等待佇列**：忙碌期間的普通訊息按順序處理（記憶體 FIFO，預設最多 20 則）；重啟不會自動恢復尚未執行的記憶體佇列。統一 10 分鐘超時／自動恢復仍是**獨立的待開發項目**，不是本次變更。
 
-**模糊追問辨識（預設啟用）**：若訊息沒有 Reply／Task ID，但內容疑似延續既有工作，Relay 只提供當前 Telegram 對話最多 8 個 Task 的 ID、標題、狀態，由目前選用的 Codex／Claude／Cursor／OpenCode 主 CLI 回傳嚴格的 `task / new / ask` 判斷；Relay 驗證同一 chat/topic 的 Task ID 才派送，無法確定就列出選項。明確新需求仍走原本 Router，一般閒聊不觸發辨識。這**不需要 MCP 或額外模型**，但模糊訊息可能增加一次主 CLI 的判斷回合（會消耗既有訂閱的使用量）。可設 `TGR_TASK_CONTEXT_RESOLVER=0` 關閉。詳見 [Task Context Resolver](docs/task-context-resolver.md)。
-
-Cursor relay 會在送入 `agent --print` 前，用 **rule-based** Task Router 產生前綴，標示本輪應走：
-
-- `DIRECT`：小型查詢、狀態檢查、單步操作，留在目前 Cursor session 直接處理。
-- `DELEGATE`：跨檔案、重構、部署/DB/權限等高風險邊界、或「實作 + 測試 + review + PR」這類工作，要求主 session 只當 Orchestrator，透過 Job Dispatcher 拆給隔離 worker sessions，再由主 session 整合與驗證。
-
-Router 不使用 LLM classifier；只依 TOML 規則的 `keywords` / regex `patterns` / `weight` / `threshold` 加總判斷。批次補檔會依「回補、分批、長時間監控、背景工作」等任務語意判斷，不綁定某個固定檔案數量。設定檔遺失或格式錯誤時會使用內建 fallback 規則，不會讓 bot 啟動失敗。
-
-Codex backend 預設使用同一份 Task Router 判定；當 `TGR_WORKER_PROVIDER=auto` 時，只有偵測到 Cursor CLI 才使用跨 Provider Worker，否則由 Codex 自行選擇可用的原生 Subagent 與模型或自行執行。可指定其他外部 Worker；失敗時退回 Codex，避免 Cursor 成為必要依賴。App Server 傳輸與其 `turn/steer` 需要明確開啟，詳見 [Codex App Server／Worker 說明](docs/codex-app-server-workers.md)。
-
-`DELEGATE` 任務會建立獨立的 job session，先回覆 job id，然後立即釋放主對話；背景 worker 完成後會自動回報。執行期間可傳送「進度」或使用 `/status` 查詢 job 狀態、執行秒數、最近一則進度與排隊數量，其他 DIRECT 訊息仍由主 session 處理。同一 thread 同時只執行一個背景 job；忙碌期間收到的新訊息不會丟棄，而是放入記憶體 FIFO queue，前一輪完成後自動執行並回覆。queue 預設最多 20 則，可用 `TGR_THREAD_QUEUE_MAX` 調整；服務重啟時尚未執行的記憶體 queue 不會保留。
-
-Cursor relay 的主 session 會收到 Router／Orchestrator 指示；relay 建立的 `:job:` session 則明確標示為 Worker，直接執行與驗證，不得再次派工，避免巢狀 delegation。3600 秒是背景 Worker 的安全上限，不是主對話的等待時間。
-
-```bash
-cp deploy/router.toml.example router.toml
-# 可選：指定其它位置
-export TGR_ROUTER_CONFIG=/path/to/router.toml
-```
-
-Telegram 內可用：
-
-```text
-/router
-/router test 請重構三個檔案、補 tests、跑完整測試並建立 PR
-```
+舊的 `task_router.py`、`worker_selector.py` 及其設定是遷移相容的歷史程式碼，不再參與 Telegram 普通訊息的預設執行路徑。
 
 ---
 

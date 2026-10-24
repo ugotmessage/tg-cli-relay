@@ -153,7 +153,10 @@ def test_handler_handoff_reaches_real_relay_and_keeps_provider_sessions_isolated
             first = FakeMessage(text="hello world", chat_id=101, message_id=100)
             await bot._on_message(_update(first, 101), SimpleNamespace())
             delegated = FakeMessage(text="請實作這些 WEB 的健康檢查", chat_id=101, message_id=101)
-            await bot._on_message(_update(delegated, 101), SimpleNamespace())
+            await bot._cmd_task(
+                _update(delegated, 101),
+                SimpleNamespace(args=["new", delegated.text]),
+            )
             await _drain(bot)
             last = FakeMessage(text="hello again", chat_id=101, message_id=102)
             await bot._on_message(_update(last, 101), SimpleNamespace())
@@ -161,9 +164,11 @@ def test_handler_handoff_reaches_real_relay_and_keeps_provider_sessions_isolated
             _reset(bot)
 
     asyncio.run(run())
-    worker_prompt = cursor.run_turn.call_args.kwargs["prompt"]
-    assert "網站甲與網站乙剛搬遷" in worker_prompt
-    assert "請實作這些 WEB 的健康檢查" in worker_prompt
+    # Relay no longer dispatches Codex -> Cursor; Task is explicit and
+    # Codex receives the task along with inherited conversation reference.
+    cursor.run_turn.assert_not_called()
+    assert "網站甲與網站乙剛搬遷" in codex.run_turn.call_args_list[1].kwargs["prompt"]
+    assert "請實作這些 WEB 的健康檢查" in codex.run_turn.call_args_list[1].kwargs["prompt"]
     calls = codex.run_turn.call_args_list
     assert len(calls) == 3
     assert [call.kwargs["session_id"] for call in calls] == [None, None, "parent-session"]

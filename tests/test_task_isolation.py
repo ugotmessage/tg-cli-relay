@@ -102,6 +102,14 @@ async def _drain(bot) -> None:
         await asyncio.gather(*tuple(bot._BACKGROUND_TASKS), return_exceptions=True)
 
 
+async def _send_new_task(bot, msg: FakeMessage, chat_id: int, chat_type: str = "private"):
+    """Only explicit /task new creates an isolated Task."""
+    await bot._cmd_task(
+        _update(msg, chat_id, chat_type=chat_type),
+        SimpleNamespace(args=["new", msg.text]),
+    )
+
+
 def _task_id_from_sent(msg: FakeMessage) -> str:
     for sent in msg.sent:
         text = getattr(sent, "text", "") or ""
@@ -187,7 +195,7 @@ def test_handler_task_isolation_routing(monkeypatch, tmp_path: Path) -> None:
             assert calls[0]["prompt"] == "hello world"
 
             msg_a = FakeMessage(text="請實作任務A獨立功能", chat_id=chat_a, message_id=2)
-            await bot._on_message(_update(msg_a, chat_a), SimpleNamespace())
+            await _send_new_task(bot, msg_a, chat_a)
             await _drain(bot)
             a_key = calls[1]["thread_key"]
             a_id = _task_id_from_sent(msg_a)
@@ -212,7 +220,7 @@ def test_handler_task_isolation_routing(monkeypatch, tmp_path: Path) -> None:
             assert progress_a is not None, sent_texts
 
             msg_b = FakeMessage(text="請實作任務B獨立功能", chat_id=chat_a, message_id=3)
-            await bot._on_message(_update(msg_b, chat_a), SimpleNamespace())
+            await _send_new_task(bot, msg_b, chat_a)
             assert await asyncio.to_thread(b_started.wait, 2)
             b_key = next(c["thread_key"] for c in calls if "任務B" in c["prompt"])
             b_id = _task_id_from_sent(msg_b)
@@ -260,12 +268,9 @@ def test_handler_task_isolation_routing(monkeypatch, tmp_path: Path) -> None:
             provider_before = len(calls)
             ambiguous = FakeMessage(text="現在進度如何", chat_id=chat_a, message_id=7)
             await bot._on_message(_update(ambiguous, chat_a), SimpleNamespace())
-            assert len(calls) == provider_before
-            choice = ambiguous.sent[-1].text
-            # Explicit replies focus Task A, so an unqualified status query
-            # reports Task A rather than prompting across all historical tasks.
-            assert a_id in choice and b_id not in choice
-            assert "狀態:" in choice
+            assert len(calls) == provider_before + 1
+            assert calls[-1]["thread_key"] == "private:101"
+            assert calls[-1]["prompt"] == "現在進度如何"
 
             other_chat = FakeMessage(
                 text="follow stolen",
@@ -295,10 +300,7 @@ def test_handler_task_isolation_routing(monkeypatch, tmp_path: Path) -> None:
                 message_id=11,
                 thread_id=11,
             )
-            await bot._on_message(
-                _update(topic_msg, 9, chat_type="supergroup"),
-                SimpleNamespace(),
-            )
+            await _send_new_task(bot, topic_msg, 9, chat_type="supergroup")
             await _drain(bot)
             topic_key = next(c["thread_key"] for c in calls if c["prompt"] == "請實作 topic 任務")
             assert topic_key.startswith("topic:9:11:job:")
@@ -369,7 +371,7 @@ def test_handler_task_isolation_routing(monkeypatch, tmp_path: Path) -> None:
 
             bot.relay_turn.side_effect = relay_with_c
             msg_c = FakeMessage(text="請實作任務C獨立功能", chat_id=chat_a, message_id=17)
-            await bot._on_message(_update(msg_c, chat_a), SimpleNamespace())
+            await _send_new_task(bot, msg_c, chat_a)
             assert await asyncio.to_thread(c_started.wait, 2)
             c_id = _task_id_from_sent(msg_c)
             c_key = f"private:101:job:{c_id}"
@@ -419,8 +421,9 @@ def test_handler_task_isolation_routing(monkeypatch, tmp_path: Path) -> None:
             )
             before = len(calls)
             await bot._on_message(_update(unbound, chat_a), SimpleNamespace())
-            assert len(calls) == before
-            assert "沒有綁定任務" in unbound.sent[-1].text
+            assert len(calls) == before + 1
+            assert calls[-1]["thread_key"] == "private:101"
+            assert "telegram_message_id" in calls[-1]["prompt"]
 
         _reset(bot)
 
@@ -442,7 +445,7 @@ def test_failed_send_and_provider_lifecycle(monkeypatch, tmp_path: Path) -> None
             new=AsyncMock(side_effect=RuntimeError("ack failed")),
         ), patch.object(bot, "relay_turn") as relay:
             with pytest.raises(RuntimeError, match="ack failed"):
-                await bot._on_message(_update(msg, 11), SimpleNamespace())
+                await _send_new_task(bot, msg, 11)
             relay.assert_not_called()
         registry = TaskRegistry(store_path)
         tasks = registry.list_tasks("private:11")
@@ -456,7 +459,7 @@ def test_failed_send_and_provider_lifecycle(monkeypatch, tmp_path: Path) -> None
             raise RuntimeError("provider down")
 
         with patch.object(bot, "relay_turn", side_effect=boom):
-            await bot._on_message(_update(raised, 12), SimpleNamespace())
+            await _send_new_task(bot, raised, 12)
             await _drain(bot)
         failed = TaskRegistry(store_path).list_tasks("private:12")[0]
         assert failed.status == "failed"
@@ -468,7 +471,7 @@ def test_failed_send_and_provider_lifecycle(monkeypatch, tmp_path: Path) -> None
             "relay_turn",
             return_value=RunResult(stdout="", stderr="nope", returncode=2),
         ):
-            await bot._on_message(_update(rc, 13), SimpleNamespace())
+            await _send_new_task(bot, rc, 13)
             await _drain(bot)
         rc_task = TaskRegistry(store_path).list_tasks("private:13")[0]
         assert rc_task.status == "failed"
@@ -546,7 +549,7 @@ def test_parent_model_pref_copied_not_leaked(monkeypatch, tmp_path: Path) -> Non
             bot, "relay_turn", return_value=RunResult(stdout="ok", stderr="", returncode=0)
         ):
             msg = FakeMessage(text="請實作複製模型偏好", chat_id=44, message_id=1)
-            await bot._on_message(_update(msg, 44), SimpleNamespace())
+            await _send_new_task(bot, msg, 44)
             await _drain(bot)
         task = TaskRegistry(store.db_path).list_tasks("private:44")[0]
         assert store.get_pref(task.worker_key, "model:cursor") == "composer-1"
@@ -579,10 +582,8 @@ def test_unthreaded_continuation_asks_when_ambiguous(monkeypatch, tmp_path: Path
                 await bot._on_message(_update(msg, 101), SimpleNamespace())
                 await _drain(bot)
                 body = msg.sent[-1].text
-                assert first.task_id in body and second.task_id in body
-                assert "/task" in body
-        # Ambiguous short prompts now ask the selected primary CLI for a
-        # strict routing decision. Its malformed response cannot dispatch.
+                assert "done" in body
+        # Ambiguous messages always go to the primary CLI, without task guessing.
         assert len(calls) == 4
         assert calls == ["private:101"] * 4
         _reset(bot)
@@ -608,7 +609,7 @@ def test_unthreaded_continuation_resumes_sole_task(monkeypatch, tmp_path: Path) 
             msg = FakeMessage(text="繼續", chat_id=77, message_id=1)
             await bot._on_message(_update(msg, 77), SimpleNamespace())
             await _drain(bot)
-        assert calls == [{"thread_key": sole.worker_key, "prompt": "繼續"}]
+        assert calls == [{"thread_key": "private:77", "prompt": "繼續"}]
         _reset(bot)
 
     asyncio.run(_run())
@@ -637,8 +638,8 @@ def test_delegate_mentioning_progress_still_opens_new_task(monkeypatch, tmp_path
             await bot._on_message(_update(msg, 88), SimpleNamespace())
             await _drain(bot)
         assert len(calls) == 1
-        assert calls[0]["thread_key"].startswith("private:88:job:")
-        assert calls[0]["thread_key"] != "private:88"
+        assert calls[0]["thread_key"] == "private:88"
+        assert len(registry.list_tasks("private:88")) == 1  # Pre-existing Task remains; no new auto-Task
         _reset(bot)
 
     asyncio.run(_run())
@@ -658,17 +659,17 @@ def test_reply_to_bound_progress_query_is_status_only(monkeypatch, tmp_path: Pat
         _reset(bot)
         with patch.object(bot, "relay_turn", side_effect=relay):
             src = FakeMessage(text="請實作任務A獨立功能", chat_id=91, message_id=1)
-            await bot._on_message(_update(src, 91), SimpleNamespace())
+            await _send_new_task(bot, src, 91)
             await _drain(bot)
             task_id = _task_id_from_sent(src)
             before = len(calls)
             probe = FakeMessage(text="現在進度如何", chat_id=91, message_id=2, reply_to=1)
             await bot._on_message(_update(probe, 91), SimpleNamespace())
             await _drain(bot)
-            assert len(calls) == before
+            assert len(calls) == before + 1
+            assert calls[-1] == "現在進度如何"
             body = probe.sent[-1].text
             assert task_id in body
-            assert "狀態:" in body
             status_id = probe.sent[-1].message_id
             follow = FakeMessage(text="補上測試", chat_id=91, message_id=3, reply_to=status_id)
             await bot._on_message(_update(follow, 91), SimpleNamespace())
@@ -709,10 +710,10 @@ def test_queued_initial_precedes_followup_and_occupancy_one(monkeypatch, tmp_pat
         _reset(bot)
         with patch.object(bot, "relay_turn", side_effect=relay):
             msg_a = FakeMessage(text="請實作任務A獨立功能", chat_id=101, message_id=1)
-            await bot._on_message(_update(msg_a, 101), SimpleNamespace())
+            await _send_new_task(bot, msg_a, 101)
             assert await asyncio.to_thread(a_started.wait, 2)
             msg_b = FakeMessage(text="請實作任務B獨立功能", chat_id=101, message_id=2)
-            await bot._on_message(_update(msg_b, 101), SimpleNamespace())
+            await _send_new_task(bot, msg_b, 101)
             b_id = _task_id_from_sent(msg_b)
             follow = FakeMessage(
                 text="追加 B 的要求",
@@ -786,7 +787,7 @@ def test_status_replies_are_task_bound(monkeypatch, tmp_path: Path) -> None:
         _reset(bot)
         with patch.object(bot, "relay_turn", side_effect=relay):
             src = FakeMessage(text="請實作任務A獨立功能", chat_id=55, message_id=1)
-            await bot._on_message(_update(src, 55), SimpleNamespace())
+            await _send_new_task(bot, src, 55)
             await _drain(bot)
             task_id = _task_id_from_sent(src)
             status = FakeMessage(text="/task", chat_id=55, message_id=2)
@@ -829,7 +830,7 @@ def test_task_title_redacts_path_and_credentials(monkeypatch, tmp_path: Path) ->
                 chat_id=66,
                 message_id=1,
             )
-            await bot._on_message(_update(msg, 66), SimpleNamespace())
+            await _send_new_task(bot, msg, 66)
             await _drain(bot)
         task = TaskRegistry(tmp_path / "sessions.sqlite3").list_tasks("private:66")[0]
         assert task.title == "background task"
@@ -865,11 +866,11 @@ def test_enqueue_ack_failure_does_not_orphan_queue(monkeypatch, tmp_path: Path) 
             bot, "_reply_text_with_retry", side_effect=fail_queue_ack
         ):
             msg_a = FakeMessage(text="請實作任務A獨立功能", chat_id=12, message_id=1)
-            await bot._on_message(_update(msg_a, 12), SimpleNamespace())
+            await _send_new_task(bot, msg_a, 12)
             assert await asyncio.to_thread(a_started.wait, 2)
             msg_b = FakeMessage(text="請實作任務B獨立功能", chat_id=12, message_id=2)
             with pytest.raises(RuntimeError, match="ack failed"):
-                await bot._on_message(_update(msg_b, 12), SimpleNamespace())
+                await _send_new_task(bot, msg_b, 12)
             assert not bot._PENDING_TURNS.get("private:12")
             registry = TaskRegistry(tmp_path / "sessions.sqlite3")
             b_tasks = [t for t in registry.list_tasks("private:12") if t.title.startswith("請實作任務B")]
