@@ -581,7 +581,10 @@ def test_unthreaded_continuation_asks_when_ambiguous(monkeypatch, tmp_path: Path
                 body = msg.sent[-1].text
                 assert first.task_id in body and second.task_id in body
                 assert "/task" in body
-        assert calls == []
+        # Ambiguous short prompts now ask the selected primary CLI for a
+        # strict routing decision. Its malformed response cannot dispatch.
+        assert len(calls) == 4
+        assert calls == ["private:101"] * 4
         _reset(bot)
 
     asyncio.run(_run())

@@ -267,6 +267,7 @@ def relay_turn(
     store: SessionStore | None = None,
     workspace: str | None = None,
     on_progress: Callable[[str], None] | None = None,
+    routing_only: bool = False,
 ) -> RunResult:
     """依 thread_key 接續或建立後端 session，送出一輪 prompt。"""
     ws = workspace or _default_workspace()
@@ -277,9 +278,9 @@ def relay_turn(
     delivered_through = int(state.get("next_handoff_id", 0))
 
     if backend == "cursor":
-        result = _relay_cursor(st, thread_key, ws, prompt)
+        result = _relay_cursor(st, thread_key, ws, prompt, routing_only=routing_only)
     elif backend == "codex":
-        result = _relay_codex(st, thread_key, ws, prompt, on_progress=on_progress)
+        result = _relay_codex(st, thread_key, ws, prompt, on_progress=on_progress, routing_only=routing_only)
     elif backend == "claude":
         result = _relay_claude(st, thread_key, ws, prompt)
     elif backend == "opencode":
@@ -292,7 +293,10 @@ def relay_turn(
     return result
 
 
-def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
+def _relay_cursor(
+    store: SessionStore, thread_key: str, workspace: str, prompt: str,
+    *, routing_only: bool = False,
+) -> RunResult:
     import os
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
@@ -311,9 +315,11 @@ def _relay_cursor(store: SessionStore, thread_key: str, workspace: str, prompt: 
         sid = prov.create_session()
         store.upsert(thread_key, "cursor", sid, workspace=workspace)
     effective_prompt = (
-        apply_cursor_worker_prefix(prompt)
-        if _is_relay_worker_thread(thread_key)
-        else apply_cursor_harness_prefix(prompt)
+        prompt if routing_only else (
+            apply_cursor_worker_prefix(prompt)
+            if _is_relay_worker_thread(thread_key)
+            else apply_cursor_harness_prefix(prompt)
+        )
     )
     effective_prompt = ConversationContext(store.db_path).prompt(
         thread_key, effective_prompt, include_history=fresh, consumer="cursor"
@@ -382,6 +388,7 @@ def _relay_codex(
     prompt: str,
     *,
     on_progress: Callable[[str], None] | None = None,
+    routing_only: bool = False,
 ) -> RunResult:
     import os
 
@@ -406,14 +413,14 @@ def _relay_codex(
     else:
         raise ValueError("TGR_CODEX_TRANSPORT must be cli or app-server")
     sid = store.get(thread_key, "codex")
-    worker = _run_codex_cursor_worker(store, thread_key, workspace, prompt)
+    worker = None if routing_only else _run_codex_cursor_worker(store, thread_key, workspace, prompt)
     if worker is not None:
         choice = choose_codex_worker()
         worker_label = (choice.provider or "Cursor").capitalize()
         codex_prompt = _codex_orchestrator_prompt(
             prompt, worker, thread_key=thread_key, worker_name=worker_label
         )
-    elif choose_codex_worker().mode == "native" and (
+    elif not routing_only and choose_codex_worker().mode == "native" and (
         route_text(prompt, load_task_router_config().config).route == Route.DELEGATE
         or _is_relay_worker_thread(thread_key)
     ):

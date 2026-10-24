@@ -45,7 +45,9 @@ def test_telegram_natural_followup_uses_focused_task_without_reply(monkeypatch, 
     calls = []
 
     def relay(**kw):
-        calls.append((kw["thread_key"], kw["prompt"]))
+        calls.append((kw["thread_key"], kw["prompt"], kw.get("routing_only", False)))
+        if kw.get("routing_only"):
+            return RunResult(stdout='{"action":"task","task_id":"' + first.task_id + '"}', stderr="", returncode=0)
         return RunResult(stdout="修正完成", stderr="", returncode=0)
 
     async def scenario():
@@ -55,12 +57,14 @@ def test_telegram_natural_followup_uses_focused_task_without_reply(monkeypatch, 
                 msg = FakeMessage(text="剛剛那個 API 再修一下", chat_id=19, message_id=100)
                 await bot._on_message(_update(msg, 19), SimpleNamespace())
                 await _drain(bot)
-                assert calls == [(first.worker_key, "剛剛那個 API 再修一下")]
+                assert len(calls) == 2
+                assert calls[0][0] == "private:19" and calls[0][2]
+                assert calls[1] == (first.worker_key, "剛剛那個 API 再修一下", False)
                 assert registry.focused_task("private:19").task_id == first.task_id
                 status = FakeMessage(text="進度", chat_id=19, message_id=101)
                 await bot._on_message(_update(status, 19), SimpleNamespace())
                 assert first.task_id in status.sent[-1].text
-                assert len(calls) == 1
+                assert len(calls) == 2
         finally:
             _reset(bot)
 
@@ -82,7 +86,12 @@ def test_explicit_task_switch_then_natural_followup(monkeypatch, tmp_path: Path)
         try:
             with patch.object(
                 bot, "relay_turn",
-                side_effect=lambda **kw: (calls.append(kw["thread_key"]) or RunResult("ok", "", 0)),
+                side_effect=lambda **kw: (
+                    calls.append(kw["thread_key"]) or RunResult(
+                        '{"action":"task","task_id":"' + first.task_id + '"}'
+                        if kw.get("routing_only") else "ok", "", 0
+                    )
+                ),
             ):
                 command = FakeMessage(text="", chat_id=19, message_id=50)
                 await bot._cmd_task(
@@ -95,6 +104,6 @@ def test_explicit_task_switch_then_natural_followup(monkeypatch, tmp_path: Path)
             _reset(bot)
 
     asyncio.run(scenario())
-    assert calls == [first.worker_key]
+    assert calls == ["private:19", first.worker_key]
     assert TaskRegistry(tmp_path / "sessions.sqlite3").focused_task("private:19").task_id == first.task_id
     assert first.task_id != second.task_id
