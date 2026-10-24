@@ -328,6 +328,7 @@ def _relay_cursor(
         workspace=workspace,
         session_id=sid,
         prompt=effective_prompt,
+        thread_key=thread_key,
     )
 
 
@@ -353,6 +354,7 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
         prompt=ConversationContext(store.db_path).prompt(
             thread_key, prompt, include_history=not sid, consumer="claude"
         ),
+        thread_key=thread_key,
     )
     display_text, new_sid = parse_claude_output(raw.stdout)
     if new_sid and new_sid != sid:
@@ -372,6 +374,7 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
         prompt=ConversationContext(store.db_path).prompt(
             thread_key, prompt, include_history=not sid, consumer="opencode"
         ),
+        thread_key=thread_key,
     )
     display_text, new_sid = parse_opencode_output(raw.stdout)
     # 優先存真正的 session id；若 JSON 沒有則存 marker 讓下次加 -c
@@ -435,7 +438,7 @@ def _relay_codex(
         on_progress=on_progress,
         **({"thread_key": thread_key, "on_session": lambda sid: store.upsert(
             thread_key, "codex", sid, workspace=workspace
-        )} if transport == "app-server" else {}),
+        )} if transport == "app-server" else {"thread_key": thread_key}),
     )
     if res.session_id and res.session_id != sid:
         store.upsert(thread_key, "codex", res.session_id, workspace=workspace)
