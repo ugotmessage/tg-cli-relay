@@ -187,6 +187,7 @@ class CodexAppServerProvider:
         self, *, workspace: str, session_id: str | None, prompt: str,
         on_progress: Callable[[str], None] | None = None,
         thread_key: str | None = None,
+        on_session: Callable[[str], None] | None = None,
     ) -> RunResult:
         timeout = float(os.environ.get("TGR_CODEX_APP_TURN_TIMEOUT", "7200"))
         runtime = _runtime_for(self.codex_bin)
@@ -195,6 +196,7 @@ class CodexAppServerProvider:
                 runtime.client, workspace=workspace, session_id=session_id,
                 prompt=prompt, model=self.model, bypass=self.bypass,
                 timeout=timeout, on_progress=on_progress, thread_key=thread_key,
+                on_session=on_session,
             ),
             timeout=timeout + 90 if timeout > 0 else None,
         )
@@ -205,6 +207,7 @@ async def _run_turn(
     prompt: str, model: str | None, bypass: bool, timeout: float,
     on_progress: Callable[[str], None] | None,
     thread_key: str | None = None,
+    on_session: Callable[[str], None] | None = None,
 ) -> RunResult:
     await client.start()
     policy = "danger-full-access" if bypass else os.environ.get("TGR_CODEX_APP_SANDBOX", "workspace-write")
@@ -222,6 +225,10 @@ async def _run_turn(
         thread_id = (started or {}).get("thread", {}).get("id")
         if not isinstance(thread_id, str) or not thread_id:
             raise CodexAppServerError("thread/start did not return a thread ID")
+    # Commit the provider's new thread identity before a potentially long turn.
+    # This also permits resume after a process crash/interruption.
+    if on_session:
+        on_session(thread_id)
     inbox = client.subscribe()  # subscribe before turn/start, so no fast-completion race
     turn_id: str | None = None
     messages: list[str] = []
@@ -278,11 +285,14 @@ async def _run_turn(
             try:
                 await asyncio.wait_for(receive(), timeout)
             except asyncio.TimeoutError:
-                await client.request(
-                    "turn/interrupt", {"threadId": thread_id, "turnId": turn_id},
-                    timeout=10,
-                )
-                raise CodexAppServerError(f"Codex App Server turn exceeded {timeout:g} seconds")
+                error = f"Codex App Server turn exceeded {timeout:g} seconds"
+                try:
+                    await client.request(
+                        "turn/interrupt", {"threadId": thread_id, "turnId": turn_id},
+                        timeout=10,
+                    )
+                except Exception:
+                    log.warning("Codex timed out; failed to interrupt its turn")
         else:
             await receive()
     except asyncio.CancelledError:
