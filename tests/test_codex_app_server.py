@@ -153,3 +153,64 @@ def test_legacy_disable_does_not_force_subagent_prompt(monkeypatch):
     monkeypatch.delenv("TGR_WORKER_PROVIDER", raising=False)
     monkeypatch.setenv("TGR_CODEX_DELEGATE_TO_CURSOR", "0")
     assert choose_codex_worker().mode == "off"
+
+
+def test_steer_only_targets_running_main_thread():
+    from tg_cli_relay.providers.codex_app_server import _steer_active_turn
+
+    async def run():
+        client = FakeAppServer()
+        client.active_turns = {"private:101": ("t1", "r1")}
+        assert await _steer_active_turn(client, "private:102", "不要重建") is False
+        assert client.calls == []
+        assert await _steer_active_turn(client, "private:101", "只補缺檔") is True
+        assert client.calls == [
+            ("turn/steer", {
+                "threadId": "t1", "expectedTurnId": "r1",
+                "input": [{"type": "text", "text": "只補缺檔"}]
+            }),
+        ]
+
+    # FakeAppServer needs to acknowledge steer.
+    original = FakeAppServer.request
+    async def request(self, method, params, **kwargs):
+        if method == "turn/steer":
+            self.calls.append((method, params))
+            return {}
+        return await original(self, method, params, **kwargs)
+    with patch.object(FakeAppServer, "request", request):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("steered", [True, False])
+def test_telegram_reply_steers_or_queues_if_active(tmp_path, monkeypatch, steered):
+    from tg_cli_relay import telegram_bot as bot
+    from tg_cli_relay.task_registry import TaskRegistry
+    from test_task_isolation import FakeMessage, _env, _reset, _update
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    monkeypatch.setenv("TGR_CODEX_TRANSPORT", "app-server")
+    reg = TaskRegistry(tmp_path / "sessions.sqlite3")
+    reg.bind_parent_message(parent_key="private:101", message_id=11, backend="codex")
+    msg = FakeMessage(text="不要重建，只補缺檔", chat_id=101, message_id=12, reply_to=11)
+
+    async def run():
+        _reset(bot)
+        bot._ACTIVE_RELAY_THREADS.add("private:101")
+        try:
+            with patch.object(bot, "steer_codex_turn", return_value=steered) as steer:
+                await bot._on_message(_update(msg, 101), SimpleNamespace())
+                steer.assert_called_once()
+                assert reg.get_parent_message_backend("private:101", 12) == (
+                    "codex" if steered else None
+                )
+                if steered:
+                    assert msg.sent[-1].text == "已追加到目前執行中的 Codex 工作。"
+                    assert "private:101" not in bot._PENDING_TURNS
+                else:
+                    assert len(bot._PENDING_TURNS["private:101"]) == 1
+                    assert "已加入等待佇列" in msg.sent[-1].text
+        finally:
+            _reset(bot)
+
+    asyncio.run(run())
