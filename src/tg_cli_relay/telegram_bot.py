@@ -1243,18 +1243,23 @@ async def _execute_relay_turn(
 
         sid = store.get(key, backend)
         model = effective_model_for_backend(store, key, backend)
-        await _send_relay_output(
-            msg,
-            body,
-            backend=backend,
-            model=model,
-            sid=sid,
-            attachment_config=attachment_config,
-            segments=res.stdout_segments,
-            job=job,
-            registry=registry,
-            parent_key=key if job is None else None,
-        )
+        try:
+            await _send_relay_output(
+                msg,
+                body,
+                backend=backend,
+                model=model,
+                sid=sid,
+                attachment_config=attachment_config,
+                segments=res.stdout_segments,
+                job=job,
+                registry=registry,
+                parent_key=key if job is None else None,
+            )
+        except Exception:
+            # Telegram network failures must not prevent timed-out turns from
+            # scheduling recovery or block the FIFO main conversation.
+            log.exception("Telegram delivery failed after CLI execution thread=%s", key)
         return res.returncode
     finally:
         _ACTIVE_RELAY_THREADS.discard(key)
