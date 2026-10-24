@@ -1758,12 +1758,10 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
 
     bare_continuation = _is_bare_continuation(prompt)
     contextual_followup = _is_contextual_followup(prompt)
-    if bare_continuation or contextual_followup:
-        # An explicit focus + a bare "continue", or a single possible task,
-        # can bypass semantic resolution. Other focus is only a hint.
-        target = (focused if bare_continuation else None) or (
-            tasks[0] if len(tasks) == 1 else None
-        )
+    if bare_continuation:
+        # A bare "continue" follows an explicitly selected task, or a sole
+        # existing task; natural-language follow-ups are less deterministic.
+        target = focused or (tasks[0] if len(tasks) == 1 else None)
         if target is not None:
             await _resume_existing_task(
                 target, msg=msg, prompt=prompt, store_path=store_path,
@@ -1773,7 +1771,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
 
     if tasks and (
         bare_continuation or contextual_followup
-        or might_refer_to_task(prompt, tasks)
+        or (decision.route != Route.DELEGATE and might_refer_to_task(prompt, tasks))
     ):
         if _task_context_enabled():
             turn = QueuedTurn(
