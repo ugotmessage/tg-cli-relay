@@ -30,6 +30,7 @@ from tg_cli_relay.relay import effective_model_for_backend, relay_turn
 from tg_cli_relay.providers.codex_app_server import steer_codex_turn, interrupt_codex_turn
 from tg_cli_relay.providers.process_control import request_interrupt, clear_interrupt, interrupt_requested
 from tg_cli_relay.conversation_context import ConversationContext
+from tg_cli_relay.durable_queue import DurableQueue, QueueRecord
 from tg_cli_relay.session_store import Backend, SessionStore
 from tg_cli_relay.task_registry import TaskRecord, TaskRegistry, make_task_title
 from tg_cli_relay.task_router import Route
@@ -57,6 +58,7 @@ class RelayJob:
     status: str = "starting"
     latest_progress: str = "等待 worker 啟動"
     title: str = ""
+    durable_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -72,6 +74,7 @@ class QueuedTurn:
     worker_key: str | None = None
     title: str = ""
     kind: str = "parent"
+    durable_id: int | None = None
 
 
 _ACTIVE_JOBS: dict[str, RelayJob] = {}
@@ -81,7 +84,135 @@ _PENDING_TURNS: dict[str, deque[QueuedTurn]] = {}
 _PENDING_TASK_TURNS: dict[str, deque[QueuedTurn]] = {}
 _QUEUE_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
 _TASK_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
+_REVIEW_REQUIRED_THREADS: set[str] = set()
+_RESTORED_BOT = None
 SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
+
+
+class _RestoredChat:
+    """Narrow Telegram chat facade for messages recovered from SQLite."""
+    def __init__(self, bot, chat_id: int, topic_id: int | None) -> None:
+        self.bot, self.chat_id, self.topic_id = bot, chat_id, topic_id
+
+    async def send_action(self, *, action) -> None:
+        args = {"chat_id": self.chat_id, "action": action}
+        if self.topic_id is not None:
+            args["message_thread_id"] = self.topic_id
+        await self.bot.send_chat_action(**args)
+
+
+class _RestoredMessage:
+    """Send results to the original chat/topic without refetching Telegram history."""
+    def __init__(self, bot, row: QueueRecord) -> None:
+        self.bot = bot
+        self.chat_id = row.chat_id
+        self.message_id = row.message_id
+        self.message_thread_id = row.topic_id
+        self.chat = _RestoredChat(bot, row.chat_id, row.topic_id)
+
+    async def reply_text(self, text: str):
+        args = {"chat_id": self.chat_id, "text": text}
+        if self.message_thread_id is not None:
+            args["message_thread_id"] = self.message_thread_id
+        return await self.bot.send_message(**args)
+
+    async def reply_document(self, **kwargs):
+        args = {"chat_id": self.chat_id, **kwargs}
+        if self.message_thread_id is not None:
+            args["message_thread_id"] = self.message_thread_id
+        return await self.bot.send_document(**args)
+
+
+def _persist_turn(turn: QueuedTurn) -> int:
+    if turn.durable_id is None:
+        msg = turn.msg
+        turn.durable_id = DurableQueue(turn.store_path).add(
+            thread_key=turn.key, backend=turn.backend,
+            prompt=turn.prompt, kind=turn.kind,
+            chat_id=int(msg.chat_id), message_id=int(msg.message_id),
+            topic_id=getattr(msg, "message_thread_id", None),
+            task_id=turn.task_id, worker_key=turn.worker_key, title=turn.title,
+        )
+    return turn.durable_id
+
+
+def _persist_finish(turn: QueuedTurn, status: str = "done") -> None:
+    if turn.durable_id is not None:
+        DurableQueue(turn.store_path).finish(turn.durable_id, status=status)
+
+
+def _turn_from_record(row: QueueRecord, bot) -> QueuedTurn:
+    return QueuedTurn(
+        msg=_RestoredMessage(bot, row), key=row.thread_key,
+        backend=row.backend, prompt=row.prompt,
+        store_path=Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3")),
+        attachment_config=_attachment_config(), route=Route.DIRECT,
+        task_id=row.task_id, worker_key=row.worker_key,
+        title=row.title, kind=row.kind, durable_id=row.id,
+    )
+
+
+async def _restore_durable_queue(bot) -> None:
+    """Replay only unstarted turns. Unknown in-flight work stops that thread."""
+    global _RESTORED_BOT
+    _RESTORED_BOT = bot
+    db = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3"))
+    ledger = DurableQueue(db)
+    uncertain = ledger.mark_interrupted_uncertain()
+    _REVIEW_REQUIRED_THREADS.update(ledger.review_threads())
+    restored = 0
+    for row in ledger.load_queued():
+        turn = _turn_from_record(row, bot)
+        if row.kind == "task_followup" and row.task_id:
+            _PENDING_TASK_TURNS.setdefault(row.task_id, deque()).append(turn)
+        else:
+            _PENDING_TURNS.setdefault(row.thread_key, deque()).append(turn)
+        restored += 1
+    for key in list(_PENDING_TURNS):
+        if key not in _REVIEW_REQUIRED_THREADS:
+            _schedule_queue_drain(key)
+    for task_id, turns in list(_PENDING_TASK_TURNS.items()):
+        if turns and turns[0].key not in _REVIEW_REQUIRED_THREADS:
+            _schedule_task_drain(task_id)
+    log.warning(
+        "Restored %d queued turns; %d interrupted turns require review; paused chats=%d",
+        restored, uncertain, len(_REVIEW_REQUIRED_THREADS),
+    )
+
+
+async def _cmd_queue(update, context) -> None:
+    """Visibility plus explicit release of crash-uncertain conversations."""
+    if not _check_auth(update) or update.message is None:
+        return
+    key = _get_thread_key(update)
+    ledger = DurableQueue(_get_store().db_path)
+    args = getattr(context, "args", []) or []
+    if args and args[0].lower() == "resume":
+        count = ledger.reviewed(key)
+        _REVIEW_REQUIRED_THREADS.discard(key)
+        _schedule_queue_drain(key)
+        for task_id, turns in list(_PENDING_TASK_TURNS.items()):
+            if turns and turns[0].key == key:
+                _schedule_task_drain(task_id)
+        await update.message.reply_text(
+            f"已確認 {count} 筆先前執行狀態不明的回合，"
+            "不會自動重跑它們；已恢復此對話其餘等待訊息。"
+            "請自行檢查未完成工作的結果。"
+        )
+        return
+    rows = ledger.open_items(key)
+    if not rows:
+        await update.message.reply_text("目前沒有待處理或需人工確認的訊息。")
+        return
+    state = "⏸ 已暫停；請檢查後用 /queue resume" if key in _REVIEW_REQUIRED_THREADS else "▶ 排隊處理中"
+    labels = {"queued": "等待", "running": "執行中", "needs_review": "結果不明"}
+    from itertools import islice
+    lines = [state]
+    for row in islice(rows, 20):
+        title = make_task_title(row.prompt)
+        lines.append(f"#{row.id} · Telegram {row.message_id} · {labels.get(row.status, row.status)} · {title[:65]}")
+    lines.append("崩潰前已執行的工作不會自動重跑；/queue resume 只恢復等待佇列。")
+    await update.message.reply_text("\n".join(lines))
 
 
 def _task_banner(job: RelayJob | TaskRecord | None) -> str:
