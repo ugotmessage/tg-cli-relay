@@ -162,7 +162,13 @@ async def _restore_durable_queue(bot) -> None:
     uncertain = ledger.mark_interrupted_uncertain()
     _REVIEW_REQUIRED_THREADS.update(ledger.review_threads())
     restored = 0
+    task_registry = TaskRegistry(db)
     for row in ledger.load_queued():
+        # Legacy startup migration marks all queued tasks interrupted. If their
+        # initial turn was durably accepted but never started, they are safe
+        # to restore and should still appear as queued in /task.
+        if row.kind == "new_task" and row.task_id:
+            task_registry.update_status(row.task_id, "queued")
         turn = _turn_from_record(row, bot)
         if row.kind == "task_followup" and row.task_id:
             _PENDING_TASK_TURNS.setdefault(row.task_id, deque()).append(turn)
