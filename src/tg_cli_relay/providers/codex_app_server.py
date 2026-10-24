@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import Any
 
 from tg_cli_relay.providers.base import RunResult
+from tg_cli_relay.providers.process_control import interrupt_requested
 
 log = logging.getLogger(__name__)
 
@@ -247,6 +248,11 @@ async def _run_turn(
             raise CodexAppServerError("turn/start did not return a turn ID")
         if thread_key:
             client.active_turns[thread_key] = (thread_id, turn_id)
+            # /stop can race with thread/start or turn/start; honor the latch.
+            if interrupt_requested(thread_key):
+                await client.request("turn/interrupt", {
+                    "threadId": thread_id, "turnId": turn_id,
+                }, timeout=10)
         async def receive() -> None:
             nonlocal pending, error
             while True:
@@ -331,6 +337,32 @@ async def _steer_active_turn(client: AppServerClient, thread_key: str, prompt: s
         )
         return True
     except (CodexAppServerError, asyncio.TimeoutError):
+        return False
+
+
+async def _interrupt_active_turn(client: AppServerClient, thread_key: str) -> bool:
+    active = client.active_turns.get(thread_key)
+    if active is None:
+        return False
+    thread_id, turn_id = active
+    try:
+        await client.request(
+            "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=8,
+        )
+        return True
+    except (CodexAppServerError, asyncio.TimeoutError):
+        return False
+
+
+def interrupt_codex_turn(thread_key: str, codex_bin: str = "codex") -> bool:
+    """Ask Codex App Server to interrupt an active turn, without ending its thread."""
+    with _runtime_lock:
+        runtime = _runtimes.get(codex_bin)
+    if runtime is None:
+        return False
+    try:
+        return bool(runtime.run(_interrupt_active_turn(runtime.client, thread_key), timeout=12))
+    except Exception:
         return False
 
 
