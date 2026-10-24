@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 
 from tg_cli_relay.providers.base import RunResult
+from tg_cli_relay.providers.process_control import interruptible_run
 
 # Cursor CLI 會把最後一次 --model 寫入全域 cli-config；relay 預設必須顯式傳 auto，避免被其它 agent 呼叫污染。
 CURSOR_DEFAULT_MODEL = "auto"
@@ -91,6 +92,7 @@ class CursorAgentProvider:
         workspace: str,
         session_id: str | None,
         prompt: str,
+        thread_key: str | None = None,
     ) -> RunResult:
         cmd: list[str] = [
             self.agent_bin,
@@ -105,14 +107,12 @@ class CursorAgentProvider:
         cmd.append(prompt)
         timeout = self.timeout_seconds if self.timeout_seconds > 0 else None
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False,
-                env=os.environ.copy(),
-                timeout=timeout,
-            )
+            proc = (interruptible_run(
+                cmd, thread_key=thread_key, env=os.environ.copy(), timeout=timeout,
+            ) if thread_key is not None else subprocess.run(
+                cmd, capture_output=True, text=True, check=False,
+                env=os.environ.copy(), timeout=timeout,
+            ))
         except subprocess.TimeoutExpired as exc:
             err = (exc.stderr or "").strip()
             msg = f"agent 執行逾時（>{self.timeout_seconds} 秒）"
