@@ -119,6 +119,18 @@ class DurableQueue:
             """, (thread_key,))
             return cur.rowcount
 
+    def prune_terminal(self, *, retention_days: int = 30) -> int:
+        """Bound persisted message content without deleting waiting/review rows."""
+        if retention_days < 1:
+            raise ValueError("retention_days must be positive")
+        with self._conn() as con:
+            cur = con.execute("""
+                DELETE FROM relay_pending_turns
+                WHERE status IN ('done','cancelled','reviewed')
+                  AND updated_at < datetime('now', ?)
+            """, (f"-{retention_days} days",))
+            return cur.rowcount
+
     def load_queued(self) -> list[QueueRecord]:
         with self._conn() as con:
             rows = con.execute("""
