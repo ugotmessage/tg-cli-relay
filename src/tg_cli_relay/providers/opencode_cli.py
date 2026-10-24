@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import dataclass
 
 from tg_cli_relay.providers.base import RunResult
+from tg_cli_relay.providers.process_control import interruptible_run
 
 # 格式為 provider/model-name；完整清單參考 opencode 官方文件
 OPENCODE_MODELS: list[str] = [
@@ -39,6 +40,7 @@ class OpencodeCliProvider:
         workspace: str,
         session_id: str | None,
         prompt: str,
+        thread_key: str | None = None,
     ) -> RunResult:
         cmd: list[str] = [self.opencode_bin, "run", "--format", "json"]
         if self.model:
@@ -46,14 +48,12 @@ class OpencodeCliProvider:
         if session_id:
             cmd.append("-c")  # 有過 session 就接續（最後一個）
         cmd.append(prompt)
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=workspace,
-            env=os.environ.copy(),
-        )
+        proc = (interruptible_run(
+            cmd, thread_key=thread_key, cwd=workspace, env=os.environ.copy(),
+        ) if thread_key is not None else subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+            cwd=workspace, env=os.environ.copy(),
+        ))
         return RunResult(stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode)
 
 

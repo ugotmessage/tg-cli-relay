@@ -19,7 +19,7 @@ def _read_timeout_env(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
-def build_resilient_application(token: str) -> Application:
+def build_resilient_application(token: str, *, post_init=None) -> Application:
     connect_timeout = _read_timeout_env("TGR_TELEGRAM_CONNECT_TIMEOUT", 30.0)
     read_timeout = _read_timeout_env("TGR_TELEGRAM_READ_TIMEOUT", 60.0)
     fallback_ips = load_fallback_ips()
@@ -41,11 +41,13 @@ def build_resilient_application(token: str) -> Application:
     except ValueError:
         concurrent_updates = 8
 
-    return (
+    builder = (
         ApplicationBuilder()
         .token(token)
         .request(request)
         .get_updates_request(updates_request)
         .concurrent_updates(concurrent_updates)
-        .build()
     )
+    if post_init is not None:
+        builder = builder.post_init(post_init)
+    return builder.build()

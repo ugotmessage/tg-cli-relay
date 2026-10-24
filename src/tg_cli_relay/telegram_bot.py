@@ -27,7 +27,8 @@ from tg_cli_relay.attachments import (
 )
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
 from tg_cli_relay.task_context_resolver import might_refer_to_task, parse_resolution, resolution_prompt
-from tg_cli_relay.providers.codex_app_server import steer_codex_turn
+from tg_cli_relay.providers.codex_app_server import steer_codex_turn, interrupt_codex_turn
+from tg_cli_relay.providers.process_control import request_interrupt, clear_interrupt
 from tg_cli_relay.conversation_context import ConversationContext
 from tg_cli_relay.session_store import Backend, SessionStore
 from tg_cli_relay.task_registry import TaskRecord, TaskRegistry, make_task_title
@@ -46,6 +47,8 @@ log = logging.getLogger(__name__)
 TG_CHUNK = 3800
 _BOT_LOCK_FILE = None
 _ACTIVE_RELAY_THREADS: set[str] = set()
+_ACTIVE_PARENT_BACKENDS: dict[str, Backend] = {}
+_ACTIVE_PARENT_REQUESTS: dict[str, str] = {}
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
 
@@ -487,6 +490,83 @@ def _check_auth(update) -> bool:  # type: ignore[no-untyped-def]
     return allow is None or update.effective_user.id in allow
 
 
+async def _signal_main_stop(key: str, backend: Backend) -> None:
+    """Interrupt the current main CLI turn; never touch Agent-managed workers."""
+    # Set the latch before the provider has necessarily spawned its process.
+    request_interrupt(key)
+    if backend == "codex" and os.environ.get("TGR_CODEX_TRANSPORT", "cli").lower() == "app-server":
+        await asyncio.to_thread(
+            interrupt_codex_turn, key, os.environ.get("TGR_CODEX_BIN", "codex")
+        )
+
+
+async def _cmd_stop(update, context) -> None:  # type: ignore[no-untyped-def]
+    if not _check_auth(update) or update.message is None:
+        return
+    key = _get_thread_key(update)
+    if key not in _ACTIVE_PARENT_BACKENDS:
+        await update.message.reply_text("目前沒有執行中的主對話工作。等待佇列不受影響。")
+        return
+    await _signal_main_stop(key, _ACTIVE_PARENT_BACKENDS[key])
+    await update.message.reply_text(
+        "已要求停止目前主對話的執行（不會自動接續這筆工作）；"
+        "結束後會繼續處理原本的等待佇列。已經修改的檔案不會自動回復。"
+    )
+
+
+async def _cmd_force(update, context) -> None:  # type: ignore[no-untyped-def]
+    if not _check_auth(update) or update.message is None:
+        return
+    raw = update.message.text or ""
+    parts = raw.split(maxsplit=1)
+    prompt = parts[1].strip() if len(parts) == 2 else ""
+    if not prompt:
+        await update.message.reply_text("用法: /force <立即修正的指令>")
+        return
+    key = _get_thread_key(update)
+    backend = _ACTIVE_PARENT_BACKENDS.get(key)
+    if backend is None:
+        await update.message.reply_text("目前主對話沒有執行中的工作，請直接傳送一般訊息。")
+        return
+    if backend == "codex" and os.environ.get("TGR_CODEX_TRANSPORT", "cli").lower() == "app-server":
+        # Prefer native, same-turn steering: it does not discard in-flight work.
+        steered = await asyncio.to_thread(
+            steer_codex_turn, key, prompt, os.environ.get("TGR_CODEX_BIN", "codex")
+        )
+        if steered:
+            await update.message.reply_text("已即時送入目前執行中的 Codex Turn。")
+            return
+
+    # Cursor/Claude/OpenCode/Codex CLI cannot accept arbitrary text inside an
+    # active subprocess. Interrupt it, then prioritize a new turn on the same
+    # provider session. Insert BEFORE interrupt so the queue cannot race ahead.
+    # An interrupted first turn may not yet have persisted its provider session.
+    # Supply the original request as *reference* rather than losing the context.
+    original = _ACTIVE_PARENT_REQUESTS.get(key, "")
+    if original:
+        retry_prompt = (
+            "Relay notice: The user is correcting the previous in-progress turn. "
+            "The previous request below is context ONLY; do not repeat or resume "
+            "it blindly. The user's new correction has priority.\n"
+            f"Previous request (context):\n{original[:8000]}\n\n"
+            f"New user correction:\n{prompt}"
+        )
+    else:
+        retry_prompt = prompt
+    turn = QueuedTurn(
+        msg=update.message, key=key, backend=backend, prompt=retry_prompt,
+        store_path=_get_store().db_path, attachment_config=_attachment_config(),
+        route=Route.DIRECT,
+    )
+    _PENDING_TURNS.setdefault(key, deque()).appendleft(turn)
+    await _signal_main_stop(key, backend)
+    await update.message.reply_text(
+        "已要求中止目前回合，修正指令已插入佇列最前面；"
+        "舊回合釋放後會使用相同的主對話 Session 執行。"
+    )
+    _schedule_queue_drain(key)
+
+
 async def _cmd_reset(update, context) -> None:  # type: ignore[no-untyped-def]
     if not _check_auth(update):
         return
@@ -757,6 +837,8 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
     cfg = _attachment_config()
     lines = [
         "/reset — 清除對話，開啟新 session",
+        "/force <指令> — 立即修正執行中的主對話（支援各 CLI）",
+        "/stop — 要求停止正在執行的主對話",
         "/status — 查看目前後端與 session 狀態",
         "/provider [名稱] — 查看或切換 CLI provider",
         "/model [provider] [名稱] — 查看或切換模型",
@@ -1527,16 +1609,24 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
             parent_key=turn.key, message_id=mid, backend=turn.backend
         )
     _ACTIVE_RELAY_THREADS.add(turn.key)
-    await _execute_relay_turn(
-        msg=turn.msg,
-        key=turn.key,
-        backend=turn.backend,
-        prompt=turn.prompt,
-        store=SessionStore(turn.store_path),
-        attachment_config=turn.attachment_config,
-        show_typing=True,
-    )
-    _schedule_queue_drain(turn.key)
+    _ACTIVE_PARENT_BACKENDS[turn.key] = turn.backend
+    _ACTIVE_PARENT_REQUESTS[turn.key] = turn.prompt
+    try:
+        await _execute_relay_turn(
+            msg=turn.msg,
+            key=turn.key,
+            backend=turn.backend,
+            prompt=turn.prompt,
+            store=SessionStore(turn.store_path),
+            attachment_config=turn.attachment_config,
+            show_typing=True,
+        )
+    finally:
+        _ACTIVE_RELAY_THREADS.discard(turn.key)
+        _ACTIVE_PARENT_BACKENDS.pop(turn.key, None)
+        _ACTIVE_PARENT_REQUESTS.pop(turn.key, None)
+        clear_interrupt(turn.key)
+        _schedule_queue_drain(turn.key)
 
 
 async def _drain_thread_queue(key: str) -> None:
@@ -1886,6 +1976,37 @@ def _acquire_bot_singleton(token: str) -> None:
     _BOT_LOCK_FILE = lock_file
 
 
+# Telegram command menu is overwritten on every successful bot startup.
+# Keep this list in sync with the registered handlers and /help.
+_BOT_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("help", "查看使用說明"),
+    ("force", "立即修正執行中的工作"),
+    ("stop", "要求停止目前的主對話"),
+    ("status", "查看 CLI、Session 與佇列"),
+    ("provider", "查看或切換 CLI"),
+    ("model", "查看或切換模型"),
+    ("task", "管理指定 Task"),
+    ("jobs", "查看背景工作"),
+    ("job", "查詢指定工作"),
+    ("router", "查看舊版路由設定"),
+    ("reset", "重置目前對話"),
+    ("new", "建立新主對話"),
+)
+
+
+async def _refresh_telegram_commands(app) -> None:
+    from telegram import BotCommand
+
+    try:
+        await app.bot.set_my_commands(
+            [BotCommand(command, description) for command, description in _BOT_COMMANDS]
+        )
+        log.info("Telegram 指令選單已重新註冊 (%d 個)", len(_BOT_COMMANDS))
+    except Exception:
+        # Network errors during menu registration must not prevent bot startup.
+        log.exception("Telegram 指令選單註冊失敗；請檢查 Telegram API 連線")
+
+
 def run_bot() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -1907,8 +2028,10 @@ def run_bot() -> None:
 
     from telegram.ext import CommandHandler, MessageHandler, filters
 
-    app = build_resilient_application(token)
+    app = build_resilient_application(token, post_init=_refresh_telegram_commands)
     app.add_handler(CommandHandler("reset", _cmd_reset))
+    app.add_handler(CommandHandler("force", _cmd_force))
+    app.add_handler(CommandHandler("stop", _cmd_stop))
     app.add_handler(CommandHandler("new", _cmd_reset))
     app.add_handler(CommandHandler("status", _cmd_status))
     app.add_handler(CommandHandler("provider", _cmd_provider))

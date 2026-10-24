@@ -137,7 +137,7 @@ def _run_external_worker(
             timeout_seconds=int(os.environ.get("TGR_CURSOR_DELEGATE_TIMEOUT", "3600")),
         )
         sid = sid or provider.create_session()
-        raw = provider.run_turn(workspace=workspace, session_id=sid, prompt=worker_prompt)
+        raw = provider.run_turn(workspace=workspace, session_id=sid, prompt=worker_prompt, thread_key=thread_key)
         effective = raw
         saved_sid = sid
     elif provider_name == "claude":
@@ -147,7 +147,7 @@ def _run_external_worker(
             timeout_seconds=int(os.environ.get("TGR_CLAUDE_TIMEOUT", "1800")),
             dangerously_skip_permissions=_env_enabled("TGR_CLAUDE_SKIP_PERMISSIONS"),
         )
-        raw = provider.run_turn(workspace=workspace, session_id=sid, prompt=worker_prompt)
+        raw = provider.run_turn(workspace=workspace, session_id=sid, prompt=worker_prompt, thread_key=thread_key)
         display, saved_sid = parse_claude_output(raw.stdout)
         effective = RunResult(stdout=display, stderr=raw.stderr, returncode=raw.returncode)
     elif provider_name == "opencode":
@@ -157,7 +157,7 @@ def _run_external_worker(
             opencode_bin=os.environ.get("TGR_OPENCODE_BIN", "opencode"),
             model=_get_model(store, thread_key, "opencode"),
         )
-        raw = provider.run_turn(workspace=workspace, session_id=None, prompt=worker_prompt)
+        raw = provider.run_turn(workspace=workspace, session_id=None, prompt=worker_prompt, thread_key=thread_key)
         display, _ = parse_opencode_output(raw.stdout)
         effective = RunResult(stdout=display, stderr=raw.stderr, returncode=raw.returncode)
         saved_sid = None
@@ -328,6 +328,7 @@ def _relay_cursor(
         workspace=workspace,
         session_id=sid,
         prompt=effective_prompt,
+        thread_key=thread_key,
     )
 
 
@@ -353,6 +354,7 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
         prompt=ConversationContext(store.db_path).prompt(
             thread_key, prompt, include_history=not sid, consumer="claude"
         ),
+        thread_key=thread_key,
     )
     display_text, new_sid = parse_claude_output(raw.stdout)
     if new_sid and new_sid != sid:
@@ -372,6 +374,7 @@ def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt
         prompt=ConversationContext(store.db_path).prompt(
             thread_key, prompt, include_history=not sid, consumer="opencode"
         ),
+        thread_key=thread_key,
     )
     display_text, new_sid = parse_opencode_output(raw.stdout)
     # 優先存真正的 session id；若 JSON 沒有則存 marker 讓下次加 -c
@@ -435,7 +438,7 @@ def _relay_codex(
         on_progress=on_progress,
         **({"thread_key": thread_key, "on_session": lambda sid: store.upsert(
             thread_key, "codex", sid, workspace=workspace
-        )} if transport == "app-server" else {}),
+        )} if transport == "app-server" else {"thread_key": thread_key}),
     )
     if res.session_id and res.session_id != sid:
         store.upsert(thread_key, "codex", res.session_id, workspace=workspace)
