@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from tg_cli_relay.providers.base import RunResult
+from tg_cli_relay.providers.process_control import interruptible_run, tracked_process
 
 # 完整清單執行 `codex models status` 或查官方文件
 CODEX_MODELS: list[str] = [
@@ -37,6 +38,7 @@ class CodexCliProvider:
         session_id: str | None,
         prompt: str,
         on_progress: Callable[[str], None] | None = None,
+        thread_key: str | None = None,
     ) -> RunResult:
         base: list[str] = [self.codex_bin]
         if self.model:
@@ -55,9 +57,11 @@ class CodexCliProvider:
         else:
             cmd = base + exec_args + [prompt]
         if on_progress is None:
-            proc = subprocess.run(
+            proc = (interruptible_run(
+                cmd, thread_key=thread_key, env=os.environ.copy(),
+            ) if thread_key is not None else subprocess.run(
                 cmd, capture_output=True, text=True, check=False, env=os.environ.copy()
-            )
+            ))
             raw_stdout, raw_stderr, returncode = proc.stdout, proc.stderr, proc.returncode
             messages = parse_messages_from_jsonl(raw_stdout)
         else:
@@ -65,23 +69,24 @@ class CodexCliProvider:
             messages: list[str] = []
             pending: str | None = None
             with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file:
+                opts = {"start_new_session": True} if thread_key and os.name == "posix" else {}
+                if thread_key and os.name == "nt":
+                    opts["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
                 proc_live = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=stderr_file,
-                    text=True,
-                    env=os.environ.copy(),
+                    cmd, stdout=subprocess.PIPE, stderr=stderr_file,
+                    text=True, env=os.environ.copy(), **opts,
                 )
-                assert proc_live.stdout is not None
-                for line in proc_live.stdout:
-                    raw_lines.append(line)
-                    message = parse_agent_message_line(line)
-                    if message is None:
-                        continue
-                    if pending is not None:
-                        on_progress(pending)
-                    pending = message
-                returncode = proc_live.wait()
+                with tracked_process(thread_key, proc_live):
+                    assert proc_live.stdout is not None
+                    for line in proc_live.stdout:
+                        raw_lines.append(line)
+                        message = parse_agent_message_line(line)
+                        if message is None:
+                            continue
+                        if pending is not None:
+                            on_progress(pending)
+                        pending = message
+                    returncode = proc_live.wait()
                 stderr_file.seek(0)
                 raw_stderr = stderr_file.read()
             raw_stdout = "".join(raw_lines)
