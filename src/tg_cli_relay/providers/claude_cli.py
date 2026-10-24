@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tg_cli_relay.providers.base import RunResult
+from tg_cli_relay.providers.process_control import interruptible_run
 
 CLAUDE_MODELS: list[str] = [
     "claude-opus-4-7",
@@ -37,6 +38,7 @@ class ClaudeCliProvider:
         workspace: str,
         session_id: str | None,
         prompt: str,
+        thread_key: str | None = None,
     ) -> RunResult:
         cmd: list[str] = [self.claude_bin, "--print", "--output-format", "json"]
         if self.dangerously_skip_permissions:
@@ -63,16 +65,13 @@ class ClaudeCliProvider:
 
         timeout = self.timeout_seconds if self.timeout_seconds > 0 else None
         try:
-            proc = subprocess.run(
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                check=False,
-                cwd=workspace,
-                env=env,
-                timeout=timeout,
-            )
+            proc = (interruptible_run(
+                cmd, thread_key=thread_key, input=prompt, cwd=workspace,
+                env=env, timeout=timeout,
+            ) if thread_key is not None else subprocess.run(
+                cmd, input=prompt, capture_output=True, text=True,
+                check=False, cwd=workspace, env=env, timeout=timeout,
+            ))
         except subprocess.TimeoutExpired as exc:
             err = (exc.stderr or "").strip()
             msg = f"claude 執行逾時（>{self.timeout_seconds} 秒）"
