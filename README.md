@@ -114,7 +114,6 @@ cp env.example .env
 | `TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX` | （未設定） | 設為 `1` 啟用 `--dangerously-bypass-approvals-and-sandbox` |
 | `TGR_CODEX_TRANSPORT` | `cli` | 預設沿用 `codex exec`；設 `app-server` 啟用持續連線、原生 Session 與執行中 Reply steering |
 | `TGR_CODEX_APP_TURN_TIMEOUT` | `7200` | App Server 單輪逾時（秒）；0 不設限制 |
-| `TGR_CODEX_CURSOR_RESULT_MAX_CHARS` | `24000` | 傳回 Codex 的 Cursor Worker 報告字元上限，避免 Worker 輸出耗用過多 Codex context |
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
 | `TGR_CLAUDE_SKIP_PERMISSIONS` | （未設定） | 設為 `1` 啟用 `--dangerously-skip-permissions` |
 | `TGR_OPENCODE_BIN` | `opencode` | OpenCode CLI 路徑 |
