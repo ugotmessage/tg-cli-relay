@@ -639,7 +639,7 @@ def test_delegate_mentioning_progress_still_opens_new_task(monkeypatch, tmp_path
             await _drain(bot)
         assert len(calls) == 1
         assert calls[0]["thread_key"] == "private:88"
-        assert not registry.list_tasks("private:88")
+        assert len(registry.list_tasks("private:88")) == 1  # Pre-existing Task remains; no new auto-Task
         _reset(bot)
 
     asyncio.run(_run())
