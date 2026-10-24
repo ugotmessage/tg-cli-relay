@@ -35,6 +35,7 @@ class AppServerClient:
         self.pending: dict[int, asyncio.Future[Any]] = {}
         self.subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self.next_id = 0
+        self.active_turns: dict[str, tuple[str, str]] = {}
         self.write_lock = asyncio.Lock()
         self.start_lock = asyncio.Lock()
 
@@ -77,6 +78,7 @@ class AppServerClient:
         for task in (self.reader, self.stderr_reader):
             if task is not None and not task.done():
                 task.cancel()
+        self.active_turns.clear()
         self._fail_pending("App Server stopped")
 
     async def _send(self, payload: dict[str, Any]) -> None:
@@ -154,6 +156,7 @@ class AppServerClient:
         except Exception as exc:
             log.warning("Codex App Server reader failed: %s", exc)
         finally:
+            self.active_turns.clear()
             self._fail_pending("Codex App Server disconnected")
 
     async def _drain_stderr(self) -> None:
@@ -183,6 +186,7 @@ class CodexAppServerProvider:
     def run_turn(
         self, *, workspace: str, session_id: str | None, prompt: str,
         on_progress: Callable[[str], None] | None = None,
+        thread_key: str | None = None,
     ) -> RunResult:
         timeout = float(os.environ.get("TGR_CODEX_APP_TURN_TIMEOUT", "7200"))
         runtime = _runtime_for(self.codex_bin)
@@ -190,7 +194,7 @@ class CodexAppServerProvider:
             _run_turn(
                 runtime.client, workspace=workspace, session_id=session_id,
                 prompt=prompt, model=self.model, bypass=self.bypass,
-                timeout=timeout, on_progress=on_progress,
+                timeout=timeout, on_progress=on_progress, thread_key=thread_key,
             ),
             timeout=timeout + 90 if timeout > 0 else None,
         )
@@ -200,6 +204,7 @@ async def _run_turn(
     client: AppServerClient, *, workspace: str, session_id: str | None,
     prompt: str, model: str | None, bypass: bool, timeout: float,
     on_progress: Callable[[str], None] | None,
+    thread_key: str | None = None,
 ) -> RunResult:
     await client.start()
     policy = "danger-full-access" if bypass else os.environ.get("TGR_CODEX_APP_SANDBOX", "workspace-write")
@@ -233,6 +238,8 @@ async def _run_turn(
         turn_id = (started_turn or {}).get("turn", {}).get("id")
         if not turn_id:
             raise CodexAppServerError("turn/start did not return a turn ID")
+        if thread_key:
+            client.active_turns[thread_key] = (thread_id, turn_id)
         async def receive() -> None:
             nonlocal pending, error
             while True:
@@ -286,6 +293,8 @@ async def _run_turn(
                 log.warning("Failed to interrupt cancelled Codex turn")
         raise
     finally:
+        if thread_key and client.active_turns.get(thread_key) == (thread_id, turn_id):
+            client.active_turns.pop(thread_key, None)
         client.unsubscribe(inbox)
     if pending:
         messages.append(pending)
@@ -294,6 +303,37 @@ async def _run_turn(
         stdout=text, stderr=error or "", returncode=1 if error else 0,
         session_id=thread_id, stdout_segments=messages if len(messages) > 1 else None,
     )
+
+
+async def _steer_active_turn(client: AppServerClient, thread_key: str, prompt: str) -> bool:
+    """A message can steer only an already running, matching logical parent."""
+    active = client.active_turns.get(thread_key)
+    if active is None:
+        return False
+    thread_id, turn_id = active
+    try:
+        await client.request(
+            "turn/steer", {
+                "threadId": thread_id,
+                "expectedTurnId": turn_id,
+                "input": [{"type": "text", "text": prompt}],
+            }, timeout=8,
+        )
+        return True
+    except (CodexAppServerError, asyncio.TimeoutError):
+        return False
+
+
+def steer_codex_turn(thread_key: str, prompt: str, codex_bin: str = "codex") -> bool:
+    """Synchronous, non-creating steering entry point for Telegram replies."""
+    with _runtime_lock:
+        runtime = _runtimes.get(codex_bin)
+    if runtime is None:
+        return False
+    try:
+        return bool(runtime.run(_steer_active_turn(runtime.client, thread_key, prompt), timeout=12))
+    except Exception:
+        return False
 
 
 class _AppServerRuntime:
