@@ -175,6 +175,27 @@ async def _restore_durable_queue(bot) -> None:
     for task_id, turns in list(_PENDING_TASK_TURNS.items()):
         if turns and turns[0].key not in _REVIEW_REQUIRED_THREADS:
             _schedule_task_drain(task_id)
+    # Do not silently hide a paused conversation after service restart.
+    for key in list(_REVIEW_REQUIRED_THREADS):
+        rows = ledger.open_items(key)
+        if not rows:
+            continue
+        sample = rows[0]
+        try:
+            kwargs = {
+                "chat_id": sample.chat_id,
+                "text": (
+                    "⚠️ Relay 重啟後發現上一輪工作執行狀態不明。"
+                    "為避免重複執行，這個對話的等待訊息已暫停。"
+                    "\n使用 /queue 查看，再用 /queue resume 確認並放行等待訊息。"
+                    "結果不明的工作不會自動重跑。"
+                ),
+            }
+            if sample.topic_id is not None:
+                kwargs["message_thread_id"] = sample.topic_id
+            await bot.send_message(**kwargs)
+        except Exception:
+            log.exception("Failed to notify chat of paused durable queue: %s", key)
     log.warning(
         "Restored %d queued turns; %d interrupted turns require review; paused chats=%d",
         restored, uncertain, len(_REVIEW_REQUIRED_THREADS),
@@ -1436,6 +1457,7 @@ async def _run_background_job(
     occupy_parent: bool,
 ) -> None:
     registry = TaskRegistry(store_path)
+    resolved = False
     try:
         job.status = "running"
         job.latest_progress = "Orchestrator 已啟動獨立 worker session"
@@ -1450,7 +1472,9 @@ async def _run_background_job(
             show_typing=False,
             job=job,
         )
+        resolved = True
     except Exception as exc:
+        resolved = True
         job.status = "failed"
         job.latest_progress = f"背景工作異常中止: {type(exc).__name__}"
         registry.update_status(job.job_id, "failed")
@@ -1458,7 +1482,12 @@ async def _run_background_job(
     finally:
         job.finished_at = time.monotonic()
         if job.durable_id is not None:
-            DurableQueue(store_path).finish(job.durable_id)
+            DurableQueue(store_path).finish(
+                job.durable_id, status="done" if resolved else "needs_review"
+            )
+        if not resolved:
+            _REVIEW_REQUIRED_THREADS.add(job.parent_key)
+            registry.update_status(job.job_id, "interrupted")
         _RUNNING_TASKS.pop(job.job_id, None)
         current = _ACTIVE_JOBS.get(job.parent_key)
         if occupy_parent and current is not None and current.job_id == job.job_id:
@@ -1717,6 +1746,7 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
     _ACTIVE_RELAY_THREADS.add(turn.key)
     _ACTIVE_PARENT_BACKENDS[turn.key] = turn.backend
     _ACTIVE_PARENT_REQUESTS[turn.key] = turn.prompt
+    resolved = False
     try:
         result_code = await _execute_relay_turn(
             msg=turn.msg,
@@ -1741,8 +1771,12 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
                 "CLI timed out; recovery queued first thread=%s source=%s",
                 turn.key, getattr(turn.msg, "message_id", None),
             )
+        resolved = True
     finally:
-        _persist_finish(turn)
+        _persist_finish(turn, "done" if resolved else "needs_review")
+        if not resolved:
+            # A cancellation/exception after dispatch is not proof of success.
+            _REVIEW_REQUIRED_THREADS.add(turn.key)
         _ACTIVE_RELAY_THREADS.discard(turn.key)
         _ACTIVE_PARENT_BACKENDS.pop(turn.key, None)
         _ACTIVE_PARENT_REQUESTS.pop(turn.key, None)
