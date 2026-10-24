@@ -1262,7 +1262,9 @@ async def _execute_relay_turn(
             log.exception("Telegram delivery failed after CLI execution thread=%s", key)
         return res.returncode
     finally:
-        _ACTIVE_RELAY_THREADS.discard(key)
+        # Parent ownership belongs to _run_direct_turn. Releasing it here
+        # (before recovery is enqueued and the typing task is disposed) opens
+        # a race where a newly arrived Telegram message starts a second turn.
         if typing_task is not None:
             typing_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
