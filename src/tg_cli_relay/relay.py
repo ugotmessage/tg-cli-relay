@@ -300,12 +300,8 @@ def _relay_cursor(
     import os
 
     bin_name = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
-    decision = route_text(prompt, load_task_router_config().config)
-    timeout_var = (
-        "TGR_CURSOR_DELEGATE_TIMEOUT" if decision.route == Route.DELEGATE else "TGR_CURSOR_TIMEOUT"
-    )
-    timeout_default = "3600" if decision.route == Route.DELEGATE else "600"
-    timeout_raw = os.environ.get(timeout_var, timeout_default).strip() or timeout_default
+    # Relay never classifies work as DIRECT/DELEGATE. The Agent owns delegation.
+    timeout_raw = os.environ.get("TGR_CURSOR_TIMEOUT", "600").strip() or "600"
     timeout_seconds = int(timeout_raw)
     model = _get_model(store, thread_key, "cursor")
     prov = CursorAgentProvider(agent_bin=bin_name, model=model, timeout_seconds=timeout_seconds)
@@ -314,15 +310,8 @@ def _relay_cursor(
     if not sid:
         sid = prov.create_session()
         store.upsert(thread_key, "cursor", sid, workspace=workspace)
-    effective_prompt = (
-        prompt if routing_only else (
-            apply_cursor_worker_prefix(prompt)
-            if _is_relay_worker_thread(thread_key)
-            else apply_cursor_harness_prefix(prompt)
-        )
-    )
     effective_prompt = ConversationContext(store.db_path).prompt(
-        thread_key, effective_prompt, include_history=fresh, consumer="cursor"
+        thread_key, prompt, include_history=fresh, consumer="cursor"
     )
     return prov.run_turn(
         workspace=workspace,
@@ -416,20 +405,9 @@ def _relay_codex(
     else:
         raise ValueError("TGR_CODEX_TRANSPORT must be cli or app-server")
     sid = store.get(thread_key, "codex")
-    worker = None if routing_only else _run_codex_cursor_worker(store, thread_key, workspace, prompt)
-    if worker is not None:
-        choice = choose_codex_worker()
-        worker_label = (choice.provider or "Cursor").capitalize()
-        codex_prompt = _codex_orchestrator_prompt(
-            prompt, worker, thread_key=thread_key, worker_name=worker_label
-        )
-    elif not routing_only and choose_codex_worker().mode == "native" and (
-        route_text(prompt, load_task_router_config().config).route == Route.DELEGATE
-        or _is_relay_worker_thread(thread_key)
-    ):
-        codex_prompt = _native_delegation_prompt(prompt)
-    else:
-        codex_prompt = prompt
+    # Never auto-call Cursor/Claude/OpenCode or ask the Relay router for a
+    # delegation decision. Codex follows its own workspace/knowledge rules.
+    codex_prompt = prompt
     res = prov.run_turn(
         workspace=workspace, session_id=sid,
         prompt=ConversationContext(store.db_path).prompt(
