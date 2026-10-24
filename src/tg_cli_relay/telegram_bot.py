@@ -48,6 +48,7 @@ TG_CHUNK = 3800
 _BOT_LOCK_FILE = None
 _ACTIVE_RELAY_THREADS: set[str] = set()
 _ACTIVE_PARENT_BACKENDS: dict[str, Backend] = {}
+_ACTIVE_PARENT_REQUESTS: dict[str, str] = {}
 _BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
 
@@ -539,8 +540,21 @@ async def _cmd_force(update, context) -> None:  # type: ignore[no-untyped-def]
     # Cursor/Claude/OpenCode/Codex CLI cannot accept arbitrary text inside an
     # active subprocess. Interrupt it, then prioritize a new turn on the same
     # provider session. Insert BEFORE interrupt so the queue cannot race ahead.
+    # An interrupted first turn may not yet have persisted its provider session.
+    # Supply the original request as *reference* rather than losing the context.
+    original = _ACTIVE_PARENT_REQUESTS.get(key, "")
+    if original:
+        retry_prompt = (
+            "Relay notice: The user is correcting the previous in-progress turn. "
+            "The previous request below is context ONLY; do not repeat or resume "
+            "it blindly. The user's new correction has priority.\n"
+            f"Previous request (context):\n{original[:8000]}\n\n"
+            f"New user correction:\n{prompt}"
+        )
+    else:
+        retry_prompt = prompt
     turn = QueuedTurn(
-        msg=update.message, key=key, backend=backend, prompt=prompt,
+        msg=update.message, key=key, backend=backend, prompt=retry_prompt,
         store_path=_get_store().db_path, attachment_config=_attachment_config(),
         route=Route.DIRECT,
     )
@@ -1596,6 +1610,7 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
         )
     _ACTIVE_RELAY_THREADS.add(turn.key)
     _ACTIVE_PARENT_BACKENDS[turn.key] = turn.backend
+    _ACTIVE_PARENT_REQUESTS[turn.key] = turn.prompt
     try:
         await _execute_relay_turn(
             msg=turn.msg,
@@ -1609,6 +1624,7 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
     finally:
         _ACTIVE_RELAY_THREADS.discard(turn.key)
         _ACTIVE_PARENT_BACKENDS.pop(turn.key, None)
+        _ACTIVE_PARENT_REQUESTS.pop(turn.key, None)
         clear_interrupt(turn.key)
         _schedule_queue_drain(turn.key)
 
