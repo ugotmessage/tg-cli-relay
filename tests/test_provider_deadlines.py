@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -23,12 +24,16 @@ def test_real_cli_turn_timeout_bounded_and_partial_session_preserved(
     fake.write_text(
         f"#!{sys.executable}\n"
         "import sys, time\n"
+        "if '--warmup' in sys.argv: sys.exit(0)\n"
         "sys.stdout.write('{\"type\":\"thread.started\",\"thread_id\":\"partial-session\"}\\n')\n"
         "sys.stdout.flush()\n"
         "time.sleep(30)\n",
         encoding="utf-8",
     )
     fake.chmod(0o755)
+    # macOS can spend longer than the deadline inspecting a new executable.
+    # Warm that path before measuring the provider's running-turn timeout.
+    subprocess.run([str(fake), "--warmup"], check=True, timeout=5)
     if backend.startswith("codex"):
         provider = CodexCliProvider(codex_bin=str(fake), timeout_seconds=0.25)
         kwargs = {"on_progress": lambda _: None} if backend == "codex-stream" else {}
