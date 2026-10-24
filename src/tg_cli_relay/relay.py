@@ -137,7 +137,7 @@ def _run_external_worker(
             timeout_seconds=int(os.environ.get("TGR_CURSOR_DELEGATE_TIMEOUT", "3600")),
         )
         sid = sid or provider.create_session()
-        raw = provider.run_turn(workspace=workspace, session_id=sid, prompt=worker_prompt)
+        raw = provider.run_turn(workspace=workspace, session_id=sid, prompt=worker_prompt, thread_key=thread_key)
         effective = raw
         saved_sid = sid
     elif provider_name == "claude":
@@ -147,7 +147,7 @@ def _run_external_worker(
             timeout_seconds=int(os.environ.get("TGR_CLAUDE_TIMEOUT", "1800")),
             dangerously_skip_permissions=_env_enabled("TGR_CLAUDE_SKIP_PERMISSIONS"),
         )
-        raw = provider.run_turn(workspace=workspace, session_id=sid, prompt=worker_prompt)
+        raw = provider.run_turn(workspace=workspace, session_id=sid, prompt=worker_prompt, thread_key=thread_key)
         display, saved_sid = parse_claude_output(raw.stdout)
         effective = RunResult(stdout=display, stderr=raw.stderr, returncode=raw.returncode)
     elif provider_name == "opencode":
@@ -157,7 +157,7 @@ def _run_external_worker(
             opencode_bin=os.environ.get("TGR_OPENCODE_BIN", "opencode"),
             model=_get_model(store, thread_key, "opencode"),
         )
-        raw = provider.run_turn(workspace=workspace, session_id=None, prompt=worker_prompt)
+        raw = provider.run_turn(workspace=workspace, session_id=None, prompt=worker_prompt, thread_key=thread_key)
         display, _ = parse_opencode_output(raw.stdout)
         effective = RunResult(stdout=display, stderr=raw.stderr, returncode=raw.returncode)
         saved_sid = None
