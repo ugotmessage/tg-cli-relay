@@ -1739,21 +1739,54 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
             await _reply_task_status(msg, tasks[0], registry, _RUNNING_TASKS.get(tasks[0].task_id))
             return
         if tasks:
-            await _reply_text_with_retry(msg, _task_choice_text(tasks))
+            if _task_context_enabled():
+                turn = QueuedTurn(
+                    msg=msg, key=key, backend=backend, prompt=prompt,
+                    store_path=store_path, attachment_config=attachment_config,
+                    route=Route.DIRECT, kind="resolve_status",
+                )
+                if key in _ACTIVE_RELAY_THREADS or _PENDING_TURNS.get(key):
+                    await _enqueue_turn(turn)
+                else:
+                    await _run_direct_turn(turn)
+            else:
+                await _reply_text_with_retry(msg, _task_choice_text(tasks))
             return
         if active_job is not None:
             await _reply_text_with_retry(msg, _job_status_text(active_job))
             return
 
-    if _is_bare_continuation(prompt) or _is_contextual_followup(prompt):
-        target = focused or (tasks[0] if len(tasks) == 1 else None)
+    bare_continuation = _is_bare_continuation(prompt)
+    contextual_followup = _is_contextual_followup(prompt)
+    if bare_continuation or contextual_followup:
+        # An explicit focus + a bare "continue", or a single possible task,
+        # can bypass semantic resolution. Other focus is only a hint.
+        target = (focused if bare_continuation else None) or (
+            tasks[0] if len(tasks) == 1 else None
+        )
         if target is not None:
             await _resume_existing_task(
                 target, msg=msg, prompt=prompt, store_path=store_path,
                 attachment_config=attachment_config, registry=registry,
             )
             return
-        if tasks:
+
+    if tasks and (
+        bare_continuation or contextual_followup
+        or might_refer_to_task(prompt, tasks)
+    ):
+        if _task_context_enabled():
+            turn = QueuedTurn(
+                msg=msg, key=key, backend=backend, prompt=prompt,
+                store_path=store_path, attachment_config=attachment_config,
+                route=Route.DIRECT, kind="resolve_task",
+            )
+            if key in _ACTIVE_RELAY_THREADS or _PENDING_TURNS.get(key):
+                await _enqueue_turn(turn)
+            else:
+                await _run_direct_turn(turn)
+            return
+        if bare_continuation or contextual_followup:
             await _reply_text_with_retry(msg, _task_choice_text(tasks))
             return
 
