@@ -840,7 +840,7 @@ def test_task_title_redacts_path_and_credentials(monkeypatch, tmp_path: Path) ->
     asyncio.run(_run())
 
 
-def test_enqueue_ack_failure_does_not_orphan_queue(monkeypatch, tmp_path: Path) -> None:
+def test_enqueue_ack_failure_retains_durable_work_and_continues(monkeypatch, tmp_path: Path) -> None:
     from tg_cli_relay import telegram_bot as bot
 
     _env(monkeypatch, tmp_path, backend="codex")
@@ -869,15 +869,17 @@ def test_enqueue_ack_failure_does_not_orphan_queue(monkeypatch, tmp_path: Path) 
             await _send_new_task(bot, msg_a, 12)
             assert await asyncio.to_thread(a_started.wait, 2)
             msg_b = FakeMessage(text="請實作任務B獨立功能", chat_id=12, message_id=2)
-            with pytest.raises(RuntimeError, match="ack failed"):
-                await _send_new_task(bot, msg_b, 12)
-            assert not bot._PENDING_TURNS.get("private:12")
+            await _send_new_task(bot, msg_b, 12)
+            assert bot._PENDING_TURNS.get("private:12")
             registry = TaskRegistry(tmp_path / "sessions.sqlite3")
             b_tasks = [t for t in registry.list_tasks("private:12") if t.title.startswith("請實作任務B")]
             assert b_tasks
-            assert b_tasks[0].status == "failed"
+            assert b_tasks[0].status == "queued"
             hold_a.set()
             await _drain(bot)
+            assert TaskRegistry(tmp_path / "sessions.sqlite3").get_task(b_tasks[0].task_id).status == "completed"
+            from tg_cli_relay.durable_queue import DurableQueue
+            assert DurableQueue(tmp_path / "sessions.sqlite3").open_items("private:12") == []
         _reset(bot)
 
     asyncio.run(_run())
