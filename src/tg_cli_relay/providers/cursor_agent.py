@@ -71,15 +71,15 @@ class CursorAgentProvider:
     timeout_seconds: int = 600
     name: str = "cursor"
 
-    def create_session(self) -> str:
-        proc = subprocess.run(
-            [self.agent_bin, "create-chat"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=os.environ.copy(),
-            timeout=self.timeout_seconds if self.timeout_seconds > 0 else None,
-        )
+    def create_session(self, *, thread_key: str | None = None) -> str:
+        cmd = [self.agent_bin, "create-chat"]
+        timeout = self.timeout_seconds if self.timeout_seconds > 0 else None
+        proc = (interruptible_run(
+            cmd, thread_key=thread_key, env=os.environ.copy(), timeout=timeout,
+        ) if thread_key is not None else subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+            env=os.environ.copy(), timeout=timeout,
+        ))
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "create-chat failed")
         sid = proc.stdout.strip()
