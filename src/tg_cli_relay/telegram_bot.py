@@ -85,7 +85,6 @@ _PENDING_TASK_TURNS: dict[str, deque[QueuedTurn]] = {}
 _QUEUE_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
 _TASK_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
 _REVIEW_REQUIRED_THREADS: set[str] = set()
-_RESTORED_BOT = None
 SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
 
 
@@ -154,8 +153,6 @@ def _turn_from_record(row: QueueRecord, bot) -> QueuedTurn:
 
 async def _restore_durable_queue(bot) -> None:
     """Replay only unstarted turns. Unknown in-flight work stops that thread."""
-    global _RESTORED_BOT
-    _RESTORED_BOT = bot
     db = Path(os.environ.get("TGR_SESSION_DB", "data/sessions.sqlite3"))
     ledger = DurableQueue(db)
     uncertain = ledger.mark_interrupted_uncertain()
@@ -1472,6 +1469,7 @@ async def _start_background_job(turn: QueuedTurn) -> None:
         _PENDING_TURNS.setdefault(turn.key, deque()).appendleft(turn)
         return
     registry = TaskRegistry(turn.store_path)
+    _persist_turn(turn)
     job = _job_from_turn(turn, occupy_parent=True)
     try:
         await _reply_text_with_retry(
@@ -1519,6 +1517,7 @@ async def _start_task_followup(turn: QueuedTurn) -> None:
         _PENDING_TASK_TURNS.setdefault(turn.task_id, deque()).appendleft(turn)
         return
     registry = TaskRegistry(turn.store_path)
+    _persist_turn(turn)
     job = _job_from_turn(turn, occupy_parent=False)
     try:
         await _reply_text_with_retry(
@@ -1585,10 +1584,9 @@ async def _enqueue_task_followup(turn: QueuedTurn) -> bool:
             role="ack",
         )
     except Exception:
-        _persist_finish(turn, "cancelled")
-        _discard_queued_turn(_PENDING_TASK_TURNS, turn.task_id, turn)
-        _schedule_task_drain(turn.task_id)
-        raise
+        # Telegram's acknowledgement can fail while the request has already
+        # been durably accepted. Do NOT discard the user's pending work.
+        log.exception("Task queue acknowledgement failed; retaining queued turn %s", turn.durable_id)
     _schedule_task_drain(turn.task_id)
     return True
 
@@ -1839,12 +1837,8 @@ async def _enqueue_turn(turn: QueuedTurn) -> bool:
             role="ack",
         )
     except Exception:
-        _persist_finish(turn, "cancelled")
-        _discard_queued_turn(_PENDING_TURNS, turn.key, turn)
-        if turn.task_id:
-            TaskRegistry(turn.store_path).update_status(turn.task_id, "failed")
-        _schedule_queue_drain(turn.key)
-        raise
+        # Delivery failure is not permission to forget a persisted request.
+        log.exception("Telegram queue acknowledgement failed; retaining turn %s", turn.durable_id)
     _schedule_queue_drain(turn.key)
     return True
 
