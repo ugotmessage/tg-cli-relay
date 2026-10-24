@@ -708,6 +708,7 @@ async def _cmd_force(update, context) -> None:  # type: ignore[no-untyped-def]
         store_path=_get_store().db_path, attachment_config=_attachment_config(),
         route=Route.DIRECT,
     )
+    _persist_turn(turn)
     _PENDING_TURNS.setdefault(key, deque()).appendleft(turn)
     await _signal_main_stop(key, backend)
     await update.message.reply_text(
@@ -982,6 +983,8 @@ async def _cmd_help(update, context) -> None:  # type: ignore[no-untyped-def]
         "/task new <說明> — 開新的孤立任務（含小型 DIRECT）",
         "查詢任務狀態請使用 /task <id>，或回覆任務訊息繼續該任務。",
         "忙碌期間的新訊息會依序排隊，完成後自動處理。",
+        "/queue — 查看持久等待佇列與重啟後結果不明的工作",
+        "/queue resume — 確認已檢查中斷工作，恢復其餘等待訊息",
         "/help — 顯示此說明",
         "",
         "附件：可傳 document / photo / audio / voice / video（含 caption）。",
@@ -1413,6 +1416,7 @@ def _job_from_turn(turn: QueuedTurn, *, occupy_parent: bool) -> RelayJob:
         started_at=time.monotonic(),
         title=turn.title,
         status="starting",
+        durable_id=turn.durable_id,
     )
     if occupy_parent:
         _ACTIVE_JOBS[turn.key] = job
@@ -1452,6 +1456,8 @@ async def _run_background_job(
         log.exception("背景 relay job 失敗 job=%s", job.job_id)
     finally:
         job.finished_at = time.monotonic()
+        if job.durable_id is not None:
+            DurableQueue(store_path).finish(job.durable_id)
         _RUNNING_TASKS.pop(job.job_id, None)
         current = _ACTIVE_JOBS.get(job.parent_key)
         if occupy_parent and current is not None and current.job_id == job.job_id:
@@ -1479,12 +1485,19 @@ async def _start_background_job(turn: QueuedTurn) -> None:
             role="ack",
         )
     except Exception:
+        _persist_finish(turn, "cancelled")
         _ACTIVE_JOBS.pop(turn.key, None)
         _RUNNING_TASKS.pop(job.job_id, None)
         registry.update_status(job.job_id, "failed")
         _PENDING_TASK_TURNS.pop(job.job_id, None)
         _schedule_queue_drain(turn.key)
         raise
+    _persist_turn(turn)
+    if not DurableQueue(turn.store_path).start(turn.durable_id):
+        _ACTIVE_JOBS.pop(turn.key, None)
+        _RUNNING_TASKS.pop(job.job_id, None)
+        return
+    job.durable_id = turn.durable_id
     task = asyncio.create_task(
         _run_background_job(
             msg=turn.msg,
@@ -1516,10 +1529,16 @@ async def _start_task_followup(turn: QueuedTurn) -> None:
             role="ack",
         )
     except Exception:
+        _persist_finish(turn, "cancelled")
         _RUNNING_TASKS.pop(job.job_id, None)
         registry.update_status(job.job_id, "failed")
         _schedule_task_drain(job.job_id)
         raise
+    _persist_turn(turn)
+    if not DurableQueue(turn.store_path).start(turn.durable_id):
+        _RUNNING_TASKS.pop(job.job_id, None)
+        return
+    job.durable_id = turn.durable_id
     task = asyncio.create_task(
         _run_background_job(
             msg=turn.msg,
@@ -1552,6 +1571,7 @@ async def _enqueue_task_followup(turn: QueuedTurn) -> bool:
             role="error",
         )
         return False
+    _persist_turn(turn)
     queue.append(turn)
     try:
         await _reply_text_with_retry(
@@ -1565,6 +1585,7 @@ async def _enqueue_task_followup(turn: QueuedTurn) -> bool:
             role="ack",
         )
     except Exception:
+        _persist_finish(turn, "cancelled")
         _discard_queued_turn(_PENDING_TASK_TURNS, turn.task_id, turn)
         _schedule_task_drain(turn.task_id)
         raise
@@ -1580,6 +1601,8 @@ async def _drain_task_queue(task_id: str) -> None:
                 _PENDING_TASK_TURNS.pop(task_id, None)
                 return
             turn = queue[0]
+            if turn.key in _REVIEW_REQUIRED_THREADS:
+                return
             if _task_session_busy(task_id, turn.worker_key) or _pending_parent_turn_for_task(task_id):
                 return
             record = TaskRegistry(turn.store_path).get_task(task_id)
@@ -1686,6 +1709,9 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
         TaskRegistry(turn.store_path).bind_parent_message(
             parent_key=turn.key, message_id=mid, backend=turn.backend
         )
+    _persist_turn(turn)
+    if not DurableQueue(turn.store_path).start(turn.durable_id):
+        return
     _ACTIVE_RELAY_THREADS.add(turn.key)
     _ACTIVE_PARENT_BACKENDS[turn.key] = turn.backend
     _ACTIVE_PARENT_REQUESTS[turn.key] = turn.prompt
@@ -1706,14 +1732,15 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
         ):
             # Add the recovery BEFORE releasing the parent slot. Never lose
             # pending user messages and never recursively retry a recovery.
-            _PENDING_TURNS.setdefault(turn.key, deque()).appendleft(
-                _timeout_recovery_turn(turn)
-            )
+            recovery = _timeout_recovery_turn(turn)
+            _persist_turn(recovery)
+            _PENDING_TURNS.setdefault(turn.key, deque()).appendleft(recovery)
             log.warning(
                 "CLI timed out; recovery queued first thread=%s source=%s",
                 turn.key, getattr(turn.msg, "message_id", None),
             )
     finally:
+        _persist_finish(turn)
         _ACTIVE_RELAY_THREADS.discard(turn.key)
         _ACTIVE_PARENT_BACKENDS.pop(turn.key, None)
         _ACTIVE_PARENT_REQUESTS.pop(turn.key, None)
@@ -1729,6 +1756,8 @@ async def _drain_thread_queue(key: str) -> None:
                 _PENDING_TURNS.pop(key, None)
                 return
             turn = queue[0]
+            if key in _REVIEW_REQUIRED_THREADS:
+                return
             if key in _ACTIVE_RELAY_THREADS:
                 return
             if turn.kind == "new_task":
@@ -1795,6 +1824,7 @@ async def _enqueue_turn(turn: QueuedTurn) -> bool:
             role="error",
         )
         return False
+    _persist_turn(turn)
     queue.append(turn)
     extra = f"（task {turn.task_id}）" if turn.task_id else ""
     try:
@@ -1809,6 +1839,7 @@ async def _enqueue_turn(turn: QueuedTurn) -> bool:
             role="ack",
         )
     except Exception:
+        _persist_finish(turn, "cancelled")
         _discard_queued_turn(_PENDING_TURNS, turn.key, turn)
         if turn.task_id:
             TaskRegistry(turn.store_path).update_status(turn.task_id, "failed")
@@ -1919,7 +1950,7 @@ async def _on_message(update, context) -> None:  # type: ignore[no-untyped-def]
         attachment_config=attachment_config,
         route=Route.DIRECT,
     )
-    if key in _ACTIVE_RELAY_THREADS or _PENDING_TURNS.get(key):
+    if key in _REVIEW_REQUIRED_THREADS or key in _ACTIVE_RELAY_THREADS or _PENDING_TURNS.get(key):
         await _enqueue_turn(turn)
         return
     await _run_direct_turn(turn)
@@ -1987,6 +2018,7 @@ _BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("force", "立即修正執行中的工作"),
     ("stop", "要求停止目前的主對話"),
     ("status", "查看 CLI、Session 與佇列"),
+    ("queue", "查看持久佇列與確認重啟工作"),
     ("provider", "查看或切換 CLI"),
     ("model", "查看或切換模型"),
     ("task", "管理指定 Task"),
@@ -2000,6 +2032,9 @@ _BOT_COMMANDS: tuple[tuple[str, str], ...] = (
 async def _refresh_telegram_commands(app) -> None:
     from telegram import BotCommand
 
+    # The recovery restore occurs once at bot startup. Running turns from a
+    # previous process are *uncertain*, never silently re-executed.
+    await _restore_durable_queue(app.bot)
     try:
         await app.bot.set_my_commands(
             [BotCommand(command, description) for command, description in _BOT_COMMANDS]
@@ -2035,6 +2070,7 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("reset", _cmd_reset))
     app.add_handler(CommandHandler("force", _cmd_force))
     app.add_handler(CommandHandler("stop", _cmd_stop))
+    app.add_handler(CommandHandler("queue", _cmd_queue))
     app.add_handler(CommandHandler("new", _cmd_reset))
     app.add_handler(CommandHandler("status", _cmd_status))
     app.add_handler(CommandHandler("provider", _cmd_provider))
