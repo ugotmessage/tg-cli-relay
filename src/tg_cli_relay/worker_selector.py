@@ -30,7 +30,7 @@ def choose_codex_worker() -> WorkerChoice:
     if raw is None:
         legacy = os.environ.get("TGR_CODEX_DELEGATE_TO_CURSOR")
         if legacy is not None:
-            raw = "cursor" if legacy.strip().lower() not in ("0", "false", "off", "no") else "native"
+            raw = "cursor" if legacy.strip().lower() not in ("0", "false", "off", "no") else "off"
         else:
             raw = "auto"
     raw = raw.strip().lower()
