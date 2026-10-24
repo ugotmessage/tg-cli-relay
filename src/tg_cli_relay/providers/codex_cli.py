@@ -74,7 +74,7 @@ class CodexCliProvider:
                     raw_stdout = raw_stdout.decode("utf-8", "replace")
                 if isinstance(raw_stderr, bytes):
                     raw_stderr = raw_stderr.decode("utf-8", "replace")
-                raw_stderr = (raw_stderr + "\\nCodex CLI turn exceeded timeout").strip()
+                raw_stderr = (raw_stderr + "\nCodex CLI turn exceeded timeout").strip()
             messages = parse_messages_from_jsonl(raw_stdout)
         else:
             raw_lines: list[str] = []
@@ -119,7 +119,7 @@ class CodexCliProvider:
                 raw_stderr = stderr_file.read()
                 if timed_out.is_set():
                     returncode = 124
-                    raw_stderr = (raw_stderr + "\\nCodex CLI turn exceeded timeout").strip()
+                    raw_stderr = (raw_stderr + "\nCodex CLI turn exceeded timeout").strip()
             raw_stdout = "".join(raw_lines)
             if pending is not None:
                 messages.append(pending)
