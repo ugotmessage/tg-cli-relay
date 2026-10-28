@@ -56,6 +56,8 @@ Receiver 由 HMS `ssh` stdin 呼叫 `tg-cli-relay callback-receive`（或 0700 w
 | outbox 根目錄 | `HMS_CALLBACK_OUTBOX`（`pending/`、`sent/`、`failed/`；`unknown_task` 進 `failed/`，不進 `sent/`） |
 | secret | `HMS_CALLBACK_SECRET_FILE` |
 | SSH | `HMS_CALLBACK_SSH_CONFIG`、`HMS_CALLBACK_SSH_ALIAS`、`HMS_CALLBACK_SSH_REMOTE_CMD` |
+| 單一本機 receiver | `HMS_CALLBACK_LOCAL_RECEIVER_ARGV`（JSON argv；與 ROUTES 互斥） |
+| 本機 receiver allowlist | `HMS_CALLBACK_LOCAL_RECEIVER_ROUTES`（JSON object，最多 8 個 named argv） |
 | watcher drain timeout | `HMS_CALLBACK_DRAIN_TIMEOUT`（預設 900 秒；drain 已不再跑模型，此值只覆蓋 transport 重試） |
 | transport attempts | `HMS_CALLBACK_MAX_ATTEMPTS`（預設 60；每次指數退避，上限 60 秒） |
 
@@ -70,6 +72,45 @@ Receiver 由 HMS `ssh` stdin 呼叫 `tg-cli-relay callback-receive`（或 0700 w
 `deploy/callback-receive-local.sh.example`；此時不經 SSH，登記 state 與 receiver
 必須使用同一個 Relay env、bot token 與 state root。argv 只放 env／Python 路徑，
 不得放 token 或 HMAC secret。未設定時仍使用上述 SSH transport。
+
+同一台若有**兩個獨立 Codex Relay**（各自 bot token、DB、callback state root），
+改設定 `HMS_CALLBACK_LOCAL_RECEIVER_ROUTES` 為 JSON object：route id → argv。
+兩個變數不可同時設定。Probe 會詢問 allowlist 上每一個 destination，**必須剛好一個**
+回 `registered` 才把該 route id 與 argv 寫進既有 outbox record；`final_result` 只送到
+這個已選定的原始 receiver。零匹配依既有 backoff／attempt 上限重試或失敗；兩個以上
+`registered`（同一 `task_id` 出現在兩個 bot）**fail-closed**（`ambiguous_route`），
+不依 list 順序挑選、也不廣播。選定後的 transport 失敗只重試同一 route，不會改送另一個
+bot。重試時 route id 必須仍在設定中且 argv **完全相等**，否則 `route_changed` 失敗。
+無效或缺漏的 route 設定 fail-closed，錯誤只回穩定 token。既有單一 ARGV 與遠端單一 SSH
+行為不變。Receiver 端既有 `bot_fingerprint` 核對仍有效。
+
+本機兩個 receiver 的 argv 形狀（由 watcher wrapper 設定，不要寫進 task JSON）：
+
+```text
+/Users/ht/.hermes/scripts/tg-relay/callback-receive-codex.sh \
+  <bot env> <venv python>
+```
+
+- `ht.tg-cli-relay`：`/Users/ht/.hermes/secrets/tg-relay-claude.env` + origin venv python
+- `hms.codex-relay`：`/Users/ht/.hermes/codex-relay/.env` + `/Users/ht/.hermes/codex-relay/.venv/bin/python3`
+
+## 雙 bot 操作 rollout（controller）
+
+1. **備份**：兩個 Relay 的 session DB、env、callback state，以及 live
+   `run-cursor-worker-watchdog.sh` 與 `hms_callback_outbox.py`。
+2. **先不要清 secondary paused queue**（`#90 needs_review`、`#91-93 queued`；重複的
+   paste-to-buy-toget-p4 通知與 `?`）。本修正不重跑、不刪那些列。
+3. **Secondary 先設** `TGR_BACKGROUND_HANDOFF_QUEUE_ROOT`（與 primary 相同共用
+   watchdog queue），再準備獨立 callback state root／secret file path（簽署密鑰可共用檔）。
+4. **套用** outbox 與 watcher wrapper patch：`HMS_CALLBACK_LOCAL_RECEIVER_ROUTES`
+   含兩個 named argv；`unset HMS_CALLBACK_LOCAL_RECEIVER_ARGV`。
+5. **序列 restart**：一次只重一個 process（建議 shared watcher → 已通過的 primary
+   保持 → 再 secondary）。確認原主 session mapping 仍在，不要 `/new`。
+6. **Per-bot 無害 live 驗收**：各 bot 各做一次 probe→selected final→原 session 續行；
+   確認 A 的 task 不會進 B 的 inbox／Telegram，反之亦然。
+7. 已知 **done/failed-task-before-marker** 競態：watchdog 若在 Relay 登記 marker 前就
+   enqueue，probe 會 `unknown_task` 並依既有政策失敗。不要為了這點另做信任通道或重跑
+   不確定的 paused 任務。
 
 Watchdog patch 見 artifacts：`/Users/ht/.hermes/artifacts/relay-background-continuation-20261028/cursor-worker-watchdog.patch`。套用前備份 live `cursor-worker-watchdog.py`。enqueue 只在 queue 檔已進入 `done/` 或 `failed/` 且既有 `notify()`／log 之後；transport 失敗被吞掉，不改分類、不改通知文字、不 `replace()` 回 running。timeout 分類為 `timed_out`，仍走同一條續行事件，不另開 queue。
 

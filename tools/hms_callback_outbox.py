@@ -34,10 +34,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -54,6 +56,12 @@ DEFAULT_VERIFIER_TIMEOUT = 600.0
 DEFAULT_VERIFIER_BIN = "/Users/ht/.hermes/scripts/tg-relay/codex-device-relay"
 KIND_PROBE = "registration_probe"
 KIND_FINAL = "final_result"
+MAX_LOCAL_ROUTES = 8
+SINGLE_ROUTE_ID = "_single"
+SSH_ROUTE_ID = "ssh"
+RESERVED_ROUTE_IDS = frozenset({SINGLE_ROUTE_ID, SSH_ROUTE_ID})
+ROUTE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+REASON_TOKEN_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 DEFAULT_ALLOWED_ROOTS = (
     Path("/Users/ht/.hermes/artifacts"),
     Path("/Users/ht/.hermes-worktrees"),
@@ -77,6 +85,12 @@ SshRunner = Callable[[list[str], bytes, float], subprocess.CompletedProcess]
 VerifierRunner = Callable[[list[str], str, str, float], subprocess.CompletedProcess]
 ssh_runner: SshRunner | None = None
 verifier_runner: VerifierRunner | None = None
+
+
+@dataclass(frozen=True)
+class ReceiverRoute:
+    route_id: str
+    argv: tuple[str, ...]
 
 
 def canonical_event_body(event: Mapping[str, Any]) -> bytes:
@@ -329,21 +343,59 @@ def ssh_argv() -> list[str]:
     ]
 
 
-def receiver_argv() -> list[str]:
-    """Return a local receiver argv when configured, otherwise the SSH transport."""
-    raw = os.environ.get("HMS_CALLBACK_LOCAL_RECEIVER_ARGV", "").strip()
-    if not raw:
-        return ssh_argv()
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise SystemExit("misconfigured") from exc
+def _parse_argv_list(parsed: Any) -> list[str]:
     if not isinstance(parsed, list) or not parsed or not all(isinstance(item, str) and item for item in parsed):
         raise SystemExit("misconfigured")
     executable = Path(parsed[0])
     if not executable.is_absolute() or not executable.exists() or executable.is_symlink():
         raise SystemExit("misconfigured")
     return [str(item) for item in parsed]
+
+
+def configured_receiver_routes() -> tuple[ReceiverRoute, ...]:
+    """Return the configured local allowlist, or the implicit single SSH route.
+
+    ``HMS_CALLBACK_LOCAL_RECEIVER_ROUTES`` is a JSON object of immutable route
+    id → argv. ``HMS_CALLBACK_LOCAL_RECEIVER_ARGV`` remains the single-argv form.
+    The two must not be set together. Task JSON cannot supply a destination.
+    """
+    routes_raw = os.environ.get("HMS_CALLBACK_LOCAL_RECEIVER_ROUTES", "").strip()
+    argv_raw = os.environ.get("HMS_CALLBACK_LOCAL_RECEIVER_ARGV", "").strip()
+    if routes_raw and argv_raw:
+        raise SystemExit("misconfigured")
+    if routes_raw:
+        try:
+            parsed = json.loads(routes_raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit("misconfigured") from exc
+        if not isinstance(parsed, dict) or not parsed or len(parsed) > MAX_LOCAL_ROUTES:
+            raise SystemExit("misconfigured")
+        routes: list[ReceiverRoute] = []
+        seen_argv: set[tuple[str, ...]] = set()
+        for key in sorted(parsed):
+            if not isinstance(key, str) or not ROUTE_ID_RE.fullmatch(key) or key in RESERVED_ROUTE_IDS:
+                raise SystemExit("misconfigured")
+            argv = tuple(_parse_argv_list(parsed[key]))
+            if argv in seen_argv:
+                raise SystemExit("misconfigured")
+            seen_argv.add(argv)
+            routes.append(ReceiverRoute(key, argv))
+        return tuple(routes)
+    if argv_raw:
+        try:
+            parsed = json.loads(argv_raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit("misconfigured") from exc
+        return (ReceiverRoute(SINGLE_ROUTE_ID, tuple(_parse_argv_list(parsed))),)
+    return (ReceiverRoute(SSH_ROUTE_ID, tuple(ssh_argv())),)
+
+
+def receiver_argv() -> list[str]:
+    """Return a local receiver argv when a single destination is configured, else SSH."""
+    routes = configured_receiver_routes()
+    if len(routes) != 1:
+        raise SystemExit("misconfigured")
+    return list(routes[0].argv)
 
 
 def run_ssh(argv: list[str], event_bytes: bytes, timeout: float) -> subprocess.CompletedProcess:
@@ -584,6 +636,13 @@ def _reason_from_output(completed: subprocess.CompletedProcess) -> str:
     return text.strip().splitlines()[0] if text.strip() else ""
 
 
+def _sanitize_reason(reason: str) -> str:
+    token = reason.strip().split()[0] if reason.strip() else ""
+    if REASON_TOKEN_RE.fullmatch(token):
+        return token
+    return "unexpected"
+
+
 def _bytes_to_text(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")
@@ -610,14 +669,57 @@ def _final_outcome(rc: int, reason: str) -> str | None:
     return None
 
 
-def _send_signed_event(event: Mapping[str, Any]) -> tuple[int, str]:
+def _send_signed_event(event: Mapping[str, Any], argv: list[str]) -> tuple[int, str]:
     event_bytes = encode_event(event)
-    argv = receiver_argv()
     try:
         completed = run_ssh(argv, event_bytes, SSH_TIMEOUT_SECONDS)
     except Exception as exc:
-        return 99, type(exc).__name__
-    return int(completed.returncode), _reason_from_output(completed)
+        return 99, _sanitize_reason(type(exc).__name__)
+    return int(completed.returncode), _sanitize_reason(_reason_from_output(completed))
+
+
+def _persist_selected_route(record: dict[str, Any], route: ReceiverRoute) -> None:
+    record["selected_route_id"] = route.route_id
+    record["selected_route_argv"] = list(route.argv)
+
+
+def _selected_route_from_record(record: Mapping[str, Any]) -> ReceiverRoute | None:
+    route_id = record.get("selected_route_id")
+    argv = record.get("selected_route_argv")
+    if not isinstance(route_id, str) or not route_id:
+        return None
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) and item for item in argv):
+        return None
+    return ReceiverRoute(route_id, tuple(argv))
+
+
+def _resolve_selected_route(record: Mapping[str, Any]) -> ReceiverRoute | str:
+    selected = _selected_route_from_record(record)
+    if selected is None:
+        return "missing_route"
+    routes = {route.route_id: route for route in configured_receiver_routes()}
+    current = routes.get(selected.route_id)
+    if current is None or current.argv != selected.argv:
+        return "route_changed"
+    return current
+
+
+def _probe_configured_routes(
+    probe: Mapping[str, Any], routes: tuple[ReceiverRoute, ...]
+) -> tuple[list[ReceiverRoute], bool, int, str]:
+    registered: list[ReceiverRoute] = []
+    retryable = False
+    last_rc = 0
+    last_reason = ""
+    for route in routes:
+        rc, reason = _send_signed_event(probe, list(route.argv))
+        last_rc, last_reason = rc, reason
+        outcome = _probe_outcome(rc, reason)
+        if outcome == "registered":
+            registered.append(route)
+        elif outcome != "unknown":
+            retryable = True
+    return registered, retryable, last_rc, last_reason
 
 
 def _fail_record(root: Path, pending: Path, record: dict[str, Any], event_id: str) -> None:
@@ -687,17 +789,26 @@ def cmd_drain() -> int:
             continue
 
         if record.get("probe_status") is None:
-            rc, reason = _send_signed_event(probe)
+            routes = configured_receiver_routes()
+            registered, retryable, last_rc, last_reason = _probe_configured_routes(probe, routes)
             record["attempts"] = int(record.get("attempts") or 0) + 1
-            record["last_rc"] = rc
-            record["last_reason"] = redact_secret_material(reason, secret)
-            outcome = _probe_outcome(rc, reason)
-            if outcome == "registered":
+            record["last_rc"] = last_rc
+            record["last_reason"] = redact_secret_material(last_reason, secret)
+            if len(registered) > 1:
+                record["probe_status"] = "ambiguous"
+                record["last_reason"] = "ambiguous_route"
+                record["last_rc"] = 3
+                _fail_record(root, pending, record, event_id)
+                continue
+            if len(registered) == 1 and not retryable:
+                _persist_selected_route(record, registered[0])
                 record["probe_status"] = "registered"
                 record["probe_acked_at"] = utcnow_iso()
                 record["phase"] = "verify"
+                record["last_rc"] = 0
+                record["last_reason"] = "registered"
                 write_json(pending, record)
-            elif outcome == "unknown":
+            elif not registered and not retryable:
                 record["probe_status"] = "unknown"
                 _fail_record(root, pending, record, event_id)
                 continue
@@ -710,6 +821,24 @@ def cmd_drain() -> int:
                 continue
 
         if record.get("probe_status") != "registered":
+            continue
+
+        if _selected_route_from_record(record) is None:
+            routes = configured_receiver_routes()
+            if len(routes) == 1:
+                _persist_selected_route(record, routes[0])
+                write_json(pending, record)
+            else:
+                record["last_reason"] = "missing_route"
+                record["last_rc"] = 4
+                _fail_record(root, pending, record, event_id)
+                continue
+
+        resolved = _resolve_selected_route(record)
+        if isinstance(resolved, str):
+            record["last_reason"] = resolved
+            record["last_rc"] = 4
+            _fail_record(root, pending, record, event_id)
             continue
 
         if record.get("verifier") is None:
@@ -738,7 +867,7 @@ def cmd_drain() -> int:
             )
             write_json(pending, record)
 
-        rc, reason = _send_signed_event(record["final_event"])
+        rc, reason = _send_signed_event(record["final_event"], list(resolved.argv))
         record["attempts"] = int(record.get("attempts") or 0) + 1
         record["last_rc"] = rc
         record["last_reason"] = redact_secret_material(reason, secret)
