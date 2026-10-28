@@ -29,4 +29,4 @@ export TGR_BACKGROUND_HANDOFF="${TGR_BACKGROUND_HANDOFF:-0}"
 export TGR_BACKGROUND_HANDOFF_SECRET_FILE="$SECRET_FILE"
 export TGR_BACKGROUND_HANDOFF_STATE_ROOT="${TGR_BACKGROUND_HANDOFF_STATE_ROOT:-/var/lib/tg-cli-relay/callback}"
 
-exec /srv/tg-cli-relay/.venv/bin/tg-cli-relay callback-receive
+exec /srv/tg-cli-relay/.venv/bin/python3 -m tg_cli_relay callback-receive

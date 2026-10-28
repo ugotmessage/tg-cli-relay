@@ -46,6 +46,14 @@ FIXED_NOW = datetime(2026, 10, 28, 3, 54, tzinfo=timezone.utc)
 SENTINEL_SECRET = b"SEN_TEST_SECRET_7f3a9c2e1b88dead"
 
 
+def test_receiver_wrapper_uses_relocatable_python_entrypoint():
+    wrapper = (Path(__file__).resolve().parents[1] / "deploy" / "callback-receive.sh.example").read_text(
+        encoding="utf-8"
+    )
+    assert ".venv/bin/python3 -m tg_cli_relay callback-receive" in wrapper
+    assert ".venv/bin/tg-cli-relay callback-receive" not in wrapper
+
+
 def _callback_env(monkeypatch, tmp_path: Path, *, enabled: bool = True) -> tuple[Path, Path]:
     state = tmp_path / "callback-state"
     secret = tmp_path / "callback.secret"
