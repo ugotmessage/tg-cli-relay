@@ -26,6 +26,14 @@ from tg_cli_relay.attachments import (
     prepare_download_path,
     resolve_outbound_files,
 )
+from tg_cli_relay.background_callback import (
+    feature_enabled as _callback_feature_enabled,
+    find_handoff_markers,
+    pending_ack_text,
+    register_fail_ack_text,
+    register_from_relay_context,
+    scan_once as callback_scan_once,
+)
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
 from tg_cli_relay.providers.codex_app_server import steer_codex_turn, interrupt_codex_turn
 from tg_cli_relay.providers.process_control import request_interrupt, clear_interrupt, interrupt_requested
@@ -1405,19 +1413,60 @@ async def _execute_relay_turn(
 
         sid = store.get(key, backend)
         model = effective_model_for_backend(store, key, backend)
+        send_segments = res.stdout_segments
+        pending_ack: str | None = None
+        if _callback_feature_enabled():
+            remaining, markers = find_handoff_markers(res)
+            if len(markers) == 1:
+                task_id, handoff_path = markers[0]
+                try:
+                    register_from_relay_context(
+                        task_id=task_id,
+                        handoff_path=handoff_path,
+                        msg=msg,
+                        thread_key=key,
+                    )
+                    pending_ack = pending_ack_text(task_id)
+                except Exception:
+                    log.exception("background handoff registration failed thread=%s", key)
+                    pending_ack = register_fail_ack_text()
+                send_segments = remaining if remaining else None
+                visible = "\n".join(remaining or [])
+                if res.returncode == 0:
+                    body = visible
+                elif err.strip():
+                    body = f"{visible}\n\n--- stderr ---\n{err}".strip() if visible else f"--- stderr ---\n{err}".strip()
+                else:
+                    body = visible
+            elif len(markers) > 1:
+                log.error("multiple background handoff markers rejected thread=%s", key)
+                pending_ack = register_fail_ack_text()
+                send_segments = remaining if remaining else None
+                body = "\n".join(remaining or [])
         try:
-            await _send_relay_output(
-                msg,
-                body,
-                backend=backend,
-                model=model,
-                sid=sid,
-                attachment_config=attachment_config,
-                segments=res.stdout_segments,
-                job=job,
-                registry=registry,
-                parent_key=key if job is None else None,
-            )
+            if (body or "").strip() or (send_segments and any(str(part).strip() for part in send_segments)):
+                await _send_relay_output(
+                    msg,
+                    body,
+                    backend=backend,
+                    model=model,
+                    sid=sid,
+                    attachment_config=attachment_config,
+                    segments=send_segments,
+                    job=job,
+                    registry=registry,
+                    parent_key=key if job is None else None,
+                )
+            if pending_ack:
+                await _reply_text_with_retry(
+                    msg,
+                    _with_task_banner(job, pending_ack),
+                    job=job,
+                    registry=registry,
+                    role="progress",
+                    parent_key=key if job is None else None,
+                    parent_backend=backend if job is None else None,
+                )
         except Exception:
             # Telegram network failures must not prevent timed-out turns from
             # scheduling recovery or block the FIFO main conversation.
@@ -2067,12 +2116,62 @@ _BOT_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _callback_dest_message(bot, registration: dict) -> _RestoredMessage:
+    row = QueueRecord(
+        id=0,
+        thread_key=str(registration["thread_key"]),
+        backend="codex",
+        prompt="",
+        kind="callback",
+        chat_id=int(registration["chat_id"]),
+        message_id=0,
+        topic_id=(
+            int(registration["message_thread_id"])
+            if registration.get("message_thread_id") is not None
+            else None
+        ),
+        task_id=str(registration.get("task_id") or ""),
+        worker_key=None,
+        title="",
+        status="queued",
+    )
+    return _RestoredMessage(bot, row)
+
+
+async def _deliver_callback_text(bot, registration: dict, text: str) -> None:
+    msg = _callback_dest_message(bot, registration)
+    chunks = _chunk_reply(text) or ["(無輸出)"]
+    for part in chunks:
+        await _reply_text_with_retry(msg, part, retries=2)
+
+
+async def _callback_inbox_loop(bot) -> None:
+    while True:
+        try:
+            await callback_scan_once(
+                active_thread_keys=_ACTIVE_RELAY_THREADS,
+                deliver=lambda registration, text: _deliver_callback_text(bot, registration, text),
+            )
+        except Exception:
+            log.exception("background callback inbox scan failed")
+        await asyncio.sleep(2)
+
+
+def _schedule_callback_inbox_loop(bot) -> None:
+    if not _callback_feature_enabled():
+        return
+    task = asyncio.create_task(_callback_inbox_loop(bot))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
 async def _refresh_telegram_commands(app) -> None:
     from telegram import BotCommand
 
     # The recovery restore occurs once at bot startup. Running turns from a
     # previous process are *uncertain*, never silently re-executed.
     await _restore_durable_queue(app.bot)
+    _schedule_callback_inbox_loop(app.bot)
     try:
         await app.bot.set_my_commands(
             [BotCommand(command, description) for command, description in _BOT_COMMANDS]
