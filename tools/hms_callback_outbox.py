@@ -323,6 +323,23 @@ def ssh_argv() -> list[str]:
     ]
 
 
+def receiver_argv() -> list[str]:
+    """Return a local receiver argv when configured, otherwise the SSH transport."""
+    raw = os.environ.get("HMS_CALLBACK_LOCAL_RECEIVER_ARGV", "").strip()
+    if not raw:
+        return ssh_argv()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("misconfigured") from exc
+    if not isinstance(parsed, list) or not parsed or not all(isinstance(item, str) and item for item in parsed):
+        raise SystemExit("misconfigured")
+    executable = Path(parsed[0])
+    if not executable.is_absolute() or not executable.exists() or executable.is_symlink():
+        raise SystemExit("misconfigured")
+    return [str(item) for item in parsed]
+
+
 def run_ssh(argv: list[str], event_bytes: bytes, timeout: float) -> subprocess.CompletedProcess:
     runner = ssh_runner
     if runner is not None:
@@ -589,7 +606,7 @@ def _final_outcome(rc: int, reason: str) -> str | None:
 
 def _send_signed_event(event: Mapping[str, Any]) -> tuple[int, str]:
     event_bytes = encode_event(event)
-    argv = ssh_argv()
+    argv = receiver_argv()
     try:
         completed = run_ssh(argv, event_bytes, SSH_TIMEOUT_SECONDS)
     except Exception as exc:

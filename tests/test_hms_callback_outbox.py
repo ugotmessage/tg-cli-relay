@@ -323,6 +323,29 @@ def test_canonical_hmac_matches_relay_helper():
     assert outbox.sign_event(probe, SENTINEL_SECRET) == relay_sign(probe, SENTINEL_SECRET)
 
 
+def test_local_receiver_argv_works_without_ssh_settings(monkeypatch, tmp_path):
+    receiver = tmp_path / "receiver"
+    receiver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    receiver.chmod(0o700)
+    monkeypatch.setenv(
+        "HMS_CALLBACK_LOCAL_RECEIVER_ARGV",
+        json.dumps([str(receiver), "/path/to/env", "/path/to/python"]),
+    )
+    monkeypatch.delenv("HMS_CALLBACK_SSH_CONFIG", raising=False)
+    monkeypatch.delenv("HMS_CALLBACK_SSH_ALIAS", raising=False)
+    monkeypatch.delenv("HMS_CALLBACK_SSH_REMOTE_CMD", raising=False)
+    assert outbox.receiver_argv() == [str(receiver), "/path/to/env", "/path/to/python"]
+
+
+def test_local_receiver_argv_rejects_relative_or_malformed(monkeypatch):
+    monkeypatch.setenv("HMS_CALLBACK_LOCAL_RECEIVER_ARGV", '["relative"]')
+    with pytest.raises(SystemExit):
+        outbox.receiver_argv()
+    monkeypatch.setenv("HMS_CALLBACK_LOCAL_RECEIVER_ARGV", "not-json")
+    with pytest.raises(SystemExit):
+        outbox.receiver_argv()
+
+
 def test_fresh_verifier_argv_never_resumes(monkeypatch, tmp_path):
     _outbox_env(monkeypatch, tmp_path)
     workspace = str(tmp_path / "workspace")

@@ -66,6 +66,12 @@ Receiver 由 HMS `ssh` stdin 呼叫 `tg-cli-relay callback-receive`（或 0700 w
 - config：`/Users/ht/.hermes/secrets/ssh/config`
 - remote command：WEB1 上的 `callback-receive` wrapper（stdin = 事件 JSON）
 
+若 Telegram Relay 與 HMS watcher 在同一台主機，設定
+`HMS_CALLBACK_LOCAL_RECEIVER_ARGV` 為 JSON argv array，直接呼叫
+`deploy/callback-receive-local.sh.example`；此時不經 SSH，登記 state 與 receiver
+必須使用同一個 Relay env、bot token 與 state root。argv 只放 env／Python 路徑，
+不得放 token 或 HMAC secret。未設定時仍使用上述 SSH transport。
+
 Watchdog patch 見 artifacts：`cursor-worker-watchdog.patch`。套用前備份 live `cursor-worker-watchdog.py`。enqueue 只在 queue 檔已進入 `done/` 或 `failed/` 且既有 `notify()`／log 之後；transport 失敗被吞掉，不改分類、不改通知文字、不 `replace()` 回 running。
 
 ## 無害 e2e fixture（deploy 後由 controller 跑）
