@@ -27,11 +27,14 @@ from tg_cli_relay.attachments import (
     resolve_outbound_files,
 )
 from tg_cli_relay.background_callback import (
+    CONTINUATION_KIND,
+    accept_handoff_marker,
+    build_continuation_prompt,
+    continuation_message_id,
     feature_enabled as _callback_feature_enabled,
     find_handoff_markers,
     pending_ack_text,
     register_fail_ack_text,
-    register_from_relay_context,
     scan_once as callback_scan_once,
 )
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
@@ -1337,6 +1340,18 @@ async def _execute_relay_turn(
         loop = asyncio.get_running_loop()
         registry = TaskRegistry(store.db_path)
 
+        def _on_handoff(task_id: str, handoff_path: str) -> bool:
+            if not _callback_feature_enabled():
+                return False
+            try:
+                accept_handoff_marker(
+                    task_id, handoff_path, msg=msg, thread_key=key
+                )
+                return True
+            except Exception:
+                log.exception("background handoff rejected during stream thread=%s", key)
+                return False
+
         def _live_progress(text: str) -> None:
             if job is not None:
                 job.status = "running"
@@ -1366,6 +1381,7 @@ async def _execute_relay_turn(
                 prompt=prompt,
                 store=store,
                 on_progress=_live_progress if backend == "codex" else None,
+                on_handoff=_on_handoff if backend == "codex" and _callback_feature_enabled() else None,
             )
         except Exception as exc:
             log.exception("relay_turn 失敗 thread=%s", key)
@@ -1420,7 +1436,7 @@ async def _execute_relay_turn(
             if len(markers) == 1:
                 task_id, handoff_path = markers[0]
                 try:
-                    register_from_relay_context(
+                    accept_handoff_marker(
                         task_id=task_id,
                         handoff_path=handoff_path,
                         msg=msg,
@@ -1814,7 +1830,7 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
         )
         if (
             result_code == 124
-            and turn.kind != "timeout_recovery"
+            and turn.kind not in {"timeout_recovery", CONTINUATION_KIND}
             and not interrupt_requested(turn.key)
         ):
             # Add the recovery BEFORE releasing the parent slot. Never lose
@@ -1829,8 +1845,9 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
         resolved = True
     finally:
         _persist_finish(turn, "done" if resolved else "needs_review")
-        if not resolved:
+        if not resolved and turn.kind != CONTINUATION_KIND:
             # A cancellation/exception after dispatch is not proof of success.
+            # Uncertain background continuations stay needs_review without pausing chat.
             _REVIEW_REQUIRED_THREADS.add(turn.key)
         _ACTIVE_RELAY_THREADS.discard(turn.key)
         _ACTIVE_PARENT_BACKENDS.pop(turn.key, None)
@@ -2116,15 +2133,21 @@ _BOT_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _callback_dest_message(bot, registration: dict) -> _RestoredMessage:
+def _already_pending(key: str, durable_id: int | None) -> bool:
+    if durable_id is None:
+        return False
+    return any(turn.durable_id == durable_id for turn in _PENDING_TURNS.get(key, ()))
+
+
+def _callback_dest_message(bot, registration: dict, *, message_id: int = 0, kind: str = "callback") -> _RestoredMessage:
     row = QueueRecord(
         id=0,
         thread_key=str(registration["thread_key"]),
         backend="codex",
         prompt="",
-        kind="callback",
+        kind=kind,
         chat_id=int(registration["chat_id"]),
-        message_id=0,
+        message_id=int(message_id),
         topic_id=(
             int(registration["message_thread_id"])
             if registration.get("message_thread_id") is not None
@@ -2145,12 +2168,51 @@ async def _deliver_callback_text(bot, registration: dict, text: str) -> None:
         await _reply_text_with_retry(msg, part, retries=2)
 
 
+async def _schedule_background_continuation(bot, registration: dict, event: dict) -> None:
+    """Enqueue one original-session Codex continuation; never auto-replay uncertain ones."""
+    store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
+    event_id = str(event.get("event_id") or "")
+    message_id = continuation_message_id(event_id)
+    thread_key = str(registration["thread_key"])
+    ledger = DurableQueue(store_path)
+    existing = ledger.lookup(thread_key=thread_key, message_id=message_id, kind=CONTINUATION_KIND)
+    if existing is not None and existing.status != "queued":
+        return
+    prompt = build_continuation_prompt(event)
+    msg = _callback_dest_message(
+        bot, registration, message_id=message_id, kind=CONTINUATION_KIND
+    )
+    turn = QueuedTurn(
+        msg=msg,
+        key=thread_key,
+        backend="codex",
+        prompt=prompt,
+        store_path=store_path,
+        attachment_config=_attachment_config(),
+        route=Route.DIRECT,
+        task_id=str(event.get("task_id") or registration.get("task_id") or ""),
+        kind=CONTINUATION_KIND,
+        durable_id=None if existing is None else existing.id,
+    )
+    _persist_turn(turn)
+    record = ledger.get(turn.durable_id) if turn.durable_id is not None else None
+    if record is not None and record.status != "queued":
+        return
+    if _already_pending(thread_key, turn.durable_id):
+        return
+    _PENDING_TURNS.setdefault(thread_key, deque()).append(turn)
+    _schedule_queue_drain(thread_key)
+
+
 async def _callback_inbox_loop(bot) -> None:
     while True:
         try:
             await callback_scan_once(
                 active_thread_keys=_ACTIVE_RELAY_THREADS,
                 deliver=lambda registration, text: _deliver_callback_text(bot, registration, text),
+                schedule_continuation=lambda registration, event: _schedule_background_continuation(
+                    bot, registration, event
+                ),
             )
         except Exception:
             log.exception("background callback inbox scan failed")

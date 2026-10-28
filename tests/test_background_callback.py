@@ -508,7 +508,9 @@ def test_marker_registers_strips_and_acks(monkeypatch, tmp_path):
 
     _env(monkeypatch, tmp_path, backend="codex")
     state, _ = _callback_env(monkeypatch, tmp_path)
-    marker = "TGR_BACKGROUND_HANDOFF:task-9:/private/tmp/handoff.md"
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text("durable handoff", encoding="utf-8")
+    marker = f"TGR_BACKGROUND_HANDOFF:task-9:{handoff}"
     msg = FakeMessage(text="長任務", chat_id=7, message_id=4)
     msg.from_user = SimpleNamespace(id=99)
 
@@ -586,3 +588,91 @@ def test_cli_callback_receive_disabled(monkeypatch, tmp_path):
     _callback_env(monkeypatch, tmp_path, enabled=False)
     monkeypatch.setattr("sys.stdin", SimpleNamespace(buffer=BytesIO(b"{}")))
     assert cli_main(["callback-receive"]) == 4
+
+
+def test_missing_handoff_file_does_not_register(monkeypatch, tmp_path):
+    from tg_cli_relay.background_callback import accept_handoff_marker, CallbackError
+
+    _callback_env(monkeypatch, tmp_path)
+    with pytest.raises(CallbackError) as exc:
+        accept_handoff_marker(
+            "task-missing",
+            str(tmp_path / "no-such.md"),
+            msg=_msg(),
+            thread_key="private:7",
+        )
+    assert exc.value.reason == "missing_handoff"
+    assert list((tmp_path / "callback-state" / "registrations").glob("*/*.json")) == []
+
+
+def test_wrong_bot_fingerprint_is_unknown_task(monkeypatch, tmp_path):
+    _callback_env(monkeypatch, tmp_path)
+    _register(tmp_path)
+    event = _signed_event(SENTINEL_SECRET)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "other-bot:token")
+    assert _receive(event) == (2, "unknown_task")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:TESTTOKEN")
+    assert _receive(event) == (0, "accepted")
+
+
+@pytest.mark.parametrize("status,controller_result", [("failed", "failed"), ("timed_out", "timed_out")])
+def test_failed_and_timed_out_events_also_schedule_continuation(monkeypatch, tmp_path, status, controller_result):
+    _callback_env(monkeypatch, tmp_path)
+    _register(tmp_path, task_id=f"task-{status}")
+    event = _signed_event(
+        SENTINEL_SECRET,
+        task_id=f"task-{status}",
+        status=status,
+        controller_result=controller_result,
+        event_id=str(uuid.uuid4()),
+    )
+    assert _receive(event) == (0, "accepted")
+    scheduled: list[str] = []
+
+    async def schedule(reg, ev):
+        scheduled.append(ev["status"])
+
+    asyncio.run(
+        scan_once(
+            active_thread_keys=set(),
+            deliver=lambda *_: (_ for _ in ()).throw(AssertionError("no direct deliver")),
+            schedule_continuation=schedule,
+        )
+    )
+    assert scheduled == [status]
+
+
+def test_terminal_event_schedules_one_continuation_not_verifier_text(monkeypatch, tmp_path):
+    state, _ = _callback_env(monkeypatch, tmp_path)
+    _register(tmp_path)
+    event = _signed_event(SENTINEL_SECRET, verifier_stdout="獨立驗收：通過")
+    assert _receive(event) == (0, "accepted")
+    scheduled: list[tuple[str, str]] = []
+    delivered: list[str] = []
+
+    async def schedule(reg, ev):
+        scheduled.append((reg["thread_key"], ev["event_id"]))
+
+    async def deliver(reg, text):
+        delivered.append(text)
+
+    asyncio.run(
+        scan_once(
+            active_thread_keys=set(),
+            deliver=deliver,
+            schedule_continuation=schedule,
+        )
+    )
+    assert scheduled == [("private:7", event["event_id"])]
+    assert delivered == []
+    receipt = json.loads((state / "receipts" / "task-1.json").read_text(encoding="utf-8"))
+    assert receipt["status"] == "continuation_queued"
+    asyncio.run(
+        scan_once(
+            active_thread_keys=set(),
+            deliver=deliver,
+            schedule_continuation=schedule,
+        )
+    )
+    assert scheduled == [("private:7", event["event_id"])]
+    assert delivered == []

@@ -1,13 +1,13 @@
-# HMS → WEB1 背景完成回呼
+# HMS → Relay 背景完成回呼
 
-預設關閉。這不是第二個 Telegram bot，也不是第二個 watchdog：WEB1 既有的單一 Relay process 在 marker 出現時凍結目的地；HMS 既有的 `cursor-worker-watchdog` 在任務進入 `done/` 或 `failed/` 之後，先送簽署登記 probe，再於 **HMS 任務 workspace** 跑一次全新 Codex 驗收，最後把凍結的驗收結果送回 WEB1，由同一個 Relay 投遞到原對話。WEB1 **不**跑 Codex。
+預設關閉。這不是第二個 Telegram bot，也不是第二個 watchdog：既有的單一 Relay process 在 **精確的 assistant protocol marker** 出現時，先核對 durable handoff 並凍結目的地，再結束送出該 marker 的主回合（不殺其他 process、不把拆離當成逾時）。HMS 既有的 `cursor-worker-watchdog` 在任務進入 `done/` / `failed/` / timeout 之後送簽署事件；Relay 用同一個 HMAC receiver 去重後，把 **一次** 續行排進原 Codex conversation／session。Inbox **不**再把獨立驗收文字直接送 Telegram，也 **不**另跑一個 verifier 模型。
 
 ## 為什麼沒有第二個 bot／watchdog
 
 - 登記與 inbox 消費都掛在現有 `tg-cli-relay bot`（`post_init=_refresh_telegram_commands` 之後 `asyncio.create_task`，列入 `_BACKGROUND_TASKS`）。
-- 忙碌判斷重用 `_ACTIVE_RELAY_THREADS`，不另建 registry。
-- HMS 端只在現有 daemon 迴圈加一次有界 `enqueue`／`drain`（idle `sleep(10)` 前、每筆任務後 `sleep(2)` 前），不新增 watcher、不另開 poll loop。
-- WEB1 **不**輪詢 HMS queue。
+- 忙碌判斷重用 `_ACTIVE_RELAY_THREADS`，不另建 registry。續行只在主 slot 空閒時執行；新的使用者訊息在 worker 仍 pending／failed／uncertain 時仍可進主對話。
+- HMS 端只在現有 daemon 迴圈加一次有界 `enqueue`／`drain`（idle `sleep(10)` 前、每筆任務後 `sleep(2)` 前），不新增 watcher、不另開 poll loop。Drain **不再**跑獨立 Codex verifier。
+- Relay **不**輪詢 HMS queue。
 
 ## WEB1
 
@@ -55,9 +55,7 @@ Receiver 由 HMS `ssh` stdin 呼叫 `tg-cli-relay callback-receive`（或 0700 w
 | outbox 根目錄 | `HMS_CALLBACK_OUTBOX`（`pending/`、`sent/`、`failed/`；`unknown_task` 進 `failed/`，不進 `sent/`） |
 | secret | `HMS_CALLBACK_SECRET_FILE` |
 | SSH | `HMS_CALLBACK_SSH_CONFIG`、`HMS_CALLBACK_SSH_ALIAS`、`HMS_CALLBACK_SSH_REMOTE_CMD` |
-| HMS verifier argv | `HMS_CALLBACK_VERIFIER_ARGV`（JSON 字串陣列）或 `HMS_CALLBACK_VERIFIER_BIN`（預設 `/Users/ht/.hermes/scripts/tg-relay/codex-device-relay`） |
-| HMS verifier timeout | `HMS_CALLBACK_VERIFIER_TIMEOUT`（預設 600 秒）；prompt 以 argv 最後一段或 `HMS_CALLBACK_VERIFIER_PROMPT=stdin` 傳入，禁止 shell 插值 |
-| watcher drain timeout | `HMS_CALLBACK_DRAIN_TIMEOUT`（預設 900 秒，須大於 verifier timeout） |
+| watcher drain timeout | `HMS_CALLBACK_DRAIN_TIMEOUT`（預設 900 秒；drain 已不再跑模型，此值只覆蓋 transport 重試） |
 | transport attempts | `HMS_CALLBACK_MAX_ATTEMPTS`（預設 60；每次指數退避，上限 60 秒） |
 
 建議 SSH 路由（只記錄路徑，不複製私鑰）：
@@ -72,16 +70,16 @@ Receiver 由 HMS `ssh` stdin 呼叫 `tg-cli-relay callback-receive`（或 0700 w
 必須使用同一個 Relay env、bot token 與 state root。argv 只放 env／Python 路徑，
 不得放 token 或 HMAC secret。未設定時仍使用上述 SSH transport。
 
-Watchdog patch 見 artifacts：`cursor-worker-watchdog.patch`。套用前備份 live `cursor-worker-watchdog.py`。enqueue 只在 queue 檔已進入 `done/` 或 `failed/` 且既有 `notify()`／log 之後；transport 失敗被吞掉，不改分類、不改通知文字、不 `replace()` 回 running。
+Watchdog patch 見 artifacts：`/Users/ht/.hermes/artifacts/relay-background-continuation-20261028/cursor-worker-watchdog.patch`。套用前備份 live `cursor-worker-watchdog.py`。enqueue 只在 queue 檔已進入 `done/` 或 `failed/` 且既有 `notify()`／log 之後；transport 失敗被吞掉，不改分類、不改通知文字、不 `replace()` 回 running。timeout 分類為 `timed_out`，仍走同一條續行事件，不另開 queue。
 
 ## 無害 e2e fixture（deploy 後由 controller 跑）
 
 1. 啟用 flag，確認 secret 與 state root。
-2. 在測試對話送出一輪會印出整段 marker 的 Codex 回合：`TGR_BACKGROUND_HANDOFF:<task_id>:<abs_handoff>`。
-3. 使用者應看到「已登記背景工作…」，看不到 marker 本體。
-4. HMS queue 任務 `callback.enabled=true`，進入 `done/` 或 `failed/` 後 outbox 先送 signed `registration_probe`。
-5. WEB1 回 `registered` 後，HMS 在任務 workspace 跑一次全新 `codex exec`（無 `resume`），原子寫入 verifier 輸出，再送 signed `final_result`。
-6. WEB1 用凍結的 chat／topic 投遞已凍結的驗收文字，寫 `receipts/<task_id>.json`。WEB1 不跑 Codex。
-7. 重送同一 final `event_id` 應為 replay、不重跑模型。壞簽章不得進 inbox。未知登記不得花費 verifier 回合。
+2. 在測試對話送出一輪會印出整段 marker 的 Codex 回合：`TGR_BACKGROUND_HANDOFF:<task_id>:<abs_handoff>`。handoff 檔必須已存在。
+3. 使用者應看到「已登記背景工作…」，看不到 marker 本體；該主回合應已釋放，後續使用者訊息可在 worker 仍 running 時完成。
+4. 共用 queue 任務 `callback.enabled=true`，進入 `done/` / `failed/` / timeout 後 outbox 先送 signed `registration_probe`。
+5. Receiver 回 `registered` 後，outbox **不**跑獨立 verifier，直接送 signed `final_result`。
+6. Relay 在原 Codex session 空閒時續行一次，範圍僅限該 task／handoff／artifacts；用凍結的 chat／topic 投遞 Codex 回覆，寫 `receipts/<task_id>.json`（`continuation_queued`）。
+7. 重送同一 final `event_id` 應為 replay、不排第二次續行。壞簽章不得進 inbox。未知／錯 bot 登記不得排程。in-flight 續行若結果不明，不得自動重跑，也不得暫停後續普通主對話。
 
 本工作樹的單元測試不連網、不打真實 Telegram，不代表 live e2e 已通過。

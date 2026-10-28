@@ -41,6 +41,7 @@ class CodexCliProvider:
         prompt: str,
         on_progress: Callable[[str], None] | None = None,
         thread_key: str | None = None,
+        on_handoff: Callable[[str, str], bool] | None = None,
     ) -> RunResult:
         base: list[str] = [self.codex_bin]
         if self.model:
@@ -59,7 +60,8 @@ class CodexCliProvider:
         else:
             cmd = base + exec_args + [prompt]
         timeout = self.timeout_seconds if self.timeout_seconds > 0 else None
-        if on_progress is None:
+        stream = on_progress is not None or on_handoff is not None
+        if not stream:
             try:
                 proc = (interruptible_run(
                     cmd, thread_key=thread_key, env=os.environ.copy(), timeout=timeout,
@@ -76,53 +78,89 @@ class CodexCliProvider:
                     raw_stderr = raw_stderr.decode("utf-8", "replace")
                 raw_stderr = (raw_stderr + "\nCodex CLI turn exceeded timeout").strip()
             messages = parse_messages_from_jsonl(raw_stdout)
-        else:
-            raw_lines: list[str] = []
-            messages: list[str] = []
-            pending: str | None = None
-            with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file:
-                opts = {"start_new_session": True} if thread_key and os.name == "posix" else {}
-                if thread_key and os.name == "nt":
-                    opts["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-                proc_live = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=stderr_file,
-                    text=True, env=os.environ.copy(), **opts,
-                )
-                timed_out = threading.Event()
+            session_id_from_jsonl = parse_session_id_from_jsonl(raw_stdout)
+            text = "\n".join(messages) if messages else None
+            stdout = text if text is not None else raw_stdout
+            segments = messages if len(messages) > 1 else None
+            return RunResult(
+                stdout=stdout,
+                stderr=raw_stderr,
+                returncode=returncode,
+                session_id=session_id_from_jsonl,
+                stdout_segments=segments,
+            )
 
-                def stop_on_deadline() -> None:
-                    if proc_live.poll() is None:
-                        timed_out.set()
-                        _terminate(proc_live)
+        raw_lines: list[str] = []
+        messages: list[str] = []
+        pending: str | None = None
+        handoff_detached = False
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file:
+            opts = {"start_new_session": True} if thread_key and os.name == "posix" else {}
+            if thread_key and os.name == "nt":
+                opts["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            proc_live = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=stderr_file,
+                text=True, env=os.environ.copy(), **opts,
+            )
+            timed_out = threading.Event()
 
-                watchdog = threading.Timer(timeout, stop_on_deadline) if timeout else None
-                if watchdog is not None:
-                    watchdog.daemon = True
-                try:
-                    with tracked_process(thread_key, proc_live):
-                        if watchdog is not None:
-                            watchdog.start()
-                        assert proc_live.stdout is not None
-                        for line in proc_live.stdout:
-                            raw_lines.append(line)
-                            message = parse_agent_message_line(line)
-                            if message is None:
-                                continue
-                            if pending is not None:
-                                on_progress(pending)
-                            pending = message
-                        returncode = proc_live.wait()
-                finally:
+            def stop_on_deadline() -> None:
+                if proc_live.poll() is None:
+                    timed_out.set()
+                    _terminate(proc_live)
+
+            watchdog = threading.Timer(timeout, stop_on_deadline) if timeout else None
+            if watchdog is not None:
+                watchdog.daemon = True
+            try:
+                with tracked_process(thread_key, proc_live):
                     if watchdog is not None:
-                        watchdog.cancel()
-                stderr_file.seek(0)
-                raw_stderr = stderr_file.read()
-                if timed_out.is_set():
-                    returncode = 124
-                    raw_stderr = (raw_stderr + "\nCodex CLI turn exceeded timeout").strip()
-            raw_stdout = "".join(raw_lines)
-            if pending is not None:
-                messages.append(pending)
+                        watchdog.start()
+                    assert proc_live.stdout is not None
+                    for line in proc_live.stdout:
+                        raw_lines.append(line)
+                        message = parse_agent_message_line(line)
+                        if message is None:
+                            continue
+                        if pending is not None and on_progress is not None:
+                            on_progress(pending)
+                        pending = message
+                        parsed = None
+                        if on_handoff is not None:
+                            from tg_cli_relay.background_callback import parse_handoff_marker
+
+                            parsed = parse_handoff_marker(message)
+                        if parsed is None:
+                            continue
+                        known_sid = (
+                            parse_session_id_from_jsonl("".join(raw_lines)) or session_id
+                        )
+                        if not known_sid:
+                            # Killing before thread.started would drop resume identity.
+                            continue
+                        try:
+                            accepted = bool(on_handoff(parsed[0], parsed[1]))
+                        except Exception:
+                            accepted = False
+                        if not accepted:
+                            continue
+                        handoff_detached = True
+                        _terminate(proc_live)
+                        break
+                    returncode = proc_live.wait()
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
+            stderr_file.seek(0)
+            raw_stderr = stderr_file.read()
+            if handoff_detached:
+                returncode = 0
+            elif timed_out.is_set():
+                returncode = 124
+                raw_stderr = (raw_stderr + "\nCodex CLI turn exceeded timeout").strip()
+        raw_stdout = "".join(raw_lines)
+        if pending is not None:
+            messages.append(pending)
         session_id_from_jsonl = parse_session_id_from_jsonl(raw_stdout)
         text = "\n".join(messages) if messages else None
         stdout = text if text is not None else raw_stdout
@@ -133,6 +171,7 @@ class CodexCliProvider:
             returncode=returncode,
             session_id=session_id_from_jsonl,
             stdout_segments=segments,
+            handoff_detached=handoff_detached,
         )
 
 

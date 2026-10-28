@@ -191,6 +191,7 @@ class CodexAppServerProvider:
         on_progress: Callable[[str], None] | None = None,
         thread_key: str | None = None,
         on_session: Callable[[str], None] | None = None,
+        on_handoff: Callable[[str, str], bool] | None = None,
     ) -> RunResult:
         timeout = (float(os.environ.get("TGR_CODEX_APP_TURN_TIMEOUT", "7200"))
                    if self.timeout_seconds is None else self.timeout_seconds)
@@ -200,7 +201,7 @@ class CodexAppServerProvider:
                 runtime.client, workspace=workspace, session_id=session_id,
                 prompt=prompt, model=self.model, bypass=self.bypass,
                 timeout=timeout, on_progress=on_progress, thread_key=thread_key,
-                on_session=on_session,
+                on_session=on_session, on_handoff=on_handoff,
             ),
             timeout=timeout + 90 if timeout > 0 else None,
         )
@@ -212,6 +213,7 @@ async def _run_turn(
     on_progress: Callable[[str], None] | None,
     thread_key: str | None = None,
     on_session: Callable[[str], None] | None = None,
+    on_handoff: Callable[[str, str], bool] | None = None,
 ) -> RunResult:
     await client.start()
     policy = "danger-full-access" if bypass else os.environ.get("TGR_CODEX_APP_SANDBOX", "workspace-write")
@@ -239,6 +241,7 @@ async def _run_turn(
     pending: str | None = None
     error: str | None = None
     timed_out = False
+    handoff_detached = False
     try:
         args = {
             "threadId": thread_id, "cwd": workspace,
@@ -258,7 +261,7 @@ async def _run_turn(
                     "threadId": thread_id, "turnId": turn_id,
                 }, timeout=10)
         async def receive() -> None:
-            nonlocal pending, error
+            nonlocal pending, error, handoff_detached
             while True:
                 event = await inbox.get()
                 method = event.get("method")
@@ -280,6 +283,27 @@ async def _run_turn(
                             if pending:
                                 messages.append(pending)
                             pending = content
+                            parsed = None
+                            if on_handoff is not None:
+                                from tg_cli_relay.background_callback import parse_handoff_marker
+
+                                parsed = parse_handoff_marker(content)
+                            if parsed is not None:
+                                try:
+                                    accepted = bool(on_handoff(parsed[0], parsed[1]))
+                                except Exception:
+                                    accepted = False
+                                if accepted:
+                                    handoff_detached = True
+                                    try:
+                                        await client.request(
+                                            "turn/interrupt",
+                                            {"threadId": thread_id, "turnId": turn_id},
+                                            timeout=10,
+                                        )
+                                    except Exception:
+                                        log.warning("Codex handoff interrupt failed")
+                                    return
                 if method == "error" and not params.get("willRetry", False):
                     error_obj = params.get("error") or {}
                     error = error_obj.get("message") if isinstance(error_obj, dict) else str(error_obj)
@@ -320,9 +344,15 @@ async def _run_turn(
     if pending:
         messages.append(pending)
     text = "\n".join(messages)
+    if handoff_detached:
+        returncode = 0
+        error = None
+    else:
+        returncode = 124 if timed_out else (1 if error else 0)
     return RunResult(
-        stdout=text, stderr=error or "", returncode=124 if timed_out else (1 if error else 0),
+        stdout=text, stderr=error or "", returncode=returncode,
         session_id=thread_id, stdout_segments=messages if len(messages) > 1 else None,
+        handoff_detached=handoff_detached,
     )
 
 

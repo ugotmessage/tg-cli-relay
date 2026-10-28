@@ -34,6 +34,7 @@ TERMINAL_RESULTS = (
     "worker_done_validation_failed",
     "blocked_before_worker",
     "failed",
+    "timed_out",
 )
 
 
@@ -74,6 +75,7 @@ def _outbox_env(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("HMS_CALLBACK_SSH_ALIAS", "snote-internal-ssh")
     monkeypatch.setenv("HMS_CALLBACK_SSH_REMOTE_CMD", "/usr/local/sbin/tg-cli-relay-callback-receive")
     monkeypatch.setenv("HMS_CALLBACK_ALLOWED_ROOTS", str(tmp_path))
+    monkeypatch.delenv("HMS_CALLBACK_LOCAL_RECEIVER_ARGV", raising=False)
     (tmp_path / "ssh-config").write_text("Host snote-internal-ssh\n", encoding="utf-8")
     monkeypatch.setattr(outbox, "utcnow_iso", lambda: "2026-10-28T03:54:00Z")
     return root
@@ -98,7 +100,7 @@ def test_enqueue_disabled_is_noop(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("controller_result", TERMINAL_RESULTS)
-def test_each_terminal_invokes_one_hms_verifier_after_probe(monkeypatch, tmp_path, controller_result):
+def test_each_terminal_skips_verifier_and_sends_passthrough_final(monkeypatch, tmp_path, controller_result):
     _callback_env(monkeypatch, tmp_path)
     root = _outbox_env(monkeypatch, tmp_path)
     _register(tmp_path)
@@ -148,11 +150,14 @@ def test_each_terminal_invokes_one_hms_verifier_after_probe(monkeypatch, tmp_pat
         outbox.ssh_runner = None
         outbox.verifier_runner = None
     assert captured["kinds"] == [KIND_PROBE, KIND_FINAL]
-    assert captured["verifier"] == 1
+    assert captured["verifier"] == 0
     sent = json.loads(next((root / "sent").glob("*.json")).read_text(encoding="utf-8"))
-    assert sent["verifier"]["stdout"].startswith("獨立驗收：通過")
+    assert sent["verifier"]["mode"] == "passthrough"
+    assert "passthrough" in sent["verifier"]["stdout"]
     assert sent["final_event"]["kind"] == KIND_FINAL
     assert sent["final_event"]["controller_result"] == controller_result
+    if controller_result == "timed_out":
+        assert sent["final_event"]["status"] == "timed_out"
     assert SENTINEL_SECRET.decode() not in json.dumps(sent)
 
 
@@ -189,7 +194,7 @@ def test_unknown_registration_invokes_zero_verifiers(monkeypatch, tmp_path):
     assert list((root / "sent").glob("*.json")) == []
 
 
-def test_verifier_result_survives_restart_and_transport_retry(monkeypatch, tmp_path):
+def test_passthrough_result_survives_restart_and_transport_retry(monkeypatch, tmp_path):
     _callback_env(monkeypatch, tmp_path)
     root = _outbox_env(monkeypatch, tmp_path)
     _register(tmp_path)
@@ -219,21 +224,21 @@ def test_verifier_result_survives_restart_and_transport_retry(monkeypatch, tmp_p
         pending = list((root / "pending").glob("*.json"))
         assert len(pending) == 1
         record = json.loads(pending[0].read_text(encoding="utf-8"))
-        assert record["verifier"]["stdout"].startswith("凍結驗收輸出")
-        assert record["final_event"]["verifier_stdout"].startswith("凍結驗收輸出")
-        assert calls["verifier"] == 1
+        assert record["verifier"]["mode"] == "passthrough"
+        assert "passthrough" in record["final_event"]["verifier_stdout"]
+        assert calls["verifier"] == 0
         record["next_ok_at"] = 0
         pending[0].write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         assert outbox.main(["drain"]) == 0
     finally:
         outbox.ssh_runner = None
         outbox.verifier_runner = None
-    assert calls["verifier"] == 1
+    assert calls["verifier"] == 0
     sent = json.loads(next((root / "sent").glob("*.json")).read_text(encoding="utf-8"))
-    assert sent["final_event"]["verifier_stdout"].startswith("凍結驗收輸出")
+    assert "passthrough" in sent["final_event"]["verifier_stdout"]
     assert list((root / "pending").glob("*.json")) == []
     assert outbox.main(["drain"]) == 0
-    assert calls["verifier"] == 1
+    assert calls["verifier"] == 0
 
 
 def test_path_ssh_and_fake_verifier_executable(monkeypatch, tmp_path):
@@ -283,15 +288,11 @@ def test_path_ssh_and_fake_verifier_executable(monkeypatch, tmp_path):
     assert "BatchMode=yes" in argv_text
     assert "snote-internal-ssh" in argv_text
     assert SENTINEL_SECRET.decode() not in argv_text
-    codex_tokens = [line.strip() for line in (tmp_path / "codex.argv").read_text(encoding="utf-8").splitlines()]
-    assert "exec" in codex_tokens
-    assert "resume" not in set(codex_tokens)
-    assert str(tmp_path / "workspace") in codex_tokens
-    assert SENTINEL_SECRET.decode() not in "\n".join(codex_tokens)
-    cwd = (tmp_path / "codex.cwd").read_text(encoding="utf-8").strip()
-    assert Path(cwd).resolve() == (tmp_path / "workspace").resolve()
+    assert not (tmp_path / "codex.argv").exists()
     sent = list((root / "sent").glob("*.json"))
     assert len(sent) == 1
+    payload = json.loads(sent[0].read_text(encoding="utf-8"))
+    assert payload["verifier"]["mode"] == "passthrough"
 
 
 def test_canonical_hmac_matches_relay_helper():

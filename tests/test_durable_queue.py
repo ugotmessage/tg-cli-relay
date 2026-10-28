@@ -18,6 +18,24 @@ def _add(db: Path, *, mid=1, kind="parent", prompt="原始指令", thread="priva
     )
 
 
+def test_uncertain_continuation_does_not_pause_review_threads(tmp_path):
+    db = tmp_path / "sessions.sqlite3"
+    store = DurableQueue(db)
+    cont = store.add(
+        thread_key="private:7", backend="codex", prompt="續行",
+        kind="background_continuation", chat_id=7, message_id=1_000_000_001, topic_id=None,
+    )
+    user = store.add(
+        thread_key="private:7", backend="codex", prompt="新問題",
+        kind="parent", chat_id=7, message_id=12, topic_id=None,
+    )
+    assert store.start(cont)
+    assert store.mark_interrupted_uncertain() == 1
+    assert store.review_threads() == set()
+    assert [r.id for r in store.load_queued()] == [user]
+    assert {r.status for r in store.open_items("private:7")} == {"queued", "needs_review"}
+
+
 def test_durable_queue_idempotence_and_uncertain_state(tmp_path):
     db = tmp_path / "sessions.sqlite3"
     first = _add(db, mid=10)

@@ -61,6 +61,8 @@ def apply_background_callback_prefix(prompt: str) -> str:
         "other text in that message: "
         "TGR_BACKGROUND_HANDOFF:<same task id>:<same absolute handoff path>. "
         "Do not emit the marker before both the queue JSON and handoff file exist. "
+        "Relay will then detach this turn and preserve the session; do not wait for the "
+        "worker. A later continuation will resume this conversation with the task result. "
         "Do not use this marker for inline workers or non-shared queues.\n\n"
     )
     return f"{prefix}{prompt}"
@@ -302,6 +304,7 @@ def relay_turn(
     store: SessionStore | None = None,
     workspace: str | None = None,
     on_progress: Callable[[str], None] | None = None,
+    on_handoff: Callable[[str, str], bool] | None = None,
     routing_only: bool = False,
 ) -> RunResult:
     """依 thread_key 接續或建立後端 session，送出一輪 prompt。"""
@@ -315,16 +318,26 @@ def relay_turn(
     if backend == "cursor":
         result = _relay_cursor(st, thread_key, ws, prompt, routing_only=routing_only)
     elif backend == "codex":
-        result = _relay_codex(st, thread_key, ws, prompt, on_progress=on_progress, routing_only=routing_only)
+        result = _relay_codex(
+            st, thread_key, ws, prompt,
+            on_progress=on_progress, on_handoff=on_handoff, routing_only=routing_only,
+        )
     elif backend == "claude":
         result = _relay_claude(st, thread_key, ws, prompt)
     elif backend == "opencode":
         result = _relay_opencode(st, thread_key, ws, prompt)
     else:
         raise ValueError(f"未知後端: {backend}")
-    if result.returncode == 0:
+    if result.returncode == 0 or result.handoff_detached:
+        from tg_cli_relay.background_callback import feature_enabled, find_handoff_markers
+
+        visible = result.stdout
+        if feature_enabled():
+            remaining, markers = find_handoff_markers(result)
+            if markers and remaining is not None:
+                visible = "\n".join(remaining)
         context.acknowledge(thread_key, epoch, backend, delivered_through)
-        context.complete(thread_key, epoch, prompt, result.stdout)
+        context.complete(thread_key, epoch, prompt, visible)
     return result
 
 
@@ -433,6 +446,7 @@ def _relay_codex(
     prompt: str,
     *,
     on_progress: Callable[[str], None] | None = None,
+    on_handoff: Callable[[str, str], bool] | None = None,
     routing_only: bool = False,
 ) -> RunResult:
     import os
@@ -463,15 +477,18 @@ def _relay_codex(
     # Never auto-call Cursor/Claude/OpenCode or ask the Relay router for a
     # delegation decision. Codex follows its own workspace/knowledge rules.
     codex_prompt = apply_background_callback_prefix(prompt)
+    extra: dict = {"thread_key": thread_key, "on_handoff": on_handoff}
+    if transport == "app-server":
+        extra["on_session"] = lambda new_sid: store.upsert(
+            thread_key, "codex", new_sid, workspace=workspace
+        )
     res = prov.run_turn(
         workspace=workspace, session_id=sid,
         prompt=ConversationContext(store.db_path).prompt(
             thread_key, codex_prompt, include_history=not sid, consumer="codex"
         ),
         on_progress=on_progress,
-        **({"thread_key": thread_key, "on_session": lambda sid: store.upsert(
-            thread_key, "codex", sid, workspace=workspace
-        )} if transport == "app-server" else {"thread_key": thread_key}),
+        **extra,
     )
     if res.session_id and res.session_id != sid:
         store.upsert(thread_key, "codex", res.session_id, workspace=workspace)

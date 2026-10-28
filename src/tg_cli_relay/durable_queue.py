@@ -83,6 +83,25 @@ class DurableQueue:
             assert row is not None
             return int(row["id"])
 
+    def lookup(self, *, thread_key: str, message_id: int, kind: str) -> QueueRecord | None:
+        with self._conn() as con:
+            row = con.execute(
+                """
+                SELECT * FROM relay_pending_turns
+                WHERE thread_key=? AND message_id=? AND kind=?
+                """,
+                (thread_key, message_id, kind),
+            ).fetchone()
+            return _record(row) if row is not None else None
+
+    def get(self, qid: int) -> QueueRecord | None:
+        with self._conn() as con:
+            row = con.execute(
+                "SELECT * FROM relay_pending_turns WHERE id=?",
+                (qid,),
+            ).fetchone()
+            return _record(row) if row is not None else None
+
     def start(self, qid: int) -> bool:
         with self._conn() as con:
             cur = con.execute("""
@@ -151,10 +170,16 @@ class DurableQueue:
             return [_record(row) for row in rows]
 
     def review_threads(self) -> set[str]:
+        """Threads whose *main* execution is uncertain.
+
+        Background continuations that crashed in-flight stay needs_review so
+        they are never auto-replayed, but they must not pause ordinary chat.
+        """
         with self._conn() as con:
             return {str(row[0]) for row in con.execute("""
                 SELECT DISTINCT thread_key FROM relay_pending_turns
                 WHERE status='needs_review'
+                  AND kind != 'background_continuation'
             """)}
 
 

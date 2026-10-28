@@ -5,10 +5,10 @@ Enqueue writes a durable pending record BEFORE any network or model call.
 Drain then:
 
 1. Sends a small signed ``registration_probe`` (no Telegram, no model).
-2. On ``registered``, runs **one fresh Codex turn on HMS** in the validated
-   task workspace (never ``resume``).
-3. Persists verifier stdout/stderr/returncode atomically.
-4. Sends a signed ``final_result`` that WEB1 only verifies and delivers.
+2. On ``registered``, persists a passthrough payload (no independent Codex
+   verifier; original-session continuation runs on the Relay).
+3. Sends a signed ``final_result`` that the authenticated receiver accepts
+   once and schedules as a continuation of the original Codex conversation.
 
 This module must not import tg_cli_relay. HMAC canonicalization is duplicated
 on purpose and is proven identical by tests.
@@ -68,6 +68,7 @@ ALLOWED_CONTROLLER_RESULTS = frozenset(
         "worker_done_validation_failed",
         "blocked_before_worker",
         "failed",
+        "timed_out",
     }
 )
 
@@ -265,7 +266,12 @@ def build_final_event(
 ) -> dict[str, Any]:
     if controller_result not in ALLOWED_CONTROLLER_RESULTS:
         raise SystemExit("malformed")
-    status = "done" if controller_result == "complete" else "failed"
+    if controller_result == "complete":
+        status = "done"
+    elif controller_result == "timed_out":
+        status = "timed_out"
+    else:
+        status = "failed"
     event: dict[str, Any] = {
         "schema_version": 1,
         "kind": KIND_FINAL,
@@ -645,11 +651,25 @@ def _secret() -> bytes:
     return load_secret_file(Path(secret_path))
 
 
+def _passthrough_verifier(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Deterministic payload so the original Codex session is the only model turn."""
+    line = (
+        f"passthrough controller_result={record.get('controller_result')} "
+        f"handoff_path={record.get('handoff_path')}"
+    )
+    return {
+        "stdout": bound_text(line, MAX_VERIFIER_STDOUT),
+        "stderr": "",
+        "returncode": 0,
+        "completed_at": utcnow_iso(),
+        "mode": "passthrough",
+    }
+
+
 def cmd_drain() -> int:
     root = outbox_root()
     secret = _secret()
     now = time.time()
-    ran_verifier = False
     attempt_limit = max_drain_attempts()
     for pending in sorted((root / "pending").glob("*.json")):
         record = json.loads(pending.read_text(encoding="utf-8"))
@@ -693,30 +713,9 @@ def cmd_drain() -> int:
             continue
 
         if record.get("verifier") is None:
-            if ran_verifier:
-                continue
-            try:
-                completed = run_hms_verifier(record, secret)
-            except Exception as exc:
-                record["attempts"] = int(record.get("attempts") or 0) + 1
-                record["last_reason"] = redact_secret_material(type(exc).__name__, secret)
-                if int(record["attempts"]) >= attempt_limit:
-                    _fail_record(root, pending, record, event_id)
-                    continue
-                _backoff(record, now)
-                write_json(pending, record)
-                continue
-            stdout = redact_secret_material(_bytes_to_text(completed.stdout), secret)
-            stderr = redact_secret_material(_bytes_to_text(completed.stderr), secret)
-            record["verifier"] = {
-                "stdout": bound_text(stdout, MAX_VERIFIER_STDOUT),
-                "stderr": bound_text(stderr, MAX_VERIFIER_STDERR),
-                "returncode": int(completed.returncode),
-                "completed_at": utcnow_iso(),
-            }
+            record["verifier"] = _passthrough_verifier(record)
             record["phase"] = "deliver"
             write_json(pending, record)
-            ran_verifier = True
 
         if record.get("final_event") is None:
             record["final_event"] = build_final_event(
