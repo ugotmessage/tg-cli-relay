@@ -1,4 +1,4 @@
-"""HMS → WEB1 background callback: registration, HMAC receive, inbox consumer."""
+"""WEB1 callback: registration, HMAC receive, inbox delivery. Never runs Codex."""
 
 from __future__ import annotations
 
@@ -15,16 +15,16 @@ from unittest.mock import patch
 import pytest
 
 from tg_cli_relay.background_callback import (
+    KIND_FINAL,
+    KIND_PROBE,
     MAX_EVENT_BYTES,
     MAX_SNAPSHOT_BYTES,
-    build_verification_prompt,
     feature_enabled,
     find_handoff_markers,
     parse_handoff_marker,
     receive_event_bytes,
     receive_from_stdin,
     register_from_relay_context,
-    run_fresh_verifier,
     scan_once,
     sign_event,
     write_receipt,
@@ -75,6 +75,27 @@ def _register(tmp_path: Path, *, task_id: str = "task-1", handoff: str | None = 
     )
 
 
+def _signed_probe(
+    secret: bytes,
+    *,
+    task_id: str = "task-1",
+    event_id: str | None = None,
+    occurred_at: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    event = {
+        "schema_version": 1,
+        "kind": KIND_PROBE,
+        "event_id": event_id or str(uuid.uuid4()),
+        "task_id": task_id,
+        "occurred_at": occurred_at or "2026-10-28T03:54:00Z",
+    }
+    if extra:
+        event.update(extra)
+    event["hmac"] = sign_event(event, secret)
+    return event
+
+
 def _signed_event(
     secret: bytes,
     *,
@@ -86,9 +107,12 @@ def _signed_event(
     handoff_path: str = "/private/tmp/callback-task-1.md",
     extra: dict | None = None,
     snapshot: str | None = None,
+    verifier_stdout: str = "獨立驗收：通過",
+    verifier_returncode: int = 0,
 ) -> dict:
     event = {
         "schema_version": 1,
+        "kind": KIND_FINAL,
         "event_id": event_id or str(uuid.uuid4()),
         "task_id": task_id,
         "status": status,
@@ -100,6 +124,8 @@ def _signed_event(
         "handoff_size": None,
         "handoff_snapshot": snapshot,
         "artifact": None,
+        "verifier_stdout": verifier_stdout,
+        "verifier_returncode": verifier_returncode,
     }
     if extra:
         event.update(extra)
@@ -113,7 +139,7 @@ def _receive(event: dict) -> tuple[int, str]:
     return result.code, result.reason
 
 
-async def _consume(verifier, deliver, busy: set[str] | None = None) -> None:
+async def _consume(deliver, busy: set[str] | None = None, verifier=None) -> None:
     await scan_once(active_thread_keys=busy or set(), deliver=deliver, verifier=verifier)
 
 
@@ -146,8 +172,20 @@ def test_marker_is_whole_message_only():
     assert remaining == ["步驟完成"]
 
 
-def test_valid_signed_event_one_verifier_one_delivery(monkeypatch, tmp_path):
-    state, secret = _callback_env(monkeypatch, tmp_path)
+def test_probe_registered_or_unknown_without_inbox_or_telegram(monkeypatch, tmp_path):
+    state, _ = _callback_env(monkeypatch, tmp_path)
+    probe = _signed_probe(SENTINEL_SECRET)
+    assert _receive(probe) == (2, "unknown_task")
+    assert list((state / "inbox" / "new").glob("*.json")) == []
+    _register(tmp_path)
+    assert _receive(probe) == (0, "registered")
+    assert list((state / "inbox" / "new").glob("*.json")) == []
+    assert list((state / "receipts").glob("*.json")) == []
+    assert _receive(probe) == (0, "registered")
+
+
+def test_valid_final_result_zero_web1_verifiers_one_delivery(monkeypatch, tmp_path):
+    state, _ = _callback_env(monkeypatch, tmp_path)
     _register(tmp_path)
     event = _signed_event(SENTINEL_SECRET)
     assert _receive(event) == (0, "accepted")
@@ -158,23 +196,21 @@ def test_valid_signed_event_one_verifier_one_delivery(monkeypatch, tmp_path):
 
     def verifier(*, workspace, prompt):
         calls.append((workspace, prompt))
-        assert workspace == str(tmp_path / "ws")
-        assert "hmac" not in prompt
-        return RunResult("驗收通過", "", 0)
+        raise AssertionError("WEB1 must not run a verifier")
 
     async def deliver(reg, text):
         delivered.append(text)
         assert reg["chat_id"] == 7
         assert reg["thread_key"] == "private:7"
 
-    asyncio.run(_consume(verifier, deliver))
-    assert len(calls) == 1
-    assert delivered == ["驗收通過"]
+    asyncio.run(_consume(deliver, verifier=verifier))
+    assert calls == []
+    assert delivered == ["獨立驗收：通過"]
     receipt = json.loads((state / "receipts" / "task-1.json").read_text(encoding="utf-8"))
     assert receipt["status"] == "completed"
     assert SENTINEL_SECRET.decode() not in json.dumps(receipt)
-    asyncio.run(_consume(verifier, deliver))
-    assert len(calls) == 1
+    asyncio.run(_consume(deliver, verifier=verifier))
+    assert calls == []
     assert len(delivered) == 1
 
 
@@ -204,6 +240,8 @@ def test_receive_rejects_without_model_or_telegram(monkeypatch, tmp_path):
     huge["hmac"] = "ab"
     assert _receive(huge) == (3, "oversized")
     assert _receive(_resign(event, task_id="other-task")) == (2, "unknown_task")
+    probe = _signed_probe(SENTINEL_SECRET, extra={"chat_id": 7})
+    assert _receive(probe) == (3, "poisoned")
 
 
 def test_unequal_length_hmac_is_bad_signature(monkeypatch, tmp_path):
@@ -217,7 +255,7 @@ def test_unequal_length_hmac_is_bad_signature(monkeypatch, tmp_path):
 
 
 def test_future_timestamp_and_conflict_and_symlink(monkeypatch, tmp_path):
-    state, secret = _callback_env(monkeypatch, tmp_path)
+    _callback_env(monkeypatch, tmp_path)
     _register(tmp_path)
     future = _signed_event(SENTINEL_SECRET, occurred_at="2026-10-28T04:10:00Z")
     assert _receive(future) == (3, "future_timestamp")
@@ -272,7 +310,7 @@ def test_pending_running_never_wake_codex(monkeypatch, tmp_path):
         return RunResult("nope", "", 0)
 
     delivered: list[str] = []
-    asyncio.run(_consume(verifier, lambda r, t: delivered.append(t) or asyncio.sleep(0)))
+    asyncio.run(_consume(lambda r, t: delivered.append(t) or asyncio.sleep(0), verifier=verifier))
     assert calls == []
     assert delivered
     assert "獨立驗收未啟動" in delivered[0] or "未通過" in delivered[0]
@@ -281,69 +319,65 @@ def test_pending_running_never_wake_codex(monkeypatch, tmp_path):
 def test_active_thread_defers_then_restart_recovers(monkeypatch, tmp_path):
     state, _ = _callback_env(monkeypatch, tmp_path)
     _register(tmp_path)
-    event = _signed_event(SENTINEL_SECRET)
+    event = _signed_event(SENTINEL_SECRET, verifier_stdout="ok")
     assert _receive(event) == (0, "accepted")
     calls: list[str] = []
 
     def verifier(**kwargs):
         calls.append("v")
-        return RunResult("ok", "", 0)
+        return RunResult("should-not-run", "", 0)
 
     delivered: list[str] = []
 
     async def deliver(reg, text):
         delivered.append(text)
 
-    asyncio.run(_consume(verifier, deliver, busy={"private:7"}))
+    asyncio.run(_consume(deliver, busy={"private:7"}, verifier=verifier))
     assert calls == []
     assert (state / "inbox" / "new" / f"{event['event_id']}.json").is_file()
-    asyncio.run(_consume(verifier, deliver, busy=set()))
-    assert calls == ["v"]
+    asyncio.run(_consume(deliver, busy=set(), verifier=verifier))
+    assert calls == []
     assert delivered == ["ok"]
     receipt = json.loads((state / "receipts" / "task-1.json").read_text(encoding="utf-8"))
     claimed = state / "inbox" / "claimed" / f"{event['event_id']}.json"
     if claimed.exists():
-        asyncio.run(_consume(verifier, deliver))
-    assert calls == ["v"]
+        asyncio.run(_consume(deliver, verifier=verifier))
+    assert calls == []
     assert receipt["status"] == "completed"
 
 
-def test_verifier_and_delivery_failures_are_bounded(monkeypatch, tmp_path):
-    _callback_env(monkeypatch, tmp_path)
-    _register(tmp_path, task_id="task-v")
-    event = _signed_event(SENTINEL_SECRET, task_id="task-v")
+def test_delivery_failure_retries_persisted_output_only(monkeypatch, tmp_path):
+    state, _ = _callback_env(monkeypatch, tmp_path)
+    _register(tmp_path, task_id="task-d")
+    event = _signed_event(SENTINEL_SECRET, task_id="task-d", verifier_stdout="通過")
     assert _receive(event) == (0, "accepted")
     calls: list[str] = []
 
     def verifier(**kwargs):
         calls.append("v")
-        return RunResult("", "boom", 1)
-
-    delivered: list[str] = []
-    asyncio.run(_consume(verifier, lambda r, t: delivered.append(t) or asyncio.sleep(0)))
-    assert calls == ["v"]
-    assert any("驗收失敗" in item for item in delivered)
-
-    _register(tmp_path, task_id="task-d")
-    event2 = _signed_event(SENTINEL_SECRET, task_id="task-d")
-    assert _receive(event2) == (0, "accepted")
-    calls.clear()
-    delivered.clear()
-
-    def ok_verifier(**kwargs):
-        calls.append("v")
-        return RunResult("通過", "", 0)
+        return RunResult("nope", "", 0)
 
     async def boom_deliver(reg, text):
         raise RuntimeError("telegram down")
 
-    asyncio.run(_consume(ok_verifier, boom_deliver))
-    assert calls == ["v"]
-    asyncio.run(_consume(ok_verifier, boom_deliver))
-    assert calls == ["v"]
+    asyncio.run(_consume(boom_deliver, verifier=verifier))
+    assert calls == []
+    pending = json.loads((state / "receipts" / "task-d.json").read_text(encoding="utf-8"))
+    assert pending["status"] == "verified_pending_delivery"
+    assert pending["verifier_stdout"] == "通過"
+    asyncio.run(_consume(boom_deliver, verifier=verifier))
+    assert calls == []
+    delivered: list[str] = []
+
+    async def ok_deliver(reg, text):
+        delivered.append(text)
+
+    asyncio.run(_consume(ok_deliver, verifier=verifier))
+    assert calls == []
+    assert delivered == ["通過"]
 
 
-def test_crash_after_verifier_does_not_rerun_on_restart(monkeypatch, tmp_path):
+def test_crash_after_pending_receipt_does_not_rerun_model(monkeypatch, tmp_path):
     state, _ = _callback_env(monkeypatch, tmp_path)
     _register(tmp_path)
     event = _signed_event(SENTINEL_SECRET)
@@ -369,19 +403,19 @@ def test_crash_after_verifier_does_not_rerun_on_restart(monkeypatch, tmp_path):
         delivered.append(text)
 
     with pytest.raises(RuntimeError, match="crash after verifier receipt"):
-        asyncio.run(_consume(verifier, deliver))
-    assert calls == ["v"]
+        asyncio.run(_consume(deliver, verifier=verifier))
+    assert calls == []
     assert delivered == []
     pending = json.loads((state / "receipts" / "task-1.json").read_text(encoding="utf-8"))
     assert pending["status"] == "verified_pending_delivery"
-    assert pending["verifier_stdout"] == "驗收通過"
+    assert pending["verifier_stdout"] == "獨立驗收：通過"
     assert pending["delivered"] is False
     assert (state / "inbox" / "claimed" / f"{event['event_id']}.json").is_file()
 
     monkeypatch.setattr("tg_cli_relay.background_callback.write_receipt", real_write)
-    asyncio.run(_consume(verifier, deliver))
-    assert calls == ["v"]
-    assert delivered == ["驗收通過"]
+    asyncio.run(_consume(deliver, verifier=verifier))
+    assert calls == []
+    assert delivered == ["獨立驗收：通過"]
     receipt = json.loads((state / "receipts" / "task-1.json").read_text(encoding="utf-8"))
     assert receipt["status"] == "completed"
     assert receipt["delivered"] is True
@@ -399,15 +433,12 @@ def test_secret_sentinel_absent_from_logs_errors_receipts(monkeypatch, tmp_path,
     event["hmac"] = "00" * 32
     code, reason = _receive(event)
     assert reason == "bad_signature"
-    blob = caplog.text + reason + json.dumps(event)
-    # hmac/token of the secret itself must not be echoed as a leak
     assert SENTINEL_SECRET.decode() not in caplog.text
     assert SENTINEL_SECRET.decode() not in reason
     receipt_dir = state / "receipts"
     for path in receipt_dir.glob("*.json") if receipt_dir.exists() else []:
         assert SENTINEL_SECRET.decode() not in path.read_text(encoding="utf-8")
     assert code == 3
-    del blob
 
 
 def test_callback_disabled_preserves_relay_behavior(monkeypatch, tmp_path):
@@ -486,43 +517,6 @@ def test_watchdog_transport_failure_does_not_alter_classification():
     )
     assert watchdog_callback_hooks.map_controller_result("contract")[0] == "blocked_before_worker"
     assert watchdog_callback_hooks.map_controller_result("error", "boom")[0] == "failed"
-
-
-def test_fresh_verifier_uses_session_none(monkeypatch, tmp_path):
-    captured: dict = {}
-
-    class FakeProvider:
-        def __init__(self, **kwargs):
-            pass
-
-        def run_turn(self, **kwargs):
-            captured.update(kwargs)
-            return RunResult("ok", "", 0)
-
-    monkeypatch.setattr("tg_cli_relay.providers.codex_cli.CodexCliProvider", FakeProvider)
-    result = run_fresh_verifier(workspace=str(tmp_path), prompt="verify")
-    assert result.stdout == "ok"
-    assert captured["session_id"] is None
-    assert captured["workspace"] == str(tmp_path)
-
-
-def test_prompt_omits_destination_and_hmac():
-    prompt = build_verification_prompt(
-        {"thread_key": "private:7", "chat_id": 7, "relay_workspace": "/tmp/ws"},
-        {
-            "task_id": "t",
-            "controller_result": "complete",
-            "controller_detail": "ok",
-            "handoff_path": "/private/tmp/a.md",
-            "handoff_sha256": None,
-            "handoff_size": None,
-            "artifact": None,
-            "hmac": "should-not-appear",
-            "chat_id": 7,
-        },
-    )
-    assert "should-not-appear" not in prompt
-    assert "chat_id" not in prompt
 
 
 def test_cli_callback_receive_disabled(monkeypatch, tmp_path):

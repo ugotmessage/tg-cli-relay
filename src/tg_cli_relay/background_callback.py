@@ -1,8 +1,10 @@
 """WEB1 verified completion callback: marker, registration, HMAC receiver, inbox.
 
 Opt-in via TGR_BACKGROUND_HANDOFF (unset/0/false/no/off = disabled). WEB1 never
-polls the HMS queue. Destination identity is frozen at registration from Relay
-context only; later events cannot retarget Telegram.
+polls the HMS queue and never runs Codex. Destination identity is frozen at
+registration from Relay context only; later events cannot retarget Telegram.
+Independent verification happens on HMS; WEB1 only accepts a signed
+registration probe or a signed final-result and delivers the frozen text.
 """
 
 from __future__ import annotations
@@ -10,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import inspect
 import json
 import logging
 import os
@@ -24,6 +25,9 @@ from typing import Any, Awaitable, Callable, Mapping
 from tg_cli_relay.providers.base import RunResult
 
 log = logging.getLogger(__name__)
+
+KIND_PROBE = "registration_probe"
+KIND_FINAL = "final_result"
 
 MARKER_RE = re.compile(
     r"^TGR_BACKGROUND_HANDOFF:([A-Za-z0-9][A-Za-z0-9._-]{0,127}):(/[^\s]+)$"
@@ -62,8 +66,17 @@ ALLOWED_CONTROLLER_RESULTS = frozenset(
         "failed",
     }
 )
-REQUIRED_EVENT_KEYS = (
+REQUIRED_PROBE_KEYS = (
     "schema_version",
+    "kind",
+    "event_id",
+    "task_id",
+    "occurred_at",
+    "hmac",
+)
+REQUIRED_FINAL_KEYS = (
+    "schema_version",
+    "kind",
     "event_id",
     "task_id",
     "status",
@@ -74,8 +87,11 @@ REQUIRED_EVENT_KEYS = (
     "handoff_sha256",
     "handoff_size",
     "artifact",
+    "verifier_stdout",
+    "verifier_returncode",
     "hmac",
 )
+REQUIRED_EVENT_KEYS = REQUIRED_FINAL_KEYS
 
 PENDING_ACK = "已登記背景工作，完成後會獨立驗收並回覆此對話。"
 REGISTER_FAIL_ACK = "無法登記背景工作，請稍後再試。"
@@ -438,9 +454,11 @@ def _looks_like_uuid(value: str) -> bool:
     return True
 
 
-def receive_event_bytes(data: bytes, env: Mapping[str, str] | None = None) -> ReceiveResult:
+def _common_receive_preamble(
+    data: bytes, env: Mapping[str, str] | None
+) -> tuple[ReceiveResult | None, dict[str, Any] | None, Path | None, int]:
     if not feature_enabled(env):
-        return ReceiveResult(4, "disabled")
+        return ReceiveResult(4, "disabled"), None, None, 0
     try:
         secret_path = _secret_file_path(env)
         secret = load_secret_file(secret_path)
@@ -448,44 +466,114 @@ def receive_event_bytes(data: bytes, env: Mapping[str, str] | None = None) -> Re
         skew = _max_skew_seconds(env)
     except CallbackConfigError as exc:
         reason = exc.reason if exc.reason in {"disabled", "misconfigured"} else "misconfigured"
-        return ReceiveResult(4, reason)
+        return ReceiveResult(4, reason), None, None, 0
     except OSError:
-        return ReceiveResult(4, "misconfigured")
+        return ReceiveResult(4, "misconfigured"), None, None, 0
 
     if len(data) > MAX_EVENT_BYTES:
-        return ReceiveResult(3, "oversized")
+        return ReceiveResult(3, "oversized"), None, None, 0
     if not data.strip():
-        return ReceiveResult(3, "malformed")
+        return ReceiveResult(3, "malformed"), None, None, 0
     try:
         event = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return ReceiveResult(3, "malformed")
+        return ReceiveResult(3, "malformed"), None, None, 0
     if not isinstance(event, dict):
-        return ReceiveResult(3, "malformed")
+        return ReceiveResult(3, "malformed"), None, None, 0
     if FORBIDDEN_DEST_KEYS.intersection(event):
-        return ReceiveResult(3, "poisoned")
-    missing = [key for key in REQUIRED_EVENT_KEYS if key not in event]
+        return ReceiveResult(3, "poisoned"), None, None, 0
+    if event.get("schema_version") != 1:
+        return ReceiveResult(3, "malformed"), None, None, 0
+    snapshot = event.get("handoff_snapshot")
+    if snapshot is not None and (
+        not isinstance(snapshot, str) or len(snapshot.encode("utf-8")) > MAX_SNAPSHOT_BYTES
+    ):
+        return ReceiveResult(3, "oversized"), None, None, 0
+    if not isinstance(event.get("hmac"), str):
+        return ReceiveResult(3, "bad_signature"), None, None, 0
+    if not verify_event_hmac(event, secret):
+        return ReceiveResult(3, "bad_signature"), None, None, 0
+    return None, event, root, skew
+
+
+def _validate_common_identity(event: Mapping[str, Any], skew: int) -> ReceiveResult | None:
+    task_id = event.get("task_id")
+    event_id = event.get("event_id")
+    if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
+        return ReceiveResult(3, "malformed")
+    if not isinstance(event_id, str) or not _looks_like_uuid(event_id):
+        return ReceiveResult(3, "malformed")
+    try:
+        occurred = parse_occurred_at(str(event.get("occurred_at", "")))
+    except CallbackError as exc:
+        return ReceiveResult(3, exc.reason)
+    now = _utcnow()
+    delta = (now - occurred).total_seconds()
+    if delta > skew:
+        return ReceiveResult(3, "stale_timestamp")
+    if -delta > skew:
+        return ReceiveResult(3, "future_timestamp")
+    return None
+
+
+def _receive_probe(event: dict[str, Any], root: Path, skew: int) -> ReceiveResult:
+    missing = [key for key in REQUIRED_PROBE_KEYS if key not in event]
     if missing:
         return ReceiveResult(3, "malformed")
-    if event.get("schema_version") != 1:
+    identity = _validate_common_identity(event, skew)
+    if identity is not None:
+        return identity
+    task_id = str(event["task_id"])
+    registration = find_registration(root, task_id)
+    if registration is None:
+        return ReceiveResult(2, "unknown_task")
+    if registration.get("task_id") != task_id:
+        return ReceiveResult(3, "task_id_mismatch")
+    return ReceiveResult(0, "registered")
+
+
+def _validate_optional_path(value: Any) -> ReceiveResult | None:
+    if value is None:
+        return None
+    try:
+        if not isinstance(value, str):
+            raise CallbackError("malformed")
+        validate_handoff_path_ref(value)
+    except CallbackError as exc:
+        return ReceiveResult(3, exc.reason)
+    return None
+
+
+def _receive_final(
+    event: dict[str, Any], root: Path, skew: int, data: bytes
+) -> ReceiveResult:
+    missing = [key for key in REQUIRED_FINAL_KEYS if key not in event]
+    if missing:
         return ReceiveResult(3, "malformed")
+    identity = _validate_common_identity(event, skew)
+    if identity is not None:
+        return identity
     snapshot = event.get("handoff_snapshot")
     if snapshot is not None and (
         not isinstance(snapshot, str) or len(snapshot.encode("utf-8")) > MAX_SNAPSHOT_BYTES
     ):
         return ReceiveResult(3, "oversized")
-    if not isinstance(event.get("hmac"), str):
-        return ReceiveResult(3, "bad_signature")
-    if not verify_event_hmac(event, secret):
-        return ReceiveResult(3, "bad_signature")
+    stdout = event.get("verifier_stdout")
+    if not isinstance(stdout, str):
+        return ReceiveResult(3, "malformed")
+    if len(stdout.encode("utf-8")) > MAX_VERIFIER_STDOUT:
+        return ReceiveResult(3, "oversized")
+    stderr = event.get("verifier_stderr")
+    if stderr is not None:
+        if not isinstance(stderr, str) or len(stderr.encode("utf-8")) > MAX_CONTROLLER_DETAIL:
+            return ReceiveResult(3, "malformed")
+    rc = event.get("verifier_returncode")
+    if not isinstance(rc, int) or isinstance(rc, bool):
+        return ReceiveResult(3, "malformed")
 
-    task_id = event.get("task_id")
-    event_id = event.get("event_id")
+    task_id = str(event["task_id"])
+    event_id = str(event["event_id"])
     status = event.get("status")
-    if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
-        return ReceiveResult(3, "malformed")
-    if not isinstance(event_id, str) or not _looks_like_uuid(event_id):
-        return ReceiveResult(3, "malformed")
     if status not in ALLOWED_STATUS:
         return ReceiveResult(3, "bad_status")
     if event.get("controller_result") not in ALLOWED_CONTROLLER_RESULTS:
@@ -506,24 +594,10 @@ def receive_event_bytes(data: bytes, env: Mapping[str, str] | None = None) -> Re
     size = event.get("handoff_size")
     if size is not None and not (isinstance(size, int) and not isinstance(size, bool) and size >= 0):
         return ReceiveResult(3, "malformed")
-    artifact = event.get("artifact")
-    if artifact is not None:
-        try:
-            if not isinstance(artifact, str):
-                raise CallbackError("malformed")
-            validate_handoff_path_ref(artifact)
-        except CallbackError as exc:
-            return ReceiveResult(3, exc.reason)
-    try:
-        occurred = parse_occurred_at(str(event.get("occurred_at", "")))
-    except CallbackError as exc:
-        return ReceiveResult(3, exc.reason)
-    now = _utcnow()
-    delta = (now - occurred).total_seconds()
-    if delta > skew:
-        return ReceiveResult(3, "stale_timestamp")
-    if -delta > skew:
-        return ReceiveResult(3, "future_timestamp")
+    for key in ("artifact", "report_path", "validation_path"):
+        path_error = _validate_optional_path(event.get(key))
+        if path_error is not None:
+            return path_error
 
     registration = find_registration(root, task_id)
     if registration is None:
@@ -539,8 +613,8 @@ def receive_event_bytes(data: bytes, env: Mapping[str, str] | None = None) -> Re
             return ReceiveResult(3, "conflict")
         return ReceiveResult(3, "replay")
 
-    receipt_path = root / "receipts" / f"{task_id}.json"
-    if receipt_path.exists():
+    existing_receipt = root / "receipts" / f"{task_id}.json"
+    if existing_receipt.exists():
         return ReceiveResult(3, "conflict")
     for folder in ("claimed", "completed", "failed", "new"):
         for existing_path in (root / "inbox" / folder).glob("*.json"):
@@ -556,6 +630,19 @@ def receive_event_bytes(data: bytes, env: Mapping[str, str] | None = None) -> Re
         return ReceiveResult(3, "replay")
     exclusive_create(seen_path, b"1\n")
     return ReceiveResult(0, "accepted")
+
+
+def receive_event_bytes(data: bytes, env: Mapping[str, str] | None = None) -> ReceiveResult:
+    early, event, root, skew = _common_receive_preamble(data, env)
+    if early is not None:
+        return early
+    assert event is not None and root is not None
+    kind = event.get("kind")
+    if kind == KIND_PROBE:
+        return _receive_probe(event, root, skew)
+    if kind != KIND_FINAL:
+        return ReceiveResult(3, "malformed")
+    return _receive_final(event, root, skew, data)
 
 
 def receive_from_stdin(stdin_buffer: Any | None = None, stdout: Any | None = None) -> int:
@@ -607,26 +694,14 @@ def _move_claimed(root: Path, event_id: str, dest_folder: str, doc: dict[str, An
         claimed.unlink()
 
 
-def build_verification_prompt(registration: Mapping[str, Any], event: Mapping[str, Any]) -> str:
-    snapshot = event.get("handoff_snapshot") or ""
-    if isinstance(snapshot, str) and len(snapshot.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
-        snapshot = snapshot.encode("utf-8")[:MAX_SNAPSHOT_BYTES].decode("utf-8", "replace")
-    detail = str(event.get("controller_detail") or "")[:MAX_CONTROLLER_DETAIL]
-    return (
-        "You are an independent Codex verifier for a completed background worker task. "
-        "Do not resume any previous session. Inspect the workspace, the handoff file "
-        "if it is readable from this host, and any receipts. The worker event is not "
-        "proof of completion.\n"
-        f"task_id: {event.get('task_id')}\n"
-        f"controller_result: {event.get('controller_result')}\n"
-        f"controller_detail: {detail}\n"
-        f"handoff_path: {event.get('handoff_path')}\n"
-        f"handoff_sha256: {event.get('handoff_sha256')}\n"
-        f"handoff_size: {event.get('handoff_size')}\n"
-        f"artifact: {event.get('artifact')}\n"
-        f"handoff_snapshot:\n{snapshot}\n"
-        "Give the final verdict in Traditional Chinese."
-    )
+def frozen_delivery_text(event: Mapping[str, Any]) -> str:
+    text = _bound_verifier_stdout(str(event.get("verifier_stdout") or "")).strip()
+    if text:
+        return text
+    rc = event.get("verifier_returncode")
+    if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
+        return format_verifier_failure(str(event.get("verifier_stderr") or f"returncode {rc}"))
+    return "(無輸出)"
 
 
 def format_failed_notice(event: Mapping[str, Any]) -> str:
@@ -649,25 +724,6 @@ def format_verifier_failure(detail: str) -> str:
 
 def format_delivery_failure() -> str:
     return "背景工作驗收結果已產生，但 Telegram 傳送失敗。"
-
-
-def run_fresh_verifier(*, workspace: str, prompt: str) -> RunResult:
-    """Fresh Codex turn. Never resumes a user session and never upserts one."""
-    from tg_cli_relay.providers.codex_cli import CodexCliProvider
-    from tg_cli_relay.relay import _relay_turn_timeout_seconds
-
-    bin_name = os.environ.get("TGR_CODEX_BIN", "codex").strip() or "codex"
-    bypass = os.environ.get("TGR_CODEX_BYPASS_APPROVALS_AND_SANDBOX", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    provider = CodexCliProvider(
-        codex_bin=bin_name,
-        dangerously_bypass_approvals_and_sandbox=bypass,
-        timeout_seconds=_relay_turn_timeout_seconds(),
-    )
-    return provider.run_turn(workspace=workspace, session_id=None, prompt=prompt)
 
 
 def _claim_new_event(root: Path, new_path: Path) -> dict[str, Any] | None:
@@ -728,6 +784,7 @@ async def scan_once(
     verifier: VerifierFn | None = None,
     env: Mapping[str, str] | None = None,
 ) -> None:
+    del verifier  # WEB1 never runs Codex; HMS already persisted the verdict.
     if not feature_enabled(env):
         return
     try:
@@ -736,6 +793,7 @@ async def scan_once(
         log.warning("callback inbox skipped: misconfigured state root")
         return
     recover_claimed_without_receipt(root)
+    processed: set[str] = set()
     new_dir = root / "inbox" / "new"
     for new_path in sorted(new_dir.glob("*.json")):
         event = load_json(new_path)
@@ -753,18 +811,17 @@ async def scan_once(
         claimed = _claim_new_event(root, new_path)
         if claimed is None:
             continue
-        await _process_claimed(
-            root,
-            claimed,
-            registration,
-            deliver=deliver,
-            verifier=verifier or run_fresh_verifier,
-        )
+        event_id = str(_event_from_claimed(claimed).get("event_id") or new_path.stem)
+        processed.add(event_id)
+        await _process_claimed(root, claimed, registration, deliver=deliver)
     for claimed_path in sorted((root / "inbox" / "claimed").glob("*.json")):
         doc = load_json(claimed_path)
         if doc is None:
             continue
         event = _event_from_claimed(doc)
+        event_id = str(event.get("event_id") or claimed_path.stem)
+        if event_id in processed:
+            continue
         task_id = str(event.get("task_id") or "")
         existing_receipt = load_json(receipt_path(root, task_id))
         if existing_receipt and existing_receipt.get("status") != PENDING_DELIVERY_STATUS:
@@ -775,13 +832,7 @@ async def scan_once(
         thread_key = str(registration.get("thread_key") or "")
         if thread_key and thread_key in active_thread_keys:
             continue
-        await _process_claimed(
-            root,
-            doc,
-            registration,
-            deliver=deliver,
-            verifier=verifier or run_fresh_verifier,
-        )
+        await _process_claimed(root, doc, registration, deliver=deliver)
 
 
 def _move_claimed_from_new(
@@ -802,7 +853,6 @@ async def _process_claimed(
     registration: dict[str, Any],
     *,
     deliver: DeliverFn,
-    verifier: VerifierFn,
 ) -> None:
     event = _event_from_claimed(doc)
     event_id = str(event.get("event_id") or "")
@@ -834,7 +884,7 @@ async def _process_claimed(
     doc["claim_attempts"] = attempts + 1
     claimed_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     status = event.get("status")
-    if status not in ALLOWED_STATUS:
+    if status not in ALLOWED_STATUS or event.get("kind") != KIND_FINAL:
         receipt = _terminal_receipt(event, registration, status="failed", note="bad_status")
         write_receipt(root, receipt)
         try:
@@ -844,80 +894,20 @@ async def _process_claimed(
         _move_claimed(root, event_id, "failed", doc)
         return
 
-    if status == "failed":
-        notice = format_failed_notice(event)
-        delivered = await _deliver_bounded(deliver, registration, notice)
-        receipt = _terminal_receipt(
-            event,
-            registration,
-            status="failed",
-            note="worker_terminal_failed",
-            delivered=delivered,
-        )
-        write_receipt(root, receipt)
-        _move_claimed(root, event_id, "failed", doc)
-        return
-
-    workspace = str(registration.get("relay_workspace") or "")
-    prompt = build_verification_prompt(registration, event)
-    try:
-        result = await _invoke_verifier(verifier, workspace=workspace, prompt=prompt)
-    except Exception as exc:
-        log.exception("callback verifier failed task=%s", task_id)
-        notice = format_verifier_failure(type(exc).__name__)
-        delivered = await _deliver_bounded(deliver, registration, notice)
-        receipt = _terminal_receipt(
-            event,
-            registration,
-            status="failed",
-            note="verifier_failed",
-            delivered=delivered,
-            verifier_returncode=None,
-        )
-        write_receipt(root, receipt)
-        _move_claimed(root, event_id, "failed", doc)
-        return
-
-    if result.returncode != 0:
-        notice = format_verifier_failure(
-            (result.stderr or result.stdout or f"returncode {result.returncode}")[:400]
-        )
-        delivered = await _deliver_bounded(deliver, registration, notice)
-        receipt = _terminal_receipt(
-            event,
-            registration,
-            status="failed",
-            note="verifier_failed",
-            delivered=delivered,
-            verifier_returncode=result.returncode,
-        )
-        write_receipt(root, receipt)
-        _move_claimed(root, event_id, "failed", doc)
-        return
-
-    text = _bound_verifier_stdout((result.stdout or "").strip() or "(無輸出)")
+    text = frozen_delivery_text(event)
+    rc = event.get("verifier_returncode")
+    returncode = rc if isinstance(rc, int) and not isinstance(rc, bool) else None
     write_receipt(
         root,
         _pending_delivery_receipt(
             event,
             registration,
             verifier_stdout=text,
-            verifier_returncode=result.returncode,
+            verifier_returncode=returncode,
         ),
     )
     delivered = await _deliver_bounded(deliver, registration, text)
     if not delivered:
-        receipt = _terminal_receipt(
-            event,
-            registration,
-            status="failed",
-            note="delivery_failed",
-            delivered=False,
-            verifier_returncode=result.returncode,
-            verifier_stdout=text,
-        )
-        write_receipt(root, receipt)
-        _move_claimed(root, event_id, "failed", doc)
         return
     receipt = _terminal_receipt(
         event,
@@ -925,7 +915,7 @@ async def _process_claimed(
         status="completed",
         note="verified",
         delivered=True,
-        verifier_returncode=result.returncode,
+        verifier_returncode=returncode,
         verifier_stdout=text,
     )
     write_receipt(root, receipt)
@@ -941,16 +931,6 @@ async def _deliver_bounded(
     except Exception:
         log.exception("callback telegram delivery failed")
         return False
-
-
-async def _invoke_verifier(verifier: VerifierFn, *, workspace: str, prompt: str) -> RunResult:
-    if inspect.iscoroutinefunction(verifier):
-        result = await verifier(workspace=workspace, prompt=prompt)
-    else:
-        result = await asyncio.to_thread(verifier, workspace=workspace, prompt=prompt)
-    if inspect.isawaitable(result):
-        result = await result
-    return result
 
 
 def _bound_verifier_stdout(text: str) -> str:
@@ -998,19 +978,25 @@ async def _complete_pending_delivery(
     rc = pending.get("verifier_returncode")
     returncode = rc if isinstance(rc, int) else None
     if not delivered:
-        write_receipt(
-            root,
-            _terminal_receipt(
-                event,
-                registration,
-                status="failed",
-                note="delivery_failed",
-                delivered=False,
-                verifier_returncode=returncode,
-                verifier_stdout=text,
-            ),
-        )
-        _move_claimed(root, event_id, "failed", doc)
+        attempts = _claimed_attempts(doc)
+        if attempts >= MAX_CLAIM_ATTEMPTS:
+            write_receipt(
+                root,
+                _terminal_receipt(
+                    event,
+                    registration,
+                    status="failed",
+                    note="delivery_failed",
+                    delivered=False,
+                    verifier_returncode=returncode,
+                    verifier_stdout=text,
+                ),
+            )
+            _move_claimed(root, event_id, "failed", doc)
+            return
+        doc["claim_attempts"] = attempts + 1
+        claimed = root / "inbox" / "claimed" / f"{event_id}.json"
+        claimed.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return
     write_receipt(
         root,

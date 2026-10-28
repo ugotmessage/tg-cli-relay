@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Standalone HMS → WEB1 callback outbox (stdlib only).
 
-Enqueue signs a terminal event and writes pending/<event_id>.json BEFORE any
-delivery. Drain sends pending records over argv-array ssh (stdin = event bytes).
+Enqueue writes a durable pending record BEFORE any network or model call.
+Drain then:
+
+1. Sends a small signed ``registration_probe`` (no Telegram, no model).
+2. On ``registered``, runs **one fresh Codex turn on HMS** in the validated
+   task workspace (never ``resume``).
+3. Persists verifier stdout/stderr/returncode atomically.
+4. Sends a signed ``final_result`` that WEB1 only verifies and delivers.
 
 This module must not import tg_cli_relay. HMAC canonicalization is duplicated
 on purpose and is proven identical by tests.
@@ -12,13 +18,13 @@ Watchdog integration (after deploy copies this file to
 
 * Call ``enqueue`` only after the queue file is already in ``done/`` or
   ``failed/`` (after the existing replace + notify/log).
-* Wrap enqueue/drain in try/except so transport failure never replace()s
-  queue files, never changes notify text, and never raises into the
-  classifier.
+* Wrap enqueue/drain in try/except so transport/verifier failure never
+  replace()s queue files, never changes notify text, and never raises into
+  the classifier.
 * Map: success→complete; WorkerDoneValidationError→worker_done_validation_failed;
   TaskContractError→blocked_before_worker; Exception→failed.
 * One bounded ``drain`` from the existing daemon loop: before idle sleep(10)
-  AND after each task before sleep(2).
+  AND after each task before sleep(2). Drain may wait for one Codex turn.
 """
 
 from __future__ import annotations
@@ -40,10 +46,19 @@ MAX_EVENT_BYTES = 64 * 1024
 MAX_SNAPSHOT_BYTES = 8192
 MAX_CONTROLLER_DETAIL = 2048
 MAX_HANDOFF_FILE_BYTES = 1 * 1024 * 1024
+MAX_VERIFIER_STDOUT = 8192
+MAX_VERIFIER_STDERR = 2048
 MAX_DRAIN_ATTEMPTS = 5
 SSH_TIMEOUT_SECONDS = 30
+DEFAULT_VERIFIER_TIMEOUT = 600.0
+DEFAULT_VERIFIER_BIN = "/Users/ht/.hermes/scripts/tg-relay/codex-device-relay"
+KIND_PROBE = "registration_probe"
+KIND_FINAL = "final_result"
 DEFAULT_ALLOWED_ROOTS = (
     Path("/Users/ht/.hermes/artifacts"),
+    Path("/Users/ht/.hermes-worktrees"),
+    Path("/Users/ht/.hermes"),
+    Path("/Users/ht/projects"),
     Path("/private/tmp"),
     Path("/Volumes/home"),
 )
@@ -56,9 +71,11 @@ ALLOWED_CONTROLLER_RESULTS = frozenset(
     }
 )
 
-# Tests may replace this hook. Production default is subprocess.run argv ssh.
+# Tests may replace these hooks. Production default is subprocess.run.
 SshRunner = Callable[[list[str], bytes, float], subprocess.CompletedProcess]
+VerifierRunner = Callable[[list[str], str, str, float], subprocess.CompletedProcess]
 ssh_runner: SshRunner | None = None
+verifier_runner: VerifierRunner | None = None
 
 
 def canonical_event_body(event: Mapping[str, Any]) -> bytes:
@@ -137,6 +154,15 @@ def validate_existing_path(path_str: str, *, must_exist: bool) -> Path:
     return path
 
 
+def validate_workspace(path_str: str) -> Path:
+    path = validate_existing_path(path_str, must_exist=False)
+    if _is_symlink(path) or (path.exists() and _is_symlink(path)):
+        raise SystemExit("symlink")
+    if not path.is_dir():
+        raise SystemExit("missing_workspace")
+    return path
+
+
 def freeze_handoff(path: Path) -> tuple[str | None, int | None, str | None]:
     if not path.is_file():
         return None, None, None
@@ -164,38 +190,101 @@ def outbox_root() -> Path:
     return root
 
 
-def build_signed_event(
+def bound_text(text: str | None, limit: int) -> str:
+    if not isinstance(text, str):
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", "replace")
+
+
+def redact_secret_material(text: str, secret: bytes | None) -> str:
+    if not text:
+        return ""
+    out = text
+    tokens: list[str] = []
+    if secret:
+        try:
+            tokens.append(secret.decode("utf-8"))
+        except UnicodeDecodeError:
+            pass
+        tokens.append(secret.hex())
+        tokens.append(secret.hex().upper())
+    for token in tokens:
+        if token:
+            out = out.replace(token, "[redacted]")
+    return out
+
+
+def _optional_callback_path(callback: Mapping[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = callback.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise SystemExit("malformed")
+        return str(validate_existing_path(value, must_exist=False))
+    return None
+
+
+def build_probe_event(
+    *,
+    task_id: str,
+    secret: bytes,
+    event_id: str | None = None,
+    occurred_at: str | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": KIND_PROBE,
+        "event_id": event_id or str(uuid.uuid4()),
+        "task_id": str(task_id),
+        "occurred_at": occurred_at or utcnow_iso(),
+    }
+    event["hmac"] = sign_event(event, secret)
+    return event
+
+
+def build_final_event(
     *,
     task_id: str,
     controller_result: str,
     controller_detail: str,
     handoff_path: str,
     artifact: str | None,
+    report_path: str | None,
+    validation_path: str | None,
+    handoff_sha256: str | None,
+    handoff_size: int | None,
+    handoff_snapshot: str | None,
+    verifier: Mapping[str, Any],
     secret: bytes,
     event_id: str | None = None,
     occurred_at: str | None = None,
 ) -> dict[str, Any]:
     if controller_result not in ALLOWED_CONTROLLER_RESULTS:
         raise SystemExit("malformed")
-    handoff = validate_existing_path(handoff_path, must_exist=False)
-    sha, size, snapshot = freeze_handoff(handoff) if (handoff.exists() and handoff.is_file()) else (None, None, None)
-    artifact_path = None
-    if artifact:
-        artifact_path = str(validate_existing_path(artifact, must_exist=False))
     status = "done" if controller_result == "complete" else "failed"
     event: dict[str, Any] = {
         "schema_version": 1,
+        "kind": KIND_FINAL,
         "event_id": event_id or str(uuid.uuid4()),
         "task_id": str(task_id),
         "status": status,
         "controller_result": controller_result,
         "controller_detail": str(controller_detail)[:MAX_CONTROLLER_DETAIL],
         "occurred_at": occurred_at or utcnow_iso(),
-        "handoff_path": str(handoff),
-        "handoff_sha256": sha,
-        "handoff_size": size,
-        "handoff_snapshot": snapshot,
-        "artifact": artifact_path,
+        "handoff_path": handoff_path,
+        "handoff_sha256": handoff_sha256,
+        "handoff_size": handoff_size,
+        "handoff_snapshot": handoff_snapshot,
+        "artifact": artifact,
+        "report_path": report_path,
+        "validation_path": validation_path,
+        "verifier_stdout": bound_text(str(verifier.get("stdout") or ""), MAX_VERIFIER_STDOUT),
+        "verifier_stderr": bound_text(str(verifier.get("stderr") or ""), MAX_VERIFIER_STDERR),
+        "verifier_returncode": int(verifier.get("returncode") or 0),
     }
     event["hmac"] = sign_event(event, secret)
     return event
@@ -242,6 +331,102 @@ def run_ssh(argv: list[str], event_bytes: bytes, timeout: float) -> subprocess.C
     )
 
 
+def verifier_timeout_seconds() -> float:
+    raw = os.environ.get("HMS_CALLBACK_VERIFIER_TIMEOUT", "").strip()
+    if not raw:
+        return DEFAULT_VERIFIER_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise SystemExit("misconfigured") from exc
+    if value <= 0:
+        raise SystemExit("misconfigured")
+    return value
+
+
+def build_verifier_argv(workspace: str) -> list[str]:
+    raw = os.environ.get("HMS_CALLBACK_VERIFIER_ARGV", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit("misconfigured") from exc
+        if not isinstance(parsed, list) or not parsed or not all(isinstance(item, str) for item in parsed):
+            raise SystemExit("misconfigured")
+        argv = [str(item) for item in parsed]
+    else:
+        binary = os.environ.get("HMS_CALLBACK_VERIFIER_BIN", DEFAULT_VERIFIER_BIN).strip() or DEFAULT_VERIFIER_BIN
+        argv = [
+            binary,
+            "exec",
+            "-C",
+            workspace,
+            "--ephemeral",
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+        ]
+    if "resume" in argv:
+        raise SystemExit("misconfigured")
+    if "-C" not in argv:
+        argv.extend(["-C", workspace])
+    return argv
+
+
+def build_verification_prompt(record: Mapping[str, Any]) -> str:
+    snapshot = record.get("handoff_snapshot") or ""
+    if isinstance(snapshot, str) and len(snapshot.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
+        snapshot = snapshot.encode("utf-8")[:MAX_SNAPSHOT_BYTES].decode("utf-8", "replace")
+    detail = str(record.get("controller_detail") or "")[:MAX_CONTROLLER_DETAIL]
+    return (
+        "You are an independent Codex verifier for a completed background worker task. "
+        "Do not resume any previous session. Inspect the workspace, the handoff file "
+        "if it is readable from this host, and any receipts or validation artifacts. "
+        "The controller terminal status is not proof of completion.\n"
+        f"task_id: {record.get('task_id')}\n"
+        f"controller_result: {record.get('controller_result')}\n"
+        f"controller_detail: {detail}\n"
+        f"handoff_path: {record.get('handoff_path')}\n"
+        f"handoff_sha256: {record.get('handoff_sha256')}\n"
+        f"handoff_size: {record.get('handoff_size')}\n"
+        f"artifact: {record.get('artifact')}\n"
+        f"report_path: {record.get('report_path')}\n"
+        f"validation_path: {record.get('validation_path')}\n"
+        f"handoff_snapshot:\n{snapshot}\n"
+        "Independently inspect the files and workspace, then give the final "
+        "verdict in Traditional Chinese."
+    )
+
+
+def run_hms_verifier(record: Mapping[str, Any], secret: bytes | None = None) -> subprocess.CompletedProcess:
+    workspace = str(record.get("workspace") or "")
+    if not workspace:
+        raise SystemExit("missing_workspace")
+    argv = build_verifier_argv(workspace)
+    prompt = redact_secret_material(build_verification_prompt(record), secret)
+    timeout = verifier_timeout_seconds()
+    runner = verifier_runner
+    if runner is not None:
+        return runner(argv, prompt, workspace, timeout)
+    mode = os.environ.get("HMS_CALLBACK_VERIFIER_PROMPT", "argv").strip().lower()
+    if mode == "stdin":
+        return subprocess.run(
+            argv,
+            input=prompt.encode("utf-8"),
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            cwd=workspace,
+        )
+    return subprocess.run(
+        argv + [prompt],
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+        cwd=workspace,
+    )
+
+
 def exclusive_write(path: Path, data: bytes) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -276,6 +461,15 @@ def callback_opt_in(task: Mapping[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _task_workspace(task: Mapping[str, Any], callback: Mapping[str, Any]) -> Path:
+    raw = task.get("workspace")
+    if raw is None:
+        raw = callback.get("workspace")
+    if not isinstance(raw, str):
+        raise SystemExit("malformed")
+    return validate_workspace(raw)
+
+
 def cmd_enqueue(task_json: Path, controller_result: str, controller_detail: str) -> int:
     task = json.loads(task_json.read_text(encoding="utf-8"))
     if not isinstance(task, dict):
@@ -285,6 +479,9 @@ def cmd_enqueue(task_json: Path, controller_result: str, controller_detail: str)
     if callback is None:
         print("skipped")
         return 0
+    if controller_result not in ALLOWED_CONTROLLER_RESULTS:
+        print("malformed", file=sys.stderr)
+        return 3
     task_id = task.get("id")
     if not isinstance(task_id, str) or not task_id:
         print("malformed", file=sys.stderr)
@@ -293,36 +490,53 @@ def cmd_enqueue(task_json: Path, controller_result: str, controller_detail: str)
     if not isinstance(handoff_path, str):
         print("malformed", file=sys.stderr)
         return 3
-    artifact = callback.get("artifact")
-    if artifact is not None and not isinstance(artifact, str):
-        print("malformed", file=sys.stderr)
-        return 3
     secret_path = os.environ.get("HMS_CALLBACK_SECRET_FILE", "").strip()
     if not secret_path:
         print("misconfigured", file=sys.stderr)
         return 4
     secret = load_secret_file(Path(secret_path))
-    event = build_signed_event(
-        task_id=task_id,
-        controller_result=controller_result,
-        controller_detail=controller_detail,
-        handoff_path=handoff_path,
-        artifact=artifact,
-        secret=secret,
-    )
+    workspace = _task_workspace(task, callback)
+    handoff = validate_existing_path(handoff_path, must_exist=False)
+    sha, size, snapshot = freeze_handoff(handoff) if (handoff.exists() and handoff.is_file()) else (None, None, None)
+    artifact = _optional_callback_path(callback, "artifact")
+    if artifact is None:
+        raw_artifact = task.get("artifact")
+        if raw_artifact is not None:
+            if not isinstance(raw_artifact, str):
+                print("malformed", file=sys.stderr)
+                return 3
+            artifact = str(validate_existing_path(raw_artifact, must_exist=False))
+    report_path = _optional_callback_path(callback, "report_path", "report")
+    validation_path = _optional_callback_path(callback, "validation_path", "validation")
+    probe = build_probe_event(task_id=task_id, secret=secret)
     root = outbox_root()
-    event_id = str(event["event_id"])
-    if (root / "sent" / f"{event_id}.json").exists():
+    probe_id = str(probe["event_id"])
+    if (root / "sent" / f"{probe_id}.json").exists():
         print("already_sent")
         return 0
     record = {
-        "event": event,
+        "task_id": task_id,
+        "workspace": str(workspace),
+        "controller_result": controller_result,
+        "controller_detail": str(controller_detail)[:MAX_CONTROLLER_DETAIL],
+        "handoff_path": str(handoff),
+        "handoff_sha256": sha,
+        "handoff_size": size,
+        "handoff_snapshot": snapshot,
+        "artifact": artifact,
+        "report_path": report_path,
+        "validation_path": validation_path,
+        "probe_event": probe,
+        "probe_status": None,
+        "verifier": None,
+        "final_event": None,
         "attempts": 0,
         "next_ok_at": 0,
         "last_rc": None,
         "last_reason": None,
+        "phase": "probe",
     }
-    pending = root / "pending" / f"{event_id}.json"
+    pending = root / "pending" / f"{probe_id}.json"
     payload = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     if not exclusive_write(pending, payload):
         print("pending_exists")
@@ -340,7 +554,23 @@ def _reason_from_output(completed: subprocess.CompletedProcess) -> str:
     return text.strip().splitlines()[0] if text.strip() else ""
 
 
-def _durable_outcome(rc: int, reason: str) -> str | None:
+def _bytes_to_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _probe_outcome(rc: int, reason: str) -> str | None:
+    if rc == 0 and reason == "registered":
+        return "registered"
+    if rc == 2 or reason == "unknown_task":
+        return "unknown"
+    return None
+
+
+def _final_outcome(rc: int, reason: str) -> str | None:
     if rc == 0 or reason in {"accepted", "already_sent"}:
         return "sent"
     if rc == 2 or reason == "unknown_task":
@@ -350,47 +580,142 @@ def _durable_outcome(rc: int, reason: str) -> str | None:
     return None
 
 
+def _send_signed_event(event: Mapping[str, Any]) -> tuple[int, str]:
+    event_bytes = encode_event(event)
+    argv = ssh_argv()
+    try:
+        completed = run_ssh(argv, event_bytes, SSH_TIMEOUT_SECONDS)
+    except Exception as exc:
+        return 99, type(exc).__name__
+    return int(completed.returncode), _reason_from_output(completed)
+
+
+def _fail_record(root: Path, pending: Path, record: dict[str, Any], event_id: str) -> None:
+    record["failed_at"] = utcnow_iso()
+    write_json(root / "failed" / f"{event_id}.json", record)
+    pending.unlink(missing_ok=True)
+
+
+def _backoff(record: dict[str, Any], now: float) -> None:
+    backoff = min(60, 2 ** int(record.get("attempts") or 1))
+    record["next_ok_at"] = now + backoff
+
+
+def _secret() -> bytes:
+    secret_path = os.environ.get("HMS_CALLBACK_SECRET_FILE", "").strip()
+    if not secret_path:
+        raise SystemExit("misconfigured")
+    return load_secret_file(Path(secret_path))
+
+
 def cmd_drain() -> int:
     root = outbox_root()
+    secret = _secret()
     now = time.time()
+    ran_verifier = False
     for pending in sorted((root / "pending").glob("*.json")):
         record = json.loads(pending.read_text(encoding="utf-8"))
-        event = record.get("event") if isinstance(record, dict) else None
-        if not isinstance(event, dict):
+        if not isinstance(record, dict):
             continue
-        event_id = str(event.get("event_id") or pending.stem)
+        probe = record.get("probe_event")
+        if not isinstance(probe, dict):
+            continue
+        event_id = str(probe.get("event_id") or pending.stem)
         sent_path = root / "sent" / f"{event_id}.json"
         if sent_path.exists():
             pending.unlink(missing_ok=True)
             continue
-        attempts = int(record.get("attempts") or 0)
-        next_ok_at = float(record.get("next_ok_at") or 0)
-        if next_ok_at > now:
+        if float(record.get("next_ok_at") or 0) > now:
             continue
-        event_bytes = encode_event(event)
-        argv = ssh_argv()
-        try:
-            completed = run_ssh(argv, event_bytes, SSH_TIMEOUT_SECONDS)
-        except Exception as exc:
-            completed = subprocess.CompletedProcess(argv, 99, b"", str(exc).encode("utf-8"))
-        reason = _reason_from_output(completed)
-        rc = int(completed.returncode)
-        record["attempts"] = attempts + 1
+
+        if record.get("probe_status") is None:
+            rc, reason = _send_signed_event(probe)
+            record["attempts"] = int(record.get("attempts") or 0) + 1
+            record["last_rc"] = rc
+            record["last_reason"] = redact_secret_material(reason, secret)
+            outcome = _probe_outcome(rc, reason)
+            if outcome == "registered":
+                record["probe_status"] = "registered"
+                record["probe_acked_at"] = utcnow_iso()
+                record["phase"] = "verify"
+                write_json(pending, record)
+            elif outcome == "unknown":
+                record["probe_status"] = "unknown"
+                _fail_record(root, pending, record, event_id)
+                continue
+            else:
+                if int(record["attempts"]) >= MAX_DRAIN_ATTEMPTS:
+                    _fail_record(root, pending, record, event_id)
+                    continue
+                _backoff(record, now)
+                write_json(pending, record)
+                continue
+
+        if record.get("probe_status") != "registered":
+            continue
+
+        if record.get("verifier") is None:
+            if ran_verifier:
+                continue
+            try:
+                completed = run_hms_verifier(record, secret)
+            except Exception as exc:
+                record["attempts"] = int(record.get("attempts") or 0) + 1
+                record["last_reason"] = redact_secret_material(type(exc).__name__, secret)
+                if int(record["attempts"]) >= MAX_DRAIN_ATTEMPTS:
+                    _fail_record(root, pending, record, event_id)
+                    continue
+                _backoff(record, now)
+                write_json(pending, record)
+                continue
+            stdout = redact_secret_material(_bytes_to_text(completed.stdout), secret)
+            stderr = redact_secret_material(_bytes_to_text(completed.stderr), secret)
+            record["verifier"] = {
+                "stdout": bound_text(stdout, MAX_VERIFIER_STDOUT),
+                "stderr": bound_text(stderr, MAX_VERIFIER_STDERR),
+                "returncode": int(completed.returncode),
+                "completed_at": utcnow_iso(),
+            }
+            record["phase"] = "deliver"
+            write_json(pending, record)
+            ran_verifier = True
+
+        if record.get("final_event") is None:
+            record["final_event"] = build_final_event(
+                task_id=str(record.get("task_id") or ""),
+                controller_result=str(record.get("controller_result") or ""),
+                controller_detail=str(record.get("controller_detail") or ""),
+                handoff_path=str(record.get("handoff_path") or ""),
+                artifact=record.get("artifact") if isinstance(record.get("artifact"), str) else None,
+                report_path=record.get("report_path") if isinstance(record.get("report_path"), str) else None,
+                validation_path=(
+                    record.get("validation_path") if isinstance(record.get("validation_path"), str) else None
+                ),
+                handoff_sha256=record.get("handoff_sha256") if isinstance(record.get("handoff_sha256"), str) else None,
+                handoff_size=record.get("handoff_size") if isinstance(record.get("handoff_size"), int) else None,
+                handoff_snapshot=(
+                    record.get("handoff_snapshot") if isinstance(record.get("handoff_snapshot"), str) else None
+                ),
+                verifier=record["verifier"],
+                secret=secret,
+            )
+            write_json(pending, record)
+
+        rc, reason = _send_signed_event(record["final_event"])
+        record["attempts"] = int(record.get("attempts") or 0) + 1
         record["last_rc"] = rc
-        record["last_reason"] = reason
-        outcome = _durable_outcome(rc, reason)
+        record["last_reason"] = redact_secret_material(reason, secret)
+        outcome = _final_outcome(rc, reason)
         if outcome == "sent":
             record["sent_at"] = utcnow_iso()
+            record["phase"] = "sent"
             write_json(sent_path, record)
             pending.unlink(missing_ok=True)
             continue
-        if outcome == "failed" or record["attempts"] >= MAX_DRAIN_ATTEMPTS:
-            record["failed_at"] = utcnow_iso()
-            write_json(root / "failed" / f"{event_id}.json", record)
-            pending.unlink(missing_ok=True)
+        if outcome == "failed" or int(record["attempts"]) >= MAX_DRAIN_ATTEMPTS:
+            _fail_record(root, pending, record, event_id)
             continue
-        backoff = min(60, 2 ** record["attempts"])
-        record["next_ok_at"] = now + backoff
+        _backoff(record, now)
         write_json(pending, record)
     print("drained")
     return 0
