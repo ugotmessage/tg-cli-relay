@@ -1417,7 +1417,7 @@ async def _execute_relay_turn(
         pending_ack: str | None = None
         if _callback_feature_enabled():
             remaining, markers = find_handoff_markers(res)
-            if markers:
+            if len(markers) == 1:
                 task_id, handoff_path = markers[0]
                 try:
                     register_from_relay_context(
@@ -1438,6 +1438,11 @@ async def _execute_relay_turn(
                     body = f"{visible}\n\n--- stderr ---\n{err}".strip() if visible else f"--- stderr ---\n{err}".strip()
                 else:
                     body = visible
+            elif len(markers) > 1:
+                log.error("multiple background handoff markers rejected thread=%s", key)
+                pending_ack = register_fail_ack_text()
+                send_segments = remaining if remaining else None
+                body = "\n".join(remaining or [])
         try:
             if (body or "").strip() or (send_segments and any(str(part).strip() for part in send_segments)):
                 await _send_relay_output(

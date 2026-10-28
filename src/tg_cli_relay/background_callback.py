@@ -39,7 +39,9 @@ MAX_SNAPSHOT_BYTES = 8192
 MAX_HANDOFF_PATH_CHARS = 4096
 MAX_CONTROLLER_DETAIL = 2048
 MAX_CLAIM_ATTEMPTS = 2
-DEFAULT_SKEW_SECONDS = 300
+# Durable cross-host outbox delivery may legitimately resume after a host/network outage.
+# HMAC + event UUID + replay receipts remain the authenticity/idempotency controls.
+DEFAULT_SKEW_SECONDS = 24 * 60 * 60
 MAX_VERIFIER_STDOUT = 8192
 PENDING_DELIVERY_STATUS = "verified_pending_delivery"
 
@@ -679,10 +681,22 @@ def write_receipt(root: Path, record: dict[str, Any]) -> None:
     task_id = str(record["task_id"])
     path = receipt_path(root, task_id)
     payload = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    if path.exists():
-        path.write_bytes(payload)
+    if not path.exists() and exclusive_create(path, payload):
         return
-    exclusive_create(path, payload)
+    _atomic_replace(path, payload)
+
+
+def _atomic_replace(path: Path, payload: bytes) -> None:
+    """Replace one state file without exposing a truncated intermediate record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
 
 
 def _move_claimed(root: Path, event_id: str, dest_folder: str, doc: dict[str, Any]) -> None:
@@ -695,12 +709,12 @@ def _move_claimed(root: Path, event_id: str, dest_folder: str, doc: dict[str, An
 
 
 def frozen_delivery_text(event: Mapping[str, Any]) -> str:
-    text = _bound_verifier_stdout(str(event.get("verifier_stdout") or "")).strip()
-    if text:
-        return text
     rc = event.get("verifier_returncode")
     if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
         return format_verifier_failure(str(event.get("verifier_stderr") or f"returncode {rc}"))
+    text = _bound_verifier_stdout(str(event.get("verifier_stdout") or "")).strip()
+    if text:
+        return text
     return "(無輸出)"
 
 
@@ -882,7 +896,10 @@ async def _process_claimed(
         _move_claimed(root, event_id, "failed", doc)
         return
     doc["claim_attempts"] = attempts + 1
-    claimed_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_replace(
+        claimed_path,
+        (json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )
     status = event.get("status")
     if status not in ALLOWED_STATUS or event.get("kind") != KIND_FINAL:
         receipt = _terminal_receipt(event, registration, status="failed", note="bad_status")
@@ -996,7 +1013,10 @@ async def _complete_pending_delivery(
             return
         doc["claim_attempts"] = attempts + 1
         claimed = root / "inbox" / "claimed" / f"{event_id}.json"
-        claimed.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _atomic_replace(
+            claimed,
+            (json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        )
         return
     write_receipt(
         root,

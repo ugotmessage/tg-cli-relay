@@ -347,3 +347,35 @@ def test_fresh_verifier_argv_never_resumes(monkeypatch, tmp_path):
     assert "chat_id" not in prompt
     assert "failed" in prompt
     assert "Traditional Chinese" in prompt
+    assert "untrusted evidence" in prompt
+
+
+def test_final_event_redacts_controller_exception_and_verifier_stderr():
+    event = outbox.build_final_event(
+        task_id="task-1",
+        controller_result="failed",
+        controller_detail="secret controller exception",
+        handoff_path="/private/tmp/handoff.md",
+        handoff_sha256=None,
+        handoff_size=0,
+        handoff_snapshot=None,
+        artifact=None,
+        report_path=None,
+        validation_path=None,
+        verifier={"returncode": 7, "stdout": "partial success", "stderr": "secret stderr"},
+        secret=SENTINEL_SECRET,
+        occurred_at="2026-10-28T03:54:00Z",
+    )
+    assert event["controller_detail"] == "controller_result=failed"
+    assert event["verifier_stderr"] == "verifier exited with code 7"
+    assert "secret" not in json.dumps(event)
+
+
+def test_max_drain_attempts_is_configurable(monkeypatch):
+    monkeypatch.delenv("HMS_CALLBACK_MAX_ATTEMPTS", raising=False)
+    assert outbox.max_drain_attempts() == 60
+    monkeypatch.setenv("HMS_CALLBACK_MAX_ATTEMPTS", "12")
+    assert outbox.max_drain_attempts() == 12
+    monkeypatch.setenv("HMS_CALLBACK_MAX_ATTEMPTS", "0")
+    with pytest.raises(SystemExit):
+        outbox.max_drain_attempts()

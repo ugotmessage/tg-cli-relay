@@ -21,6 +21,7 @@ from tg_cli_relay.background_callback import (
     MAX_SNAPSHOT_BYTES,
     feature_enabled,
     find_handoff_markers,
+    frozen_delivery_text,
     parse_handoff_marker,
     receive_event_bytes,
     receive_from_stdin,
@@ -31,6 +32,7 @@ from tg_cli_relay.background_callback import (
 )
 from tg_cli_relay.cli import main as cli_main
 from tg_cli_relay.providers.base import RunResult
+from tg_cli_relay.relay import apply_background_callback_prefix
 from test_task_isolation import FakeMessage, _env, _reset, _update
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
@@ -471,6 +473,28 @@ def test_callback_disabled_preserves_relay_behavior(monkeypatch, tmp_path):
     ))
 
 
+def test_callback_prompt_contract_is_opt_in(monkeypatch):
+    monkeypatch.delenv("TGR_BACKGROUND_HANDOFF", raising=False)
+    assert apply_background_callback_prefix("原始需求") == "原始需求"
+    monkeypatch.setenv("TGR_BACKGROUND_HANDOFF", "1")
+    prompt = apply_background_callback_prefix("原始需求")
+    assert "callback={enabled:true,handoff_path:<absolute durable handoff path>}" in prompt
+    assert "TGR_BACKGROUND_HANDOFF:<same task id>:<same absolute handoff path>" in prompt
+    assert prompt.endswith("原始需求")
+
+
+def test_nonzero_verifier_never_delivers_partial_stdout():
+    text = frozen_delivery_text(
+        {
+            "verifier_returncode": 3,
+            "verifier_stdout": "看似成功的部分輸出",
+            "verifier_stderr": "verifier exited with code 3",
+        }
+    )
+    assert "看似成功" not in text
+    assert "驗收失敗" in text
+
+
 def test_marker_registers_strips_and_acks(monkeypatch, tmp_path):
     from tg_cli_relay import telegram_bot as bot
 
@@ -498,6 +522,37 @@ def test_marker_registers_strips_and_acks(monkeypatch, tmp_path):
     assert (state / "registrations").exists()
     matches = list((state / "registrations").glob("*/task-9.json"))
     assert matches
+
+
+def test_multiple_markers_are_rejected_and_not_registered(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    state, _ = _callback_env(monkeypatch, tmp_path)
+    markers = [
+        "TGR_BACKGROUND_HANDOFF:task-1:/private/tmp/one.md",
+        "TGR_BACKGROUND_HANDOFF:task-2:/private/tmp/two.md",
+    ]
+    msg = FakeMessage(text="長任務", chat_id=7, message_id=5)
+    msg.from_user = SimpleNamespace(id=99)
+
+    async def scenario():
+        _reset(bot)
+        try:
+            with patch.object(
+                bot,
+                "relay_turn",
+                return_value=RunResult("", "", 0, stdout_segments=["說明", *markers]),
+            ):
+                await bot._on_message(_update(msg, 7), SimpleNamespace())
+        finally:
+            _reset(bot)
+
+    asyncio.run(scenario())
+    texts = [getattr(s, "text", "") or "" for s in msg.sent]
+    assert any("無法登記背景工作" in text for text in texts)
+    assert all(marker not in text for marker in markers for text in texts)
+    assert not list((state / "registrations").glob("*/*.json"))
 
 
 def test_watchdog_transport_failure_does_not_alter_classification():

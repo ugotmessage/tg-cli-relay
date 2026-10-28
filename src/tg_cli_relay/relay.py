@@ -45,6 +45,27 @@ def apply_cursor_worker_prefix(prompt: str) -> str:
     return f"{prefix}{prompt}"
 
 
+def apply_background_callback_prefix(prompt: str) -> str:
+    """Tell Codex the exact opt-in contract only when callback support is enabled."""
+    import os
+
+    enabled = os.environ.get("TGR_BACKGROUND_HANDOFF", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return prompt
+    prefix = (
+        "Verified HMS completion callback is available for shared Cursor watchdog tasks. "
+        "When, and only when, you enqueue such a background task, add this exact task JSON "
+        "object: callback={enabled:true,handoff_path:<absolute durable handoff path>} "
+        "(optional artifact/report_path/validation_path). After at most one registration "
+        "check, finish the turn by emitting exactly one separate whole agent message and no "
+        "other text in that message: "
+        "TGR_BACKGROUND_HANDOFF:<same task id>:<same absolute handoff path>. "
+        "Do not emit the marker before both the queue JSON and handoff file exist. "
+        "Do not use this marker for inline workers or non-shared queues.\n\n"
+    )
+    return f"{prefix}{prompt}"
+
+
 _TASK_ID_IN_KEY = re.compile(r":job:([0-9a-f]+)")
 
 
@@ -441,7 +462,7 @@ def _relay_codex(
     sid = store.get(thread_key, "codex")
     # Never auto-call Cursor/Claude/OpenCode or ask the Relay router for a
     # delegation decision. Codex follows its own workspace/knowledge rules.
-    codex_prompt = prompt
+    codex_prompt = apply_background_callback_prefix(prompt)
     res = prov.run_turn(
         workspace=workspace, session_id=sid,
         prompt=ConversationContext(store.db_path).prompt(

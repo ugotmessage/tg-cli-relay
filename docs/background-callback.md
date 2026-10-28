@@ -58,6 +58,7 @@ Receiver 由 HMS `ssh` stdin 呼叫 `tg-cli-relay callback-receive`（或 0700 w
 | HMS verifier argv | `HMS_CALLBACK_VERIFIER_ARGV`（JSON 字串陣列）或 `HMS_CALLBACK_VERIFIER_BIN`（預設 `/Users/ht/.hermes/scripts/tg-relay/codex-device-relay`） |
 | HMS verifier timeout | `HMS_CALLBACK_VERIFIER_TIMEOUT`（預設 600 秒）；prompt 以 argv 最後一段或 `HMS_CALLBACK_VERIFIER_PROMPT=stdin` 傳入，禁止 shell 插值 |
 | watcher drain timeout | `HMS_CALLBACK_DRAIN_TIMEOUT`（預設 900 秒，須大於 verifier timeout） |
+| transport attempts | `HMS_CALLBACK_MAX_ATTEMPTS`（預設 60；每次指數退避，上限 60 秒） |
 
 建議 SSH 路由（只記錄路徑，不複製私鑰）：
 
