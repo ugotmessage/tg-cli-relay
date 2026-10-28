@@ -1,0 +1,32 @@
+#!/bin/bash
+# Root-only WEB1 wrapper for HMS → Relay callback-receive.
+# Install as /usr/local/sbin/tg-cli-relay-callback-receive and chmod 0700.
+# Reads the secret from a root-only file (chmod 0600). Passes stdin through.
+# Never puts the secret on argv or in the environment as the key value.
+set -euo pipefail
+umask 077
+
+# Same opt-in as the bot: default OFF. Enable only by setting
+# TGR_BACKGROUND_HANDOFF=1 in this env file (or the process environment).
+# Put flag / path settings here — never the HMAC secret value.
+CALLBACK_ENV="/etc/tg-cli-relay/callback.env"
+if [[ -f "$CALLBACK_ENV" && ! -L "$CALLBACK_ENV" ]]; then
+  # shellcheck disable=SC1091
+  source "$CALLBACK_ENV"
+fi
+
+SECRET_FILE="${TGR_BACKGROUND_HANDOFF_SECRET_FILE:-/etc/tg-cli-relay/callback.secret}"
+if [[ ! -f "$SECRET_FILE" ]]; then
+  echo "misconfigured" >&2
+  exit 4
+fi
+if [[ -L "$SECRET_FILE" ]]; then
+  echo "misconfigured" >&2
+  exit 4
+fi
+
+export TGR_BACKGROUND_HANDOFF="${TGR_BACKGROUND_HANDOFF:-0}"
+export TGR_BACKGROUND_HANDOFF_SECRET_FILE="$SECRET_FILE"
+export TGR_BACKGROUND_HANDOFF_STATE_ROOT="${TGR_BACKGROUND_HANDOFF_STATE_ROOT:-/var/lib/tg-cli-relay/callback}"
+
+exec /srv/tg-cli-relay/.venv/bin/tg-cli-relay callback-receive

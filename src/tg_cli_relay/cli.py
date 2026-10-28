@@ -43,6 +43,11 @@ def main(argv: list[str] | None = None) -> int:
     cleanup = sub.add_parser("cleanup-uploads", help="清理超過保留期限的 Telegram 上傳暫存")
     cleanup.add_argument("--dry-run", action="store_true", help="僅顯示設定，不刪除")
 
+    sub.add_parser(
+        "callback-receive",
+        help="讀取 stdin 上一筆 HMAC 簽署的背景回呼事件（HMS → WEB1）",
+    )
+
     args = p.parse_args(argv)
     if args.cmd == "doctor":
         db = os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3"))
@@ -81,6 +86,11 @@ def main(argv: list[str] | None = None) -> int:
 
         run_bot()
         return 0
+
+    if args.cmd == "callback-receive":
+        from tg_cli_relay.background_callback import receive_from_stdin
+
+        return receive_from_stdin()
 
     if args.cmd == "cleanup-uploads":
         from tg_cli_relay.attachments import AttachmentConfig, cleanup_upload_dirs
