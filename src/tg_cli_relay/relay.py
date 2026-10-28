@@ -304,14 +304,17 @@ def relay_turn(
     store: SessionStore | None = None,
     workspace: str | None = None,
     on_progress: Callable[[str], None] | None = None,
-    on_handoff: Callable[[str, str], bool] | None = None,
+    on_handoff: Callable[[str, str, str], bool] | None = None,
     routing_only: bool = False,
+    resume_session_id: str | None = None,
+    persist_session: bool = True,
+    update_context: bool = True,
 ) -> RunResult:
     """依 thread_key 接續或建立後端 session，送出一輪 prompt。"""
     ws = workspace or _default_workspace()
     st = store or SessionStore(_default_db_path())
     context = ConversationContext(st.db_path)
-    state = context.snapshot(thread_key)
+    state = context.snapshot(thread_key) if update_context else {"epoch": "", "next_handoff_id": 0}
     epoch = state["epoch"]
     delivered_through = int(state.get("next_handoff_id", 0))
 
@@ -321,6 +324,8 @@ def relay_turn(
         result = _relay_codex(
             st, thread_key, ws, prompt,
             on_progress=on_progress, on_handoff=on_handoff, routing_only=routing_only,
+            resume_session_id=resume_session_id, persist_session=persist_session,
+            update_context=update_context,
         )
     elif backend == "claude":
         result = _relay_claude(st, thread_key, ws, prompt)
@@ -328,7 +333,7 @@ def relay_turn(
         result = _relay_opencode(st, thread_key, ws, prompt)
     else:
         raise ValueError(f"未知後端: {backend}")
-    if result.returncode == 0 or result.handoff_detached:
+    if update_context and (result.returncode == 0 or result.handoff_detached):
         from tg_cli_relay.background_callback import feature_enabled, find_handoff_markers
 
         visible = result.stdout
@@ -446,8 +451,11 @@ def _relay_codex(
     prompt: str,
     *,
     on_progress: Callable[[str], None] | None = None,
-    on_handoff: Callable[[str, str], bool] | None = None,
+    on_handoff: Callable[[str, str, str], bool] | None = None,
     routing_only: bool = False,
+    resume_session_id: str | None = None,
+    persist_session: bool = True,
+    update_context: bool = True,
 ) -> RunResult:
     import os
 
@@ -473,23 +481,27 @@ def _relay_codex(
         )
     else:
         raise ValueError("TGR_CODEX_TRANSPORT must be cli or app-server")
-    sid = store.get(thread_key, "codex")
+    sid = resume_session_id if resume_session_id is not None else store.get(thread_key, "codex")
     # Never auto-call Cursor/Claude/OpenCode or ask the Relay router for a
     # delegation decision. Codex follows its own workspace/knowledge rules.
     codex_prompt = apply_background_callback_prefix(prompt)
     extra: dict = {"thread_key": thread_key, "on_handoff": on_handoff}
-    if transport == "app-server":
+    if transport == "app-server" and persist_session:
         extra["on_session"] = lambda new_sid: store.upsert(
             thread_key, "codex", new_sid, workspace=workspace
         )
+    if update_context:
+        turn_prompt = ConversationContext(store.db_path).prompt(
+            thread_key, codex_prompt, include_history=not sid, consumer="codex"
+        )
+    else:
+        turn_prompt = codex_prompt
     res = prov.run_turn(
         workspace=workspace, session_id=sid,
-        prompt=ConversationContext(store.db_path).prompt(
-            thread_key, codex_prompt, include_history=not sid, consumer="codex"
-        ),
+        prompt=turn_prompt,
         on_progress=on_progress,
         **extra,
     )
-    if res.session_id and res.session_id != sid:
+    if persist_session and res.session_id and res.session_id != sid:
         store.upsert(thread_key, "codex", res.session_id, workspace=workspace)
     return res

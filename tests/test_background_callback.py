@@ -64,9 +64,26 @@ def _callback_env(monkeypatch, tmp_path: Path, *, enabled: bool = True) -> tuple
     monkeypatch.setenv("TGR_BACKGROUND_HANDOFF_MAX_SKEW_SECONDS", "300")
     monkeypatch.setenv("TGR_DEFAULT_WORKSPACE", str(tmp_path / "ws"))
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:TESTTOKEN")
+    queue = tmp_path / "watchdog-queue"
+    for name in ("pending", "running", "done", "failed"):
+        (queue / name).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TGR_BACKGROUND_HANDOFF_QUEUE_ROOT", str(queue))
     (tmp_path / "ws").mkdir()
     monkeypatch.setattr("tg_cli_relay.background_callback._utcnow", lambda: FIXED_NOW)
     return state, secret
+
+
+def _submit_shared_task(
+    tmp_path: Path, task_id: str, handoff_path: str, *, enabled: bool = True
+) -> Path:
+    payload = {
+        "id": task_id,
+        "callback": {"enabled": enabled, "handoff_path": handoff_path},
+    }
+    path = tmp_path / "watchdog-queue" / "pending" / f"{task_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def _msg(chat_id: int = 7, thread_id: int | None = None) -> FakeMessage:
@@ -511,6 +528,7 @@ def test_marker_registers_strips_and_acks(monkeypatch, tmp_path):
     handoff = tmp_path / "handoff.md"
     handoff.write_text("durable handoff", encoding="utf-8")
     marker = f"TGR_BACKGROUND_HANDOFF:task-9:{handoff}"
+    _submit_shared_task(tmp_path, "task-9", str(handoff))
     msg = FakeMessage(text="長任務", chat_id=7, message_id=4)
     msg.from_user = SimpleNamespace(id=99)
 
@@ -518,7 +536,7 @@ def test_marker_registers_strips_and_acks(monkeypatch, tmp_path):
         _reset(bot)
         try:
             with patch.object(bot, "relay_turn", return_value=RunResult(
-                "done", "", 0, stdout_segments=["說明", marker]
+                "done", "", 0, session_id="sess-9", stdout_segments=["說明", marker]
             )):
                 await bot._on_message(_update(msg, 7), SimpleNamespace())
         finally:
@@ -532,6 +550,8 @@ def test_marker_registers_strips_and_acks(monkeypatch, tmp_path):
     assert (state / "registrations").exists()
     matches = list((state / "registrations").glob("*/task-9.json"))
     assert matches
+    recorded = json.loads(matches[0].read_text(encoding="utf-8"))
+    assert recorded["codex_session_id"] == "sess-9"
 
 
 def test_multiple_markers_are_rejected_and_not_registered(monkeypatch, tmp_path):
@@ -600,9 +620,53 @@ def test_missing_handoff_file_does_not_register(monkeypatch, tmp_path):
             str(tmp_path / "no-such.md"),
             msg=_msg(),
             thread_key="private:7",
+            session_id="sess-missing",
         )
     assert exc.value.reason == "missing_handoff"
     assert list((tmp_path / "callback-state" / "registrations").glob("*/*.json")) == []
+
+
+def test_accept_requires_real_shared_task_receipt(monkeypatch, tmp_path):
+    from tg_cli_relay.background_callback import accept_handoff_marker, CallbackError
+
+    _callback_env(monkeypatch, tmp_path)
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text("durable worker handoff", encoding="utf-8")
+    msg = _msg()
+    with pytest.raises(CallbackError) as missing:
+        accept_handoff_marker(
+            "task-q", str(handoff), msg=msg, thread_key="private:7", session_id="sess-q"
+        )
+    assert missing.value.reason == "missing_durable_task"
+
+    _submit_shared_task(tmp_path, "task-q", str(tmp_path / "other.md"))
+    with pytest.raises(CallbackError) as mismatch:
+        accept_handoff_marker(
+            "task-q", str(handoff), msg=msg, thread_key="private:7", session_id="sess-q"
+        )
+    assert mismatch.value.reason == "task_ref_mismatch"
+
+    (tmp_path / "watchdog-queue" / "pending" / "task-q.json").unlink()
+    _submit_shared_task(tmp_path, "task-q", str(handoff), enabled=False)
+    with pytest.raises(CallbackError) as disabled:
+        accept_handoff_marker(
+            "task-q", str(handoff), msg=msg, thread_key="private:7", session_id="sess-q"
+        )
+    assert disabled.value.reason == "invalid_durable_task"
+
+    (tmp_path / "watchdog-queue" / "pending" / "task-q.json").unlink()
+    _submit_shared_task(tmp_path, "task-q", str(handoff))
+    record = accept_handoff_marker(
+        "task-q", str(handoff), msg=msg, thread_key="private:7", session_id="sess-q"
+    )
+    assert record["codex_session_id"] == "sess-q"
+
+    monkeypatch.delenv("TGR_BACKGROUND_HANDOFF_QUEUE_ROOT", raising=False)
+    with pytest.raises(CallbackError) as remote:
+        accept_handoff_marker(
+            "task-remote", str(handoff), msg=msg, thread_key="private:7", session_id="sess-r"
+        )
+    assert remote.value.reason == "unverified_task"
 
 
 def test_wrong_bot_fingerprint_is_unknown_task(monkeypatch, tmp_path):

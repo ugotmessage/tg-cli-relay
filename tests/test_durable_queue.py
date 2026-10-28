@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -225,3 +226,58 @@ def test_terminal_history_can_be_pruned_without_dropping_waiting_turns(tmp_path)
         )
     assert store.prune_terminal(retention_days=30) == 1
     assert [r.id for r in store.load_queued()] == [waiting]
+
+
+def test_legacy_schema_migrates_and_event_id_uniquely_identifies_continuations(tmp_path):
+    db = tmp_path / "sessions.sqlite3"
+    with sqlite3.connect(db) as con:
+        con.execute("""
+            CREATE TABLE relay_pending_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_key TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                topic_id INTEGER,
+                task_id TEXT,
+                worker_key TEXT,
+                title TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'queued',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(thread_key, message_id, kind)
+            )
+        """)
+        con.execute("""
+            INSERT INTO relay_pending_turns (
+                thread_key,backend,prompt,kind,chat_id,message_id,topic_id,title,status
+            ) VALUES ('private:7','codex','原始指令','parent',7,10,NULL,'','queued')
+        """)
+    store = DurableQueue(db)
+    existing = store.lookup(thread_key="private:7", message_id=10, kind="parent")
+    assert existing is not None
+    assert existing.prompt == "原始指令"
+    first = store.add(
+        thread_key="private:7", backend="codex", prompt="續行 A",
+        kind="background_continuation", chat_id=7, message_id=0, topic_id=None,
+        event_id="00000000-0000-0000-0000-000000000001",
+        resume_session_id="sess-a",
+    )
+    again = store.add(
+        thread_key="private:7", backend="codex", prompt="續行 A 重送",
+        kind="background_continuation", chat_id=7, message_id=0, topic_id=None,
+        event_id="00000000-0000-0000-0000-000000000001",
+        resume_session_id="sess-a",
+    )
+    other = store.add(
+        thread_key="private:7", backend="codex", prompt="續行 B",
+        kind="background_continuation", chat_id=7, message_id=0, topic_id=None,
+        event_id="00000000-0000-0000-0000-000000000002",
+        resume_session_id="sess-b",
+    )
+    assert first == again
+    assert other != first
+    assert store.lookup_event("00000000-0000-0000-0000-000000000001").resume_session_id == "sess-a"
+    assert store.lookup_event("00000000-0000-0000-0000-000000000002").prompt == "續行 B"

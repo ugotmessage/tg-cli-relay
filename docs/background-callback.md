@@ -19,6 +19,7 @@
 | receiver wrapper | `deploy/callback-receive.sh.example`（mode 0700；**預設關閉**，與 bot 相同 opt-in） |
 | wrapper env | `/etc/tg-cli-relay/callback.env`（若存在則 source；在此明確設 `TGR_BACKGROUND_HANDOFF=1` 才啟用，不可放密鑰） |
 | 狀態目錄 | `registrations/<bot_fp>/<task_id>.json`、`inbox/{new,claimed,completed,failed}/`、`seen/<event_id>`、`receipts/<task_id>.json` |
+| 共用 queue 核對 | `TGR_BACKGROUND_HANDOFF_QUEUE_ROOT`（watchdog `queue/`；本機必填。未設定＝無法核對、拒絕拆離） |
 
 ### 密鑰
 
@@ -75,11 +76,34 @@ Watchdog patch 見 artifacts：`/Users/ht/.hermes/artifacts/relay-background-con
 ## 無害 e2e fixture（deploy 後由 controller 跑）
 
 1. 啟用 flag，確認 secret 與 state root。
-2. 在測試對話送出一輪會印出整段 marker 的 Codex 回合：`TGR_BACKGROUND_HANDOFF:<task_id>:<abs_handoff>`。handoff 檔必須已存在。
+2. 在測試對話送出一輪會印出整段 marker 的 Codex 回合：`TGR_BACKGROUND_HANDOFF:<task_id>:<abs_handoff>`。handoff 檔與共用 queue 的 `pending/`／`running/` 任務 JSON（`callback.enabled` + 相符 `handoff_path`）必須已存在；Relay 必須看得到 `TGR_BACKGROUND_HANDOFF_QUEUE_ROOT`。
 3. 使用者應看到「已登記背景工作…」，看不到 marker 本體；該主回合應已釋放，後續使用者訊息可在 worker 仍 running 時完成。
 4. 共用 queue 任務 `callback.enabled=true`，進入 `done/` / `failed/` / timeout 後 outbox 先送 signed `registration_probe`。
 5. Receiver 回 `registered` 後，outbox **不**跑獨立 verifier，直接送 signed `final_result`。
 6. Relay 在原 Codex session 空閒時續行一次，範圍僅限該 task／handoff／artifacts；用凍結的 chat／topic 投遞 Codex 回覆，寫 `receipts/<task_id>.json`（`continuation_queued`）。
 7. 重送同一 final `event_id` 應為 replay、不排第二次續行。壞簽章不得進 inbox。未知／錯 bot 登記不得排程。in-flight 續行若結果不明，不得自動重跑，也不得暫停後續普通主對話。
+
+## 凍結 session、`/new`、續行 UI
+
+拆離時會把 **Codex `thread.started` / app-server thread id** 寫進 registration 的 `codex_session_id`（CLI 在 `store.upsert` 之前凍結）。續行用這個 id 做 `codex exec resume`，**不會**覆寫目前主對話 SessionStore。因此：
+
+- `/new`、`/reset` 仍可在主 slot 空閒時使用（不會為了背景工作而禁止）。
+- 之後的使用者訊息走新的主 session；背景續行仍回到**原** Codex session。
+- Telegram 投遞仍用凍結的 chat／topic，所以同一對話看得到續行文字，但 Codex 歷史已分叉。
+- 續行不會 `bind_parent_message`，回覆續行訊息不會把主 UI 綁到舊 session。
+- Relay 重啟後，durable queue 的 `event_id` + `resume_session_id` 仍指向原 session。
+- 舊登記若沒有 `codex_session_id`：**可見失敗**，絕不默默改用目前／新 session。
+
+## 事件去重
+
+續行以完整 callback `event_id`（UUID 字串）存在 `relay_pending_turns.event_id` 做 UNIQUE。Telegram 使用者訊息仍用 `(thread_key, message_id, kind)`。不再用 UUID 截斷當 identity。
+
+## App Server 拆離
+
+必須 `turn/interrupt` RPC 成功，且隨後收到 `turn/completed`，才把 `handoff_detached=True`。interrupt 失敗則繼續該回合，不釋放父對話為成功 handoff。CLI SIGTERM／resume 仍需 live Codex 驗收，假 executable 不能證明真實 CLI 行為。
+
+## Durable task 核對
+
+`accept_handoff_marker` 除了 handoff 檔存在，還要在 `TGR_BACKGROUND_HANDOFF_QUEUE_ROOT/{pending,running}/<task_id>.json` 找到 `id` 相符、`callback.enabled`、且 `callback.handoff_path` 與 marker 相同的任務。缺 queue root（遠端 WEB1 收件端看不到本機 HMS queue、且既有 SSH 只在完成後送 probe）時 **fail-closed**（`unverified_task`），不發明新的信任通道。
 
 本工作樹的單元測試不連網、不打真實 Telegram，不代表 live e2e 已通過。

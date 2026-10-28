@@ -191,7 +191,7 @@ class CodexAppServerProvider:
         on_progress: Callable[[str], None] | None = None,
         thread_key: str | None = None,
         on_session: Callable[[str], None] | None = None,
-        on_handoff: Callable[[str, str], bool] | None = None,
+        on_handoff: Callable[[str, str, str], bool] | None = None,
     ) -> RunResult:
         timeout = (float(os.environ.get("TGR_CODEX_APP_TURN_TIMEOUT", "7200"))
                    if self.timeout_seconds is None else self.timeout_seconds)
@@ -213,7 +213,7 @@ async def _run_turn(
     on_progress: Callable[[str], None] | None,
     thread_key: str | None = None,
     on_session: Callable[[str], None] | None = None,
-    on_handoff: Callable[[str, str], bool] | None = None,
+    on_handoff: Callable[[str, str, str], bool] | None = None,
 ) -> RunResult:
     await client.start()
     policy = "danger-full-access" if bypass else os.environ.get("TGR_CODEX_APP_SANDBOX", "workspace-write")
@@ -242,6 +242,7 @@ async def _run_turn(
     error: str | None = None
     timed_out = False
     handoff_detached = False
+    handoff_interrupt_ok = False
     try:
         args = {
             "threadId": thread_id, "cwd": workspace,
@@ -261,7 +262,7 @@ async def _run_turn(
                     "threadId": thread_id, "turnId": turn_id,
                 }, timeout=10)
         async def receive() -> None:
-            nonlocal pending, error, handoff_detached
+            nonlocal pending, error, handoff_detached, handoff_interrupt_ok
             while True:
                 event = await inbox.get()
                 method = event.get("method")
@@ -290,11 +291,10 @@ async def _run_turn(
                                 parsed = parse_handoff_marker(content)
                             if parsed is not None:
                                 try:
-                                    accepted = bool(on_handoff(parsed[0], parsed[1]))
+                                    accepted = bool(on_handoff(parsed[0], parsed[1], thread_id))
                                 except Exception:
                                     accepted = False
                                 if accepted:
-                                    handoff_detached = True
                                     try:
                                         await client.request(
                                             "turn/interrupt",
@@ -303,13 +303,19 @@ async def _run_turn(
                                         )
                                     except Exception:
                                         log.warning("Codex handoff interrupt failed")
-                                    return
+                                        continue
+                                    handoff_interrupt_ok = True
+                                    continue
                 if method == "error" and not params.get("willRetry", False):
                     error_obj = params.get("error") or {}
                     error = error_obj.get("message") if isinstance(error_obj, dict) else str(error_obj)
                 if method == "turn/completed":
                     turn = params.get("turn") or {}
                     status = turn.get("status", "completed")
+                    if handoff_interrupt_ok:
+                        handoff_detached = True
+                        error = None
+                        return
                     if status not in ("completed", "success"):
                         err = turn.get("error") or {}
                         error = err.get("message", str(status)) if isinstance(err, dict) else str(err)

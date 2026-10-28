@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,14 +16,18 @@ import pytest
 from tg_cli_relay.background_callback import (
     CONTINUATION_KIND,
     accept_handoff_marker,
-    continuation_message_id,
     receive_event_bytes,
     scan_once,
 )
 from tg_cli_relay.durable_queue import DurableQueue
 from tg_cli_relay.providers.codex_cli import CodexCliProvider
 from tg_cli_relay.session_store import SessionStore
-from test_background_callback import SENTINEL_SECRET, _callback_env, _signed_event
+from test_background_callback import (
+    SENTINEL_SECRET,
+    _callback_env,
+    _signed_event,
+    _submit_shared_task,
+)
 from test_task_isolation import FakeMessage, _env, _reset, _update
 
 
@@ -38,7 +43,10 @@ prompt = sys.argv[-1]
 if log:
     with open(log, "a", encoding="utf-8") as fh:
         fh.write(json.dumps({"argv": sys.argv[1:], "prompt": prompt}) + "\n")
-thread = os.environ.get("FAKE_SESSION", "sess-handoff")
+if "resume" in sys.argv:
+    thread = sys.argv[sys.argv.index("resume") + 1]
+else:
+    thread = os.environ.get("FAKE_SESSION", "sess-handoff")
 sys.stdout.write(json.dumps({"type": "thread.started", "thread_id": thread}) + "\n")
 sys.stdout.flush()
 mode = os.environ.get("FAKE_CODEX_MODE", "reply")
@@ -137,8 +145,8 @@ def test_streaming_handoff_detaches_without_timeout_and_preserves_resume(tmp_pat
     monkeypatch.setenv("FAKE_CODEX_LOG", str(tmp_path / "codex.log"))
     accepted: list[tuple[str, str]] = []
 
-    def on_handoff(task_id: str, path: str) -> bool:
-        accepted.append((task_id, path))
+    def on_handoff(task_id: str, path: str, session_id: str) -> bool:
+        accepted.append((task_id, path, session_id))
         return True
 
     started = time.monotonic()
@@ -154,7 +162,7 @@ def test_streaming_handoff_detaches_without_timeout_and_preserves_resume(tmp_pat
     assert result.handoff_detached is True
     assert result.returncode == 0
     assert result.session_id == "sess-handoff"
-    assert accepted == [("task-stop", str(handoff))]
+    assert accepted == [("task-stop", str(handoff), "sess-handoff")]
     assert "Codex CLI turn exceeded timeout" not in (result.stderr or "")
 
     monkeypatch.setenv("FAKE_CODEX_MODE", "reply")
@@ -204,7 +212,7 @@ def test_quoted_or_tool_marker_does_not_detach(tmp_path, monkeypatch, mode):
         session_id=None,
         prompt="不要拆離",
         on_progress=lambda _: None,
-        on_handoff=lambda task_id, path: calls.append((task_id, path)) or True,
+        on_handoff=lambda task_id, path, session_id: calls.append((task_id, path)) or True,
         thread_key=f"private:{mode}",
     )
     assert calls == []
@@ -221,6 +229,7 @@ def test_submission_releases_while_worker_pending_and_later_user_completes(monke
 
     _full_env(monkeypatch, tmp_path)
     handoff = _handoff_file(tmp_path)
+    _submit_shared_task(tmp_path, "task-bg", str(handoff))
     marker = f"TGR_BACKGROUND_HANDOFF:task-bg:{handoff}"
     monkeypatch.setenv("FAKE_CODEX_MODE", "handoff-hang")
     monkeypatch.setenv("FAKE_MARKER", marker)
@@ -260,6 +269,7 @@ def test_handoff_does_not_queue_timeout_recovery(monkeypatch, tmp_path):
     _full_env(monkeypatch, tmp_path)
     monkeypatch.setenv("TGR_TURN_TIMEOUT", "8")
     handoff = _handoff_file(tmp_path)
+    _submit_shared_task(tmp_path, "task-norecovery", str(handoff))
     marker = f"TGR_BACKGROUND_HANDOFF:task-norecovery:{handoff}"
     monkeypatch.setenv("FAKE_CODEX_MODE", "handoff-hang")
     monkeypatch.setenv("FAKE_MARKER", marker)
@@ -289,6 +299,7 @@ def test_terminal_completion_continues_original_session_once(monkeypatch, tmp_pa
 
     state, _, _ = _full_env(monkeypatch, tmp_path)
     handoff = _handoff_file(tmp_path)
+    _submit_shared_task(tmp_path, "task-1", str(handoff))
     marker = f"TGR_BACKGROUND_HANDOFF:task-1:{handoff}"
     monkeypatch.setenv("FAKE_CODEX_MODE", "handoff-hang")
     monkeypatch.setenv("FAKE_MARKER", marker)
@@ -330,10 +341,8 @@ def test_terminal_completion_continues_original_session_once(monkeypatch, tmp_pa
                     bot_api, reg, ev
                 ),
             )
-            assert DurableQueue(tmp_path / "sessions.sqlite3").lookup(
-                thread_key="private:7",
-                message_id=continuation_message_id(event["event_id"]),
-                kind=CONTINUATION_KIND,
+            assert DurableQueue(tmp_path / "sessions.sqlite3").lookup_event(
+                event["event_id"]
             ) is None
             await running
             await scan_once(
@@ -381,7 +390,10 @@ def test_uncertain_continuation_does_not_block_or_rerun(monkeypatch, tmp_path):
     handoff = _handoff_file(tmp_path)
     msg = FakeMessage(text="hi", chat_id=7, message_id=1)
     msg.from_user = SimpleNamespace(id=99)
-    accept_handoff_marker("task-u", str(handoff), msg=msg, thread_key="private:7")
+    _submit_shared_task(tmp_path, "task-u", str(handoff))
+    accept_handoff_marker(
+        "task-u", str(handoff), msg=msg, thread_key="private:7", session_id="sess-handoff"
+    )
     event = _signed_event(SENTINEL_SECRET, task_id="task-u", handoff_path=str(handoff))
     assert receive_event_bytes(json.dumps(event).encode("utf-8")).reason == "accepted"
     db = tmp_path / "sessions.sqlite3"
@@ -392,9 +404,11 @@ def test_uncertain_continuation_does_not_block_or_rerun(monkeypatch, tmp_path):
         prompt="Relay background-worker continuation. stale",
         kind=CONTINUATION_KIND,
         chat_id=7,
-        message_id=continuation_message_id(event["event_id"]),
+        message_id=0,
         topic_id=None,
         task_id="task-u",
+        event_id=event["event_id"],
+        resume_session_id="sess-handoff",
     )
     assert ledger.start(qid)
     assert ledger.mark_interrupted_uncertain() == 1
@@ -441,7 +455,10 @@ def test_invalid_signature_does_not_enqueue_continuation(monkeypatch, tmp_path):
     handoff = _handoff_file(tmp_path)
     msg = FakeMessage(text="hi", chat_id=7, message_id=1)
     msg.from_user = SimpleNamespace(id=99)
-    accept_handoff_marker("task-1", str(handoff), msg=msg, thread_key="private:7")
+    _submit_shared_task(tmp_path, "task-1", str(handoff))
+    accept_handoff_marker(
+        "task-1", str(handoff), msg=msg, thread_key="private:7", session_id="sess-handoff"
+    )
     event = _signed_event(SENTINEL_SECRET, task_id="task-1", handoff_path=str(handoff))
     event["hmac"] = "00" * 32
     assert receive_event_bytes(json.dumps(event).encode("utf-8")).reason == "bad_signature"
@@ -461,3 +478,182 @@ def test_invalid_signature_does_not_enqueue_continuation(monkeypatch, tmp_path):
     asyncio.run(scenario())
     assert scheduled == []
     assert DurableQueue(tmp_path / "sessions.sqlite3").load_queued() == []
+
+
+def test_continuation_uses_frozen_session_after_new_mapping(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot as bot
+
+    _full_env(monkeypatch, tmp_path)
+    handoff = _handoff_file(tmp_path)
+    _submit_shared_task(tmp_path, "task-freeze", str(handoff))
+    marker = f"TGR_BACKGROUND_HANDOFF:task-freeze:{handoff}"
+    monkeypatch.setenv("FAKE_CODEX_MODE", "handoff-hang")
+    monkeypatch.setenv("FAKE_MARKER", marker)
+    submit = FakeMessage(text="請派背景工作", chat_id=7, message_id=70)
+    submit.from_user = SimpleNamespace(id=99)
+    later = FakeMessage(text="新對話", chat_id=7, message_id=71)
+    later.from_user = SimpleNamespace(id=99)
+    recorded: list[str] = []
+    bot_api = SimpleNamespace(
+        send_message=AsyncMock(
+            side_effect=lambda **kw: recorded.append(kw.get("text", "") or "")
+            or SimpleNamespace(message_id=910)
+        ),
+        send_chat_action=AsyncMock(),
+        send_document=AsyncMock(),
+    )
+
+    async def scenario():
+        _reset(bot)
+        bot._REVIEW_REQUIRED_THREADS.clear()
+        try:
+            await bot._on_message(_update(submit, 7), SimpleNamespace())
+            store = SessionStore(tmp_path / "sessions.sqlite3")
+            assert store.get("private:7", "codex") == "sess-handoff"
+            store.delete("private:7", "codex")
+            monkeypatch.setenv("FAKE_CODEX_MODE", "reply")
+            monkeypatch.setenv("FAKE_SESSION", "sess-new")
+            monkeypatch.setenv("FAKE_REPLY", "新主對話")
+            monkeypatch.setenv("FAKE_CONTINUATION_REPLY", "舊 session 續行")
+            await bot._on_message(_update(later, 7), SimpleNamespace())
+            assert store.get("private:7", "codex") == "sess-new"
+            event = _signed_event(
+                SENTINEL_SECRET,
+                task_id="task-freeze",
+                handoff_path=str(handoff),
+            )
+            assert receive_event_bytes(json.dumps(event).encode("utf-8")).reason == "accepted"
+            await scan_once(
+                active_thread_keys=set(),
+                deliver=lambda *_: asyncio.sleep(0),
+                schedule_continuation=lambda reg, ev: bot._schedule_background_continuation(
+                    bot_api, reg, ev
+                ),
+            )
+            while bot._BACKGROUND_TASKS:
+                await asyncio.gather(*tuple(bot._BACKGROUND_TASKS), return_exceptions=True)
+            assert store.get("private:7", "codex") == "sess-new"
+        finally:
+            _reset(bot)
+            bot._REVIEW_REQUIRED_THREADS.clear()
+
+    asyncio.run(scenario())
+    resumes = [
+        entry["argv"]
+        for entry in _codex_log(tmp_path)
+        if "resume" in entry["argv"]
+    ]
+    assert any("sess-handoff" in argv for argv in resumes)
+    assert any("舊 session 續行" in text for text in recorded)
+    assert any("新主對話" in (getattr(s, "text", "") or "") for s in later.sent)
+
+
+def test_legacy_registration_without_session_fails_visibly(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot as bot
+    from tg_cli_relay.background_callback import register_from_relay_context
+
+    state, _, _ = _full_env(monkeypatch, tmp_path)
+    handoff = _handoff_file(tmp_path)
+    msg = FakeMessage(text="hi", chat_id=7, message_id=1)
+    msg.from_user = SimpleNamespace(id=99)
+    register_from_relay_context(
+        task_id="task-legacy",
+        handoff_path=str(handoff),
+        msg=msg,
+        thread_key="private:7",
+    )
+    event = _signed_event(
+        SENTINEL_SECRET, task_id="task-legacy", handoff_path=str(handoff)
+    )
+    assert receive_event_bytes(json.dumps(event).encode("utf-8")).reason == "accepted"
+    SessionStore(tmp_path / "sessions.sqlite3").upsert("private:7", "codex", "sess-current")
+    delivered: list[str] = []
+
+    async def scenario():
+        _reset(bot)
+        try:
+            await scan_once(
+                active_thread_keys=set(),
+                deliver=lambda _reg, text: delivered.append(text) or asyncio.sleep(0),
+                schedule_continuation=lambda reg, ev: bot._schedule_background_continuation(
+                    SimpleNamespace(), reg, ev
+                ),
+            )
+        finally:
+            _reset(bot)
+
+    asyncio.run(scenario())
+    assert delivered
+    assert "缺少凍結的 session id" in delivered[0]
+    assert DurableQueue(tmp_path / "sessions.sqlite3").load_queued() == []
+    receipt = json.loads((state / "receipts" / "task-legacy.json").read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    assert receipt["note"] == "missing_session"
+    log_prompts = [entry["prompt"] for entry in _codex_log(tmp_path)]
+    assert all("Relay background-worker continuation" not in prompt for prompt in log_prompts)
+
+
+def test_colliding_truncated_uuid_events_are_both_queued(monkeypatch, tmp_path):
+    from tg_cli_relay import telegram_bot as bot
+
+    _full_env(monkeypatch, tmp_path)
+    first = uuid.UUID(int=1)
+    second = uuid.UUID(int=1_000_000_000 + 1)
+    assert first.int % 1_000_000_000 == second.int % 1_000_000_000
+    handoff_a = _handoff_file(tmp_path, "a.md")
+    handoff_b = _handoff_file(tmp_path, "b.md")
+    _submit_shared_task(tmp_path, "task-a", str(handoff_a))
+    _submit_shared_task(tmp_path, "task-b", str(handoff_b))
+    msg = FakeMessage(text="hi", chat_id=7, message_id=1)
+    msg.from_user = SimpleNamespace(id=99)
+    accept_handoff_marker(
+        "task-a", str(handoff_a), msg=msg, thread_key="private:7", session_id="sess-a"
+    )
+    accept_handoff_marker(
+        "task-b", str(handoff_b), msg=msg, thread_key="private:7", session_id="sess-b"
+    )
+    event_a = _signed_event(
+        SENTINEL_SECRET,
+        task_id="task-a",
+        handoff_path=str(handoff_a),
+        event_id=str(first),
+    )
+    event_b = _signed_event(
+        SENTINEL_SECRET,
+        task_id="task-b",
+        handoff_path=str(handoff_b),
+        event_id=str(second),
+    )
+    assert receive_event_bytes(json.dumps(event_a).encode("utf-8")).reason == "accepted"
+    assert receive_event_bytes(json.dumps(event_b).encode("utf-8")).reason == "accepted"
+
+    async def scenario():
+        _reset(bot)
+        try:
+            await scan_once(
+                active_thread_keys=set(),
+                deliver=lambda *_: asyncio.sleep(0),
+                schedule_continuation=lambda reg, ev: bot._schedule_background_continuation(
+                    SimpleNamespace(
+                        send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)),
+                        send_chat_action=AsyncMock(),
+                        send_document=AsyncMock(),
+                    ),
+                    reg,
+                    ev,
+                ),
+            )
+            while bot._BACKGROUND_TASKS:
+                await asyncio.gather(*tuple(bot._BACKGROUND_TASKS), return_exceptions=True)
+        finally:
+            _reset(bot)
+
+    asyncio.run(scenario())
+    ledger = DurableQueue(tmp_path / "sessions.sqlite3")
+    row_a = ledger.lookup_event(str(first))
+    row_b = ledger.lookup_event(str(second))
+    assert row_a is not None and row_b is not None
+    assert row_a.id != row_b.id
+    assert row_a.resume_session_id == "sess-a"
+    assert row_b.resume_session_id == "sess-b"
+    assert {row_a.event_id, row_b.event_id} == {str(first), str(second)}

@@ -41,7 +41,7 @@ class CodexCliProvider:
         prompt: str,
         on_progress: Callable[[str], None] | None = None,
         thread_key: str | None = None,
-        on_handoff: Callable[[str, str], bool] | None = None,
+        on_handoff: Callable[[str, str, str], bool] | None = None,
     ) -> RunResult:
         base: list[str] = [self.codex_bin]
         if self.model:
@@ -139,7 +139,7 @@ class CodexCliProvider:
                             # Killing before thread.started would drop resume identity.
                             continue
                         try:
-                            accepted = bool(on_handoff(parsed[0], parsed[1]))
+                            accepted = bool(on_handoff(parsed[0], parsed[1], known_sid))
                         except Exception:
                             accepted = False
                         if not accepted:

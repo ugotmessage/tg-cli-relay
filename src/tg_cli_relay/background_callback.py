@@ -308,12 +308,75 @@ def validate_handoff_path_ref(path_str: str) -> str:
     return path_str
 
 
+DURABLE_TASK_STATES = ("pending", "running")
+
+
+def _validate_session_id(session_id: str | None) -> str:
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise CallbackError("missing_session")
+    sid = session_id.strip()
+    if len(sid) > 256 or "\x00" in sid or "/" in sid or ".." in sid:
+        raise CallbackError("malformed")
+    return sid
+
+
+def verify_durable_shared_task(
+    task_id: str,
+    handoff_path: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Prove a submitted shared-watcher task exists with matching callback refs.
+
+    Local co-located Relay reads the existing watchdog queue directory. Remote
+    WEB1 without a readable queue root cannot verify the Mac-side queue over
+    existing submit-time protocol, so detach is fail-closed (unverified_task)
+    rather than inventing SSH/trust proof.
+    """
+    source = os.environ if env is None else env
+    raw = (source.get("TGR_BACKGROUND_HANDOFF_QUEUE_ROOT") or "").strip()
+    if not raw:
+        raise CallbackError("unverified_task")
+    root = Path(raw)
+    if _is_symlink(root):
+        raise CallbackError("symlink")
+    if not root.is_dir():
+        raise CallbackError("missing_durable_task")
+    found: Path | None = None
+    for state in DURABLE_TASK_STATES:
+        candidate = root / state / f"{task_id}.json"
+        if _is_symlink(candidate):
+            raise CallbackError("symlink")
+        if candidate.is_file():
+            found = candidate
+            break
+    if found is None:
+        raise CallbackError("missing_durable_task")
+    data = load_json(found)
+    if not data or data.get("id") != task_id:
+        raise CallbackError("invalid_durable_task")
+    callback = data.get("callback")
+    if not isinstance(callback, dict):
+        raise CallbackError("invalid_durable_task")
+    enabled = callback.get("enabled")
+    enabled_ok = enabled is True or (
+        isinstance(enabled, str) and enabled.strip().lower() in _TRUTHY
+    )
+    if not enabled_ok:
+        raise CallbackError("invalid_durable_task")
+    cb_path = callback.get("handoff_path")
+    if not isinstance(cb_path, str) or cb_path != handoff_path:
+        raise CallbackError("task_ref_mismatch")
+    return data
+
+
 def accept_handoff_marker(
     task_id: str,
     handoff_path: str,
     *,
     msg: Any,
     thread_key: str,
+    session_id: str | None,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Verify durable refs and freeze destination before the submitting turn releases."""
@@ -321,22 +384,20 @@ def accept_handoff_marker(
         raise CallbackConfigError("disabled")
     if not TASK_ID_RE.fullmatch(task_id):
         raise CallbackError("malformed")
+    session_id = _validate_session_id(session_id)
     handoff_path = validate_handoff_path_ref(handoff_path)
     path = Path(handoff_path)
     if _is_symlink(path) or not path.is_file():
         raise CallbackError("missing_handoff")
+    verify_durable_shared_task(task_id, handoff_path, env=env)
     return register_from_relay_context(
         task_id=task_id,
         handoff_path=handoff_path,
         msg=msg,
         thread_key=thread_key,
+        session_id=session_id,
         env=env,
     )
-
-
-def continuation_message_id(event_id: str) -> int:
-    """Stable synthetic Telegram message id used as the durable-queue identity."""
-    return 1_000_000_000 + (uuid.UUID(event_id).int % 1_000_000_000)
 
 
 def build_continuation_prompt(event: Mapping[str, Any]) -> str:
@@ -410,6 +471,23 @@ def load_json(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def frozen_codex_session_id(registration: Mapping[str, Any]) -> str:
+    """Authoritative Codex session frozen at handoff. Never fall back to SessionStore."""
+    return _validate_session_id(
+        registration.get("codex_session_id") if isinstance(registration, Mapping) else None
+    )
+
+
+def format_continuation_reject_notice(event: Mapping[str, Any], reason: str) -> str:
+    task_id = str(event.get("task_id") or "")
+    if reason == "missing_session":
+        return (
+            f"背景工作已結束，但無法續行原 Codex session（{task_id}）："
+            "登記缺少凍結的 session id。"
+        )
+    return f"背景工作已結束，但無法排程續行（{task_id}）：{reason}。"
+
+
 def register_from_relay_context(
     *,
     task_id: str,
@@ -417,6 +495,7 @@ def register_from_relay_context(
     msg: Any,
     thread_key: str,
     env: Mapping[str, str] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     if not feature_enabled(env):
         raise CallbackConfigError("disabled")
@@ -424,7 +503,7 @@ def register_from_relay_context(
         raise CallbackError("malformed")
     handoff_path = validate_handoff_path_ref(handoff_path)
     identity = identity_from_msg(msg, thread_key, env)
-    record = {
+    record: dict[str, Any] = {
         "task_id": task_id,
         "chat_id": identity["chat_id"],
         "message_thread_id": identity["message_thread_id"],
@@ -436,6 +515,8 @@ def register_from_relay_context(
         "created_at": _utcnow_iso(),
         "status": "registered",
     }
+    if session_id is not None:
+        record["codex_session_id"] = _validate_session_id(session_id)
     root = resolve_state_root(env)
     path = _registration_path(root, record["bot_fingerprint"], task_id)
     payload = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
@@ -453,8 +534,11 @@ def register_from_relay_context(
         "bot_fingerprint",
         "user_id",
         "handoff_path",
+        "codex_session_id",
     )
     for key in frozen:
+        if key == "codex_session_id" and key not in existing and key not in record:
+            continue
         if existing.get(key) != record.get(key):
             raise CallbackError("conflict")
     return existing
@@ -1019,6 +1103,23 @@ async def _process_claimed(
     if schedule_continuation is not None:
         try:
             await schedule_continuation(registration, event)
+        except CallbackError as exc:
+            notice = format_continuation_reject_notice(event, exc.reason)
+            log.warning(
+                "callback continuation rejected task=%s reason=%s", task_id, exc.reason
+            )
+            write_receipt(
+                root,
+                _terminal_receipt(
+                    event, registration, status="failed", note=exc.reason
+                ),
+            )
+            try:
+                await deliver(registration, notice)
+            except Exception:
+                log.exception("callback continuation reject notice failed task=%s", task_id)
+            _move_claimed(root, event_id, "failed", doc)
+            return
         except Exception:
             log.exception("callback continuation schedule failed task=%s", task_id)
             return
