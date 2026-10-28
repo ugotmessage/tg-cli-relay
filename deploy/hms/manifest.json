@@ -1,0 +1,7 @@
+{
+  "runtime_source_commit": "872be732e8448e84282cc1e2092e74d403011f87",
+  "sha256": {
+    "cursor-worker-watchdog.py": "c25829ff40ea60594e596e0fb59954baffd0a6824afe24c064edfbae34906b3d",
+    "run-cursor-worker-watchdog.sh.example": "de376715e0f5b329dc9ebbd7ab0dab9302fa7e9703db96505158a90870b0bc53"
+  }
+}
