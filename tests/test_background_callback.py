@@ -586,3 +586,18 @@ def test_cli_callback_receive_disabled(monkeypatch, tmp_path):
     _callback_env(monkeypatch, tmp_path, enabled=False)
     monkeypatch.setattr("sys.stdin", SimpleNamespace(buffer=BytesIO(b"{}")))
     assert cli_main(["callback-receive"]) == 4
+
+
+@pytest.mark.parametrize("text", [
+    "中" * 3000,
+    "a" * 8191 + "中",
+    "a" * 8191 + "😀",
+    "完整訊息",
+])
+def test_bound_verifier_stdout_preserves_utf8_byte_ceiling(text):
+    from tg_cli_relay.background_callback import _bound_verifier_stdout, MAX_VERIFIER_STDOUT
+
+    bounded = _bound_verifier_stdout(text)
+    assert len(bounded.encode("utf-8")) <= MAX_VERIFIER_STDOUT
+    assert "\ufffd" not in bounded
+    assert _bound_verifier_stdout(bounded) == bounded
