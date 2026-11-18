@@ -91,6 +91,7 @@ _RUNNING_TASKS: dict[str, RelayJob] = {}
 _PENDING_TURNS: dict[str, deque[QueuedTurn]] = {}
 _PENDING_TASK_TURNS: dict[str, deque[QueuedTurn]] = {}
 _QUEUE_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
+_PARENT_TYPING_TASKS: dict[str, asyncio.Task[None]] = {}
 _TASK_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
 _REVIEW_REQUIRED_THREADS: set[str] = set()
 SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
@@ -1754,6 +1755,33 @@ async def _resume_existing_task(
     await _start_task_followup(turn)
 
 
+def _ensure_parent_typing(key: str, msg: object) -> None:
+    """Keep one Telegram typing heartbeat across main turns and timeout recovery."""
+    current = _PARENT_TYPING_TASKS.get(key)
+    if current is not None and not current.done():
+        return
+
+    async def heartbeat() -> None:
+        from telegram.constants import ChatAction
+
+        while True:
+            try:
+                await msg.chat.send_action(action=ChatAction.TYPING)
+            except Exception as exc:
+                log.warning("Parent typing heartbeat failed thread=%s: %s", key, exc)
+            await asyncio.sleep(4)
+
+    _PARENT_TYPING_TASKS[key] = asyncio.create_task(heartbeat())
+
+
+async def _stop_parent_typing(key: str) -> None:
+    task = _PARENT_TYPING_TASKS.pop(key, None)
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
 def _timeout_recovery_turn(turn: QueuedTurn) -> QueuedTurn:
     """One priority follow-up in the same main provider session, not a new Task.
 
@@ -1798,6 +1826,7 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
     _persist_turn(turn)
     if not DurableQueue(turn.store_path).start(turn.durable_id):
         return
+    _ensure_parent_typing(turn.key, turn.msg)
     _ACTIVE_RELAY_THREADS.add(turn.key)
     _ACTIVE_PARENT_BACKENDS[turn.key] = turn.backend
     _ACTIVE_PARENT_REQUESTS[turn.key] = turn.prompt
@@ -1810,7 +1839,7 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
             prompt=turn.prompt,
             store=SessionStore(turn.store_path),
             attachment_config=turn.attachment_config,
-            show_typing=True,
+            show_typing=False,  # Parent heartbeat spans original and recovery turns.
         )
         if (
             result_code == 124
@@ -1836,6 +1865,8 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
         _ACTIVE_PARENT_BACKENDS.pop(turn.key, None)
         _ACTIVE_PARENT_REQUESTS.pop(turn.key, None)
         clear_interrupt(turn.key)
+        if not _PENDING_TURNS.get(turn.key):
+            await _stop_parent_typing(turn.key)
         _schedule_queue_drain(turn.key)
 
 
@@ -1887,6 +1918,8 @@ async def _drain_thread_queue(key: str) -> None:
                 )
     finally:
         _QUEUE_DRAIN_TASKS.pop(key, None)
+        if key not in _ACTIVE_RELAY_THREADS:
+            await _stop_parent_typing(key)
 
 
 def _schedule_queue_drain(key: str) -> None:
