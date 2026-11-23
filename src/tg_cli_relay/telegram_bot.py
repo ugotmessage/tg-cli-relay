@@ -35,6 +35,7 @@ from tg_cli_relay.background_callback import (
     find_handoff_markers,
     frozen_codex_session_id,
     frozen_backend,
+    continuation_chain_enabled,
     pending_ack_text,
     register_fail_ack_text,
     scan_once as callback_scan_once,
@@ -1860,7 +1861,8 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
                 "resume_session_id": sid,
                 "persist_session": False,
                 "update_context": False,
-                "allow_handoff": False,
+                # Chained dispatch: a continuation may hand off the next queued task.
+                "allow_handoff": continuation_chain_enabled(),
             }
             if turn.task_id:
                 try:

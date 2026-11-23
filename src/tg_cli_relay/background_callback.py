@@ -129,6 +129,17 @@ def feature_enabled(env: Mapping[str, str] | None = None) -> bool:
     return raw.strip().lower() in _TRUTHY
 
 
+def continuation_chain_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Opt-in: let a background continuation dispatch the next task (sequential chains).
+
+    Off by default so existing relays keep one-shot continuations.
+    """
+    source = os.environ if env is None else env
+    if not feature_enabled(source):
+        return False
+    return (source.get("TGR_BACKGROUND_HANDOFF_CHAIN") or "").strip().lower() in _TRUTHY
+
+
 def pending_ack_text(_task_id: str | None = None) -> str:
     return PENDING_ACK
 
@@ -426,6 +437,12 @@ def build_continuation_prompt(event: Mapping[str, Any]) -> str:
         f"handoff_snapshot:\n{snapshot}\n"
         "Inspect the files if they are readable from this host, then give the user a "
         "concise Traditional Chinese status and next step."
+        + (
+            " If the user's agreed plan still has remaining items and this task's result is "
+            "acceptable, you may dispatch exactly the next item with the same background "
+            "handoff contract instead of stopping; otherwise stop and report."
+            if continuation_chain_enabled() else ""
+        )
     )
 
 

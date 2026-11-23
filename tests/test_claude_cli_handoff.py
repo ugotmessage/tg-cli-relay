@@ -116,3 +116,15 @@ def test_registration_freezes_claude_backend_and_codex_stays_compatible():
     assert bc.frozen_backend({"backend": "claude"}) == "claude"
     with pytest.raises(bc.CallbackError):
         bc.frozen_backend({"backend": "opencode"})
+
+
+def test_continuation_chain_is_opt_in(monkeypatch):
+    monkeypatch.setenv("TGR_BACKGROUND_HANDOFF", "1")
+    monkeypatch.delenv("TGR_BACKGROUND_HANDOFF_CHAIN", raising=False)
+    assert bc.continuation_chain_enabled() is False
+    assert "dispatch exactly the next item" not in bc.build_continuation_prompt({"task_id": "t"})
+    monkeypatch.setenv("TGR_BACKGROUND_HANDOFF_CHAIN", "1")
+    assert bc.continuation_chain_enabled() is True
+    assert "dispatch exactly the next item" in bc.build_continuation_prompt({"task_id": "t"})
+    monkeypatch.setenv("TGR_BACKGROUND_HANDOFF", "0")
+    assert bc.continuation_chain_enabled() is False
