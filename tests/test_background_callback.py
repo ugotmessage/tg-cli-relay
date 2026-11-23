@@ -740,3 +740,40 @@ def test_terminal_event_schedules_one_continuation_not_verifier_text(monkeypatch
     )
     assert scheduled == [("private:7", event["event_id"])]
     assert delivered == []
+
+
+def test_claude_registration_freezes_backend_and_rejects_backend_change(monkeypatch, tmp_path):
+    from tg_cli_relay.background_callback import CallbackError, frozen_backend
+
+    _callback_env(monkeypatch, tmp_path)
+    sid = "11111111-2222-3333-4444-555555555555"
+    record = register_from_relay_context(
+        task_id="task-claude", handoff_path="/private/tmp/callback-task-claude.md",
+        msg=_msg(), thread_key="private:7", session_id=sid, backend="claude",
+    )
+    assert record["backend"] == "claude"
+    assert frozen_backend(record) == "claude"
+    # Idempotent re-registration with the same backend returns the frozen record.
+    again = register_from_relay_context(
+        task_id="task-claude", handoff_path="/private/tmp/callback-task-claude.md",
+        msg=_msg(), thread_key="private:7", session_id=sid, backend="claude",
+    )
+    assert again == record
+    with pytest.raises(CallbackError):
+        register_from_relay_context(
+            task_id="task-claude", handoff_path="/private/tmp/callback-task-claude.md",
+            msg=_msg(), thread_key="private:7", session_id=sid, backend="codex",
+        )
+
+
+def test_codex_registration_has_no_backend_field(monkeypatch, tmp_path):
+    from tg_cli_relay.background_callback import frozen_backend
+
+    _callback_env(monkeypatch, tmp_path)
+    record = register_from_relay_context(
+        task_id="task-codex", handoff_path="/private/tmp/callback-task-codex.md",
+        msg=_msg(), thread_key="private:7",
+        session_id="11111111-2222-3333-4444-555555555555", backend="codex",
+    )
+    assert "backend" not in record
+    assert frozen_backend(record) == "codex"

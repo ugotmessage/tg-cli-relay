@@ -378,6 +378,7 @@ def accept_handoff_marker(
     thread_key: str,
     session_id: str | None,
     env: Mapping[str, str] | None = None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     """Verify durable refs and freeze destination before the submitting turn releases."""
     if not feature_enabled(env):
@@ -397,6 +398,7 @@ def accept_handoff_marker(
         thread_key=thread_key,
         session_id=session_id,
         env=env,
+        backend=backend,
     )
 
 
@@ -471,8 +473,24 @@ def load_json(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+HANDOFF_BACKENDS = frozenset({"codex", "claude"})
+
+
+def frozen_backend(registration: Mapping[str, Any]) -> str:
+    """Backend frozen at handoff; registrations predating the field were Codex-only."""
+    value = registration.get("backend") if isinstance(registration, Mapping) else None
+    if value is None:
+        return "codex"
+    if value not in HANDOFF_BACKENDS:
+        raise CallbackError("malformed")
+    return str(value)
+
+
 def frozen_codex_session_id(registration: Mapping[str, Any]) -> str:
-    """Authoritative Codex session frozen at handoff. Never fall back to SessionStore."""
+    """Authoritative agent session frozen at handoff (field name kept for compatibility).
+
+    Never fall back to SessionStore.
+    """
     return _validate_session_id(
         registration.get("codex_session_id") if isinstance(registration, Mapping) else None
     )
@@ -482,7 +500,7 @@ def format_continuation_reject_notice(event: Mapping[str, Any], reason: str) -> 
     task_id = str(event.get("task_id") or "")
     if reason == "missing_session":
         return (
-            f"背景工作已結束，但無法續行原 Codex session（{task_id}）："
+            f"背景工作已結束，但無法續行原 Agent session（{task_id}）："
             "登記缺少凍結的 session id。"
         )
     return f"背景工作已結束，但無法排程續行（{task_id}）：{reason}。"
@@ -496,6 +514,7 @@ def register_from_relay_context(
     thread_key: str,
     env: Mapping[str, str] | None = None,
     session_id: str | None = None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     if not feature_enabled(env):
         raise CallbackConfigError("disabled")
@@ -517,6 +536,12 @@ def register_from_relay_context(
     }
     if session_id is not None:
         record["codex_session_id"] = _validate_session_id(session_id)
+    if backend is not None:
+        if backend not in HANDOFF_BACKENDS:
+            raise CallbackError("malformed")
+        # Codex records stay byte-compatible with pre-existing registrations.
+        if backend != "codex":
+            record["backend"] = backend
     root = resolve_state_root(env)
     path = _registration_path(root, record["bot_fingerprint"], task_id)
     payload = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
@@ -535,9 +560,10 @@ def register_from_relay_context(
         "user_id",
         "handoff_path",
         "codex_session_id",
+        "backend",
     )
     for key in frozen:
-        if key == "codex_session_id" and key not in existing and key not in record:
+        if key in ("codex_session_id", "backend") and key not in existing and key not in record:
             continue
         if existing.get(key) != record.get(key):
             raise CallbackError("conflict")

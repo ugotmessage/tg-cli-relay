@@ -34,6 +34,7 @@ from tg_cli_relay.background_callback import (
     feature_enabled as _callback_feature_enabled,
     find_handoff_markers,
     frozen_codex_session_id,
+    frozen_backend,
     pending_ack_text,
     register_fail_ack_text,
     scan_once as callback_scan_once,
@@ -457,6 +458,9 @@ _PROGRESS_QUERY_RE = re.compile(
     r")[\s?？!！.。]*$",
     re.IGNORECASE,
 )
+# Backends whose providers stream top-level agent messages and can detach on a marker.
+_HANDOFF_BACKENDS = frozenset({"codex", "claude"})
+
 _CONTINUATION_RE = re.compile(
     r"^(?:"
     r"(?:請)?繼續(?:做|下去|吧)?"
@@ -1356,7 +1360,7 @@ async def _execute_relay_turn(
             try:
                 accept_handoff_marker(
                     task_id, handoff_path, msg=msg, thread_key=key,
-                    session_id=session_id,
+                    session_id=session_id, backend=backend,
                 )
                 return True
             except Exception:
@@ -1395,7 +1399,7 @@ async def _execute_relay_turn(
                 on_progress=_live_progress if backend == "codex" else None,
                 on_handoff=(
                     _on_handoff
-                    if allow_handoff and backend == "codex" and _callback_feature_enabled()
+                    if allow_handoff and backend in _HANDOFF_BACKENDS and _callback_feature_enabled()
                     else None
                 ),
                 resume_session_id=resume_session_id,
@@ -1461,6 +1465,7 @@ async def _execute_relay_turn(
                         msg=msg,
                         thread_key=key,
                         session_id=res.session_id,
+                        backend=backend,
                     )
                     pending_ack = pending_ack_text(task_id)
                 except Exception:
@@ -1847,7 +1852,7 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
             if not sid:
                 await _reply_text_with_retry(
                     turn.msg,
-                    "無法續行原 Codex session：登記缺少凍結的 session id。",
+                    "無法續行原 Agent session：登記缺少凍結的 session id。",
                 )
                 resolved = True
                 return
@@ -2222,7 +2227,7 @@ async def _deliver_callback_text(bot, registration: dict, text: str) -> None:
 
 
 async def _schedule_background_continuation(bot, registration: dict, event: dict) -> None:
-    """Enqueue one original-session Codex continuation; never auto-replay uncertain ones."""
+    """Enqueue one original-session continuation on the frozen backend; never auto-replay uncertain ones."""
     store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
     event_id = str(event.get("event_id") or "")
     if not event_id:
@@ -2240,7 +2245,7 @@ async def _schedule_background_continuation(bot, registration: dict, event: dict
     turn = QueuedTurn(
         msg=msg,
         key=thread_key,
-        backend="codex",
+        backend=frozen_backend(registration),
         prompt=prompt,
         store_path=store_path,
         attachment_config=_attachment_config(),

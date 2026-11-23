@@ -328,7 +328,11 @@ def relay_turn(
             update_context=update_context,
         )
     elif backend == "claude":
-        result = _relay_claude(st, thread_key, ws, prompt)
+        result = _relay_claude(
+            st, thread_key, ws, prompt,
+            on_handoff=on_handoff, resume_session_id=resume_session_id,
+            persist_session=persist_session, update_context=update_context,
+        )
     elif backend == "opencode":
         result = _relay_opencode(st, thread_key, ws, prompt)
     else:
@@ -391,7 +395,17 @@ def _relay_cursor(
     )
 
 
-def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
+def _relay_claude(
+    store: SessionStore,
+    thread_key: str,
+    workspace: str,
+    prompt: str,
+    *,
+    on_handoff: Callable[[str, str, str], bool] | None = None,
+    resume_session_id: str | None = None,
+    persist_session: bool = True,
+    update_context: bool = True,
+) -> RunResult:
     import os
 
     bin_name = os.environ.get("TGR_CLAUDE_BIN", "claude").strip() or "claude"
@@ -406,18 +420,33 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
         model=model,
         timeout_seconds=timeout_seconds,
     )
-    sid = store.get(thread_key, "claude")
+    sid = resume_session_id if resume_session_id is not None else store.get(thread_key, "claude")
+    claude_prompt = apply_background_callback_prefix(prompt)
+    if update_context:
+        turn_prompt = ConversationContext(store.db_path).prompt(
+            thread_key, claude_prompt, include_history=not sid, consumer="claude"
+        )
+    else:
+        turn_prompt = claude_prompt
     raw = prov.run_turn(
         workspace=workspace, session_id=sid,
-        prompt=ConversationContext(store.db_path).prompt(
-            thread_key, prompt, include_history=not sid, consumer="claude"
-        ),
+        prompt=turn_prompt,
         thread_key=thread_key,
+        on_handoff=on_handoff,
     )
-    display_text, new_sid = parse_claude_output(raw.stdout)
-    if new_sid and new_sid != sid:
+    if on_handoff is not None:
+        # Streaming path already extracted visible text and the session id.
+        new_sid = raw.session_id
+        result = raw
+    else:
+        display_text, new_sid = parse_claude_output(raw.stdout)
+        result = RunResult(
+            stdout=display_text, stderr=raw.stderr, returncode=raw.returncode,
+            session_id=new_sid,
+        )
+    if persist_session and new_sid and new_sid != sid:
         store.upsert(thread_key, "claude", new_sid, workspace=workspace)
-    return RunResult(stdout=display_text, stderr=raw.stderr, returncode=raw.returncode)
+    return result
 
 
 def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
