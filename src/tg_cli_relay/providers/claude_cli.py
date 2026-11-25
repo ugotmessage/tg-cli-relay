@@ -207,7 +207,13 @@ class ClaudeCliProvider:
         else:
             cleaned = _sanitize_claude_display_text(result_text)
             visible = [cleaned] if cleaned else []
-        stdout = "\n".join(visible) if visible else ("" if messages or result_text is not None else "".join(raw_lines))
+        if visible or messages or result_text is not None:
+            stdout = "\n".join(visible)
+        else:
+            # Killed (/stop, timeout) before any text: never forward the raw stream-json
+            # events (tool calls, file contents) to Telegram; keep only plain-text lines.
+            plain = [ln for ln in raw_lines if ln.strip() and _try_parse_json_object(ln) is None]
+            stdout = "".join(plain).strip()[:4000]
         return RunResult(
             stdout=stdout,
             stderr=raw_stderr,

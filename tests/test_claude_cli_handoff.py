@@ -128,3 +128,18 @@ def test_continuation_chain_is_opt_in(monkeypatch):
     assert "dispatch exactly the next item" in bc.build_continuation_prompt({"task_id": "t"})
     monkeypatch.setenv("TGR_BACKGROUND_HANDOFF", "0")
     assert bc.continuation_chain_enabled() is False
+
+
+def test_stream_killed_before_text_does_not_leak_raw_events(tmp_path):
+    """/stop or timeout before any assistant text must not forward raw stream-json to Telegram."""
+    tool = {"type": "assistant", "session_id": SID, "parent_tool_use_id": None,
+            "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/x"}}]}}
+    result_evt = {"type": "user", "session_id": SID,
+                  "message": {"content": [{"type": "tool_result", "content": "secret file body " * 50}]}}
+    bin_ = _fake_claude(tmp_path, [INIT, tool, result_evt], tail_sleep=30)
+    prov = ClaudeCliProvider(claude_bin=bin_, timeout_seconds=2)
+    res = prov.run_turn(workspace=str(tmp_path), session_id=None, prompt="p",
+                        on_handoff=lambda t, p, s: False)
+    assert res.returncode == 124
+    assert res.stdout == ""
+    assert "session_id" not in res.stdout and "tool_result" not in res.stdout
