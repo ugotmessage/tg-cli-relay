@@ -233,6 +233,90 @@ def test_app_server_thread_checkpoint_happens_before_turn_finishes():
     asyncio.run(run())
 
 
+class HandoffAppServer(FakeAppServer):
+    def __init__(self, *, interrupt_ok=True, complete_after_interrupt=True, marker=""):
+        super().__init__()
+        self.interrupt_ok = interrupt_ok
+        self.complete_after_interrupt = complete_after_interrupt
+        self.marker = marker
+
+    async def request(self, method, params, **kwargs):
+        self.calls.append((method, params))
+        if method == "thread/start":
+            return {"thread": {"id": "t-handoff"}}
+        if method == "thread/resume":
+            return {"thread": {"id": params["threadId"]}}
+        if method == "turn/start":
+            self.inbox.put_nowait({
+                "method": "item/completed",
+                "params": {
+                    "threadId": params["threadId"], "turnId": "r1",
+                    "item": {"type": "agentMessage", "text": self.marker},
+                },
+            })
+            return {"turn": {"id": "r1"}}
+        if method == "turn/interrupt":
+            if not self.interrupt_ok:
+                raise CodexAppServerError("interrupt denied")
+            if self.complete_after_interrupt:
+                self.inbox.put_nowait({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": params.get("threadId"), "turnId": params.get("turnId"),
+                        "turn": {"status": "completed"},
+                    },
+                })
+            return {}
+        raise AssertionError(method)
+
+
+def test_app_server_handoff_requires_confirmed_interrupt():
+    marker = "TGR_BACKGROUND_HANDOFF:task-as:/tmp/h.md"
+    accepted: list[tuple[str, str, str]] = []
+
+    async def success():
+        client = HandoffAppServer(marker=marker)
+        result = await _run_turn(
+            client, workspace="/tmp/repo", session_id=None, prompt="派工",
+            model=None, bypass=False, timeout=1, on_progress=None,
+            on_handoff=lambda task_id, path, sid: accepted.append((task_id, path, sid)) or True,
+        )
+        assert result.handoff_detached is True
+        assert result.returncode == 0
+        assert result.session_id == "t-handoff"
+        assert ("turn/interrupt", {"threadId": "t-handoff", "turnId": "r1"}) in client.calls
+        assert accepted == [("task-as", "/tmp/h.md", "t-handoff")]
+
+    asyncio.run(success())
+
+    async def interrupt_failure_does_not_detach():
+        client = HandoffAppServer(interrupt_ok=False, marker=marker)
+        result = await _run_turn(
+            client, workspace="/tmp/repo", session_id=None, prompt="派工",
+            model=None, bypass=False, timeout=0.05, on_progress=None,
+            on_handoff=lambda *_: True,
+        )
+        assert result.handoff_detached is False
+        assert result.returncode == 124
+        assert any(call[0] == "turn/interrupt" for call in client.calls)
+
+    asyncio.run(interrupt_failure_does_not_detach())
+
+    async def missing_turn_completed_does_not_detach():
+        client = HandoffAppServer(
+            interrupt_ok=True, complete_after_interrupt=False, marker=marker
+        )
+        result = await _run_turn(
+            client, workspace="/tmp/repo", session_id=None, prompt="派工",
+            model=None, bypass=False, timeout=0.05, on_progress=None,
+            on_handoff=lambda *_: True,
+        )
+        assert result.handoff_detached is False
+        assert result.returncode == 124
+
+    asyncio.run(missing_turn_completed_does_not_detach())
+
+
 def test_app_server_timeout_interrupts_and_returns_resumable_session():
     class SlowAppServer(FakeAppServer):
         async def request(self, method, params, **kwargs):

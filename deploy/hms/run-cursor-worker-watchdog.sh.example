@@ -1,0 +1,16 @@
+#!/bin/zsh
+set -euo pipefail
+
+export PATH="/Users/ht/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export HMS_CALLBACK_OUTBOX="/Users/ht/.hermes/data/state/tg-relay-callback-outbox"
+export HMS_CALLBACK_SECRET_FILE="/Users/ht/.hermes/secrets/tg-relay-callback.secret"
+export HMS_CALLBACK_SSH_CONFIG="/Users/ht/.hermes/secrets/ssh/config"
+export HMS_CALLBACK_SSH_ALIAS="snote-internal-ssh"
+export HMS_CALLBACK_SSH_REMOTE_CMD="sudo -n /usr/local/sbin/tg-cli-relay-callback-receive"
+unset HMS_CALLBACK_LOCAL_RECEIVER_ARGV
+export HMS_CALLBACK_LOCAL_RECEIVER_ROUTES='{"ht.tg-cli-relay":["/Users/ht/.hermes/scripts/tg-relay/callback-receive-codex.sh","/Users/ht/.hermes/secrets/tg-relay-claude.env","/Users/ht/projects/tg-cli-relay-cursor/.venv/bin/python3"],"hms.codex-relay":["/Users/ht/.hermes/scripts/tg-relay/callback-receive-codex.sh","/Users/ht/.hermes/codex-relay/.env","/Users/ht/.hermes/codex-relay/.venv/bin/python3"]}'
+export HMS_CALLBACK_VERIFIER_BIN="/Users/ht/.hermes/scripts/tg-relay/codex-device-relay"
+export HMS_CALLBACK_VERIFIER_TIMEOUT="600"
+export HMS_CALLBACK_DRAIN_TIMEOUT="900"
+export HMS_CALLBACK_MAX_ATTEMPTS="60"
+exec python3 /Users/ht/.hermes/scripts/research/cursor-worker-watchdog.py

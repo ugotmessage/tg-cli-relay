@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Callable
 
 from tg_cli_relay.conversation_context import ConversationContext
+from tg_cli_relay.providers.antigravity_cli import (
+    ANTIGRAVITY_DEFAULT_MODEL,
+    AntigravityCliProvider,
+)
 from tg_cli_relay.providers.base import RunResult
 from tg_cli_relay.providers.claude_cli import ClaudeCliProvider, parse_claude_output
 from tg_cli_relay.providers.codex_cli import CodexCliProvider
@@ -61,6 +65,8 @@ def apply_background_callback_prefix(prompt: str) -> str:
         "other text in that message: "
         "TGR_BACKGROUND_HANDOFF:<same task id>:<same absolute handoff path>. "
         "Do not emit the marker before both the queue JSON and handoff file exist. "
+        "Relay will then detach this turn and preserve the session; do not wait for the "
+        "worker. A later continuation will resume this conversation with the task result. "
         "Do not use this marker for inline workers or non-shared queues.\n\n"
     )
     return f"{prefix}{prompt}"
@@ -267,9 +273,21 @@ def resolve_cursor_model(store: SessionStore, thread_key: str) -> str:
     return "auto" if explicit.upper() == "AUTO" else explicit
 
 
+def resolve_antigravity_model(store: SessionStore, thread_key: str) -> str:
+    """Antigravity relay 使用的模型；優先順序為 thread pref → TGR_ANTIGRAVITY_MODEL → 預設值。"""
+    import os
+
+    explicit = store.get_pref(thread_key, _model_pref_key("antigravity"))
+    if not explicit:
+        explicit = os.environ.get("TGR_ANTIGRAVITY_MODEL", "").strip()
+    return explicit or ANTIGRAVITY_DEFAULT_MODEL
+
+
 def effective_model_for_backend(store: SessionStore, thread_key: str, backend: Backend) -> str:
     if backend == "cursor":
         return resolve_cursor_model(store, thread_key)
+    if backend == "antigravity":
+        return resolve_antigravity_model(store, thread_key)
     model = store.get_pref(thread_key, _model_pref_key(backend))
     return model or "(預設)"
 
@@ -277,6 +295,8 @@ def effective_model_for_backend(store: SessionStore, thread_key: str, backend: B
 def _get_model(store: SessionStore, thread_key: str, backend: Backend) -> str | None:
     if backend == "cursor":
         return resolve_cursor_model(store, thread_key)
+    if backend == "antigravity":
+        return resolve_antigravity_model(store, thread_key)
     return store.get_pref(thread_key, _model_pref_key(backend))
 
 
@@ -302,29 +322,56 @@ def relay_turn(
     store: SessionStore | None = None,
     workspace: str | None = None,
     on_progress: Callable[[str], None] | None = None,
+    on_handoff: Callable[[str, str, str], bool] | None = None,
     routing_only: bool = False,
+    resume_session_id: str | None = None,
+    persist_session: bool = True,
+    update_context: bool = True,
 ) -> RunResult:
     """依 thread_key 接續或建立後端 session，送出一輪 prompt。"""
     ws = workspace or _default_workspace()
     st = store or SessionStore(_default_db_path())
     context = ConversationContext(st.db_path)
-    state = context.snapshot(thread_key)
+    state = context.snapshot(thread_key) if update_context else {"epoch": "", "next_handoff_id": 0}
     epoch = state["epoch"]
     delivered_through = int(state.get("next_handoff_id", 0))
 
     if backend == "cursor":
         result = _relay_cursor(st, thread_key, ws, prompt, routing_only=routing_only)
     elif backend == "codex":
-        result = _relay_codex(st, thread_key, ws, prompt, on_progress=on_progress, routing_only=routing_only)
+        result = _relay_codex(
+            st, thread_key, ws, prompt,
+            on_progress=on_progress, on_handoff=on_handoff, routing_only=routing_only,
+            resume_session_id=resume_session_id, persist_session=persist_session,
+            update_context=update_context,
+        )
     elif backend == "claude":
-        result = _relay_claude(st, thread_key, ws, prompt)
+        result = _relay_claude(
+            st, thread_key, ws, prompt,
+            on_handoff=on_handoff, resume_session_id=resume_session_id,
+            persist_session=persist_session, update_context=update_context,
+        )
     elif backend == "opencode":
         result = _relay_opencode(st, thread_key, ws, prompt)
+    elif backend == "antigravity":
+        result = _relay_antigravity(
+            st, thread_key, ws, prompt,
+            on_progress=on_progress, on_handoff=on_handoff,
+            resume_session_id=resume_session_id,
+            persist_session=persist_session, update_context=update_context,
+        )
     else:
         raise ValueError(f"未知後端: {backend}")
-    if result.returncode == 0:
+    if update_context and (result.returncode == 0 or result.handoff_detached):
+        from tg_cli_relay.background_callback import feature_enabled, find_handoff_markers
+
+        visible = result.stdout
+        if feature_enabled():
+            remaining, markers = find_handoff_markers(result)
+            if markers and remaining is not None:
+                visible = "\n".join(remaining)
         context.acknowledge(thread_key, epoch, backend, delivered_through)
-        context.complete(thread_key, epoch, prompt, result.stdout)
+        context.complete(thread_key, epoch, prompt, visible)
     return result
 
 
@@ -373,7 +420,17 @@ def _relay_cursor(
     )
 
 
-def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
+def _relay_claude(
+    store: SessionStore,
+    thread_key: str,
+    workspace: str,
+    prompt: str,
+    *,
+    on_handoff: Callable[[str, str, str], bool] | None = None,
+    resume_session_id: str | None = None,
+    persist_session: bool = True,
+    update_context: bool = True,
+) -> RunResult:
     import os
 
     bin_name = os.environ.get("TGR_CLAUDE_BIN", "claude").strip() or "claude"
@@ -388,18 +445,33 @@ def _relay_claude(store: SessionStore, thread_key: str, workspace: str, prompt: 
         model=model,
         timeout_seconds=timeout_seconds,
     )
-    sid = store.get(thread_key, "claude")
+    sid = resume_session_id if resume_session_id is not None else store.get(thread_key, "claude")
+    claude_prompt = apply_background_callback_prefix(prompt)
+    if update_context:
+        turn_prompt = ConversationContext(store.db_path).prompt(
+            thread_key, claude_prompt, include_history=not sid, consumer="claude"
+        )
+    else:
+        turn_prompt = claude_prompt
     raw = prov.run_turn(
         workspace=workspace, session_id=sid,
-        prompt=ConversationContext(store.db_path).prompt(
-            thread_key, prompt, include_history=not sid, consumer="claude"
-        ),
+        prompt=turn_prompt,
         thread_key=thread_key,
+        on_handoff=on_handoff,
     )
-    display_text, new_sid = parse_claude_output(raw.stdout)
-    if new_sid and new_sid != sid:
+    if on_handoff is not None:
+        # Streaming path already extracted visible text and the session id.
+        new_sid = raw.session_id
+        result = raw
+    else:
+        display_text, new_sid = parse_claude_output(raw.stdout)
+        result = RunResult(
+            stdout=display_text, stderr=raw.stderr, returncode=raw.returncode,
+            session_id=new_sid,
+        )
+    if persist_session and new_sid and new_sid != sid:
         store.upsert(thread_key, "claude", new_sid, workspace=workspace)
-    return RunResult(stdout=display_text, stderr=raw.stderr, returncode=raw.returncode)
+    return result
 
 
 def _relay_opencode(store: SessionStore, thread_key: str, workspace: str, prompt: str) -> RunResult:
@@ -433,7 +505,11 @@ def _relay_codex(
     prompt: str,
     *,
     on_progress: Callable[[str], None] | None = None,
+    on_handoff: Callable[[str, str, str], bool] | None = None,
     routing_only: bool = False,
+    resume_session_id: str | None = None,
+    persist_session: bool = True,
+    update_context: bool = True,
 ) -> RunResult:
     import os
 
@@ -459,20 +535,85 @@ def _relay_codex(
         )
     else:
         raise ValueError("TGR_CODEX_TRANSPORT must be cli or app-server")
-    sid = store.get(thread_key, "codex")
+    sid = resume_session_id if resume_session_id is not None else store.get(thread_key, "codex")
     # Never auto-call Cursor/Claude/OpenCode or ask the Relay router for a
     # delegation decision. Codex follows its own workspace/knowledge rules.
     codex_prompt = apply_background_callback_prefix(prompt)
+    extra: dict = {"thread_key": thread_key, "on_handoff": on_handoff}
+    if transport == "app-server" and persist_session:
+        extra["on_session"] = lambda new_sid: store.upsert(
+            thread_key, "codex", new_sid, workspace=workspace
+        )
+    if update_context:
+        turn_prompt = ConversationContext(store.db_path).prompt(
+            thread_key, codex_prompt, include_history=not sid, consumer="codex"
+        )
+    else:
+        turn_prompt = codex_prompt
     res = prov.run_turn(
         workspace=workspace, session_id=sid,
-        prompt=ConversationContext(store.db_path).prompt(
-            thread_key, codex_prompt, include_history=not sid, consumer="codex"
-        ),
+        prompt=turn_prompt,
         on_progress=on_progress,
-        **({"thread_key": thread_key, "on_session": lambda sid: store.upsert(
-            thread_key, "codex", sid, workspace=workspace
-        )} if transport == "app-server" else {"thread_key": thread_key}),
+        **extra,
     )
-    if res.session_id and res.session_id != sid:
+    if persist_session and res.session_id and res.session_id != sid:
         store.upsert(thread_key, "codex", res.session_id, workspace=workspace)
+    return res
+
+
+def _relay_antigravity(
+    store: SessionStore,
+    thread_key: str,
+    workspace: str,
+    prompt: str,
+    *,
+    on_progress: Callable[[str], None] | None = None,
+    on_handoff: Callable[[str, str, str], bool] | None = None,
+    resume_session_id: str | None = None,
+    persist_session: bool = True,
+    update_context: bool = True,
+) -> RunResult:
+    import os
+
+    bin_name = os.environ.get("TGR_ANTIGRAVITY_BIN", "agy").strip() or "agy"
+    skip_perms = os.environ.get("TGR_ANTIGRAVITY_SKIP_PERMISSIONS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    sandbox = os.environ.get("TGR_ANTIGRAVITY_SANDBOX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    raw_add_dirs = os.environ.get("TGR_ANTIGRAVITY_ADD_DIRS", "")
+    add_dirs = tuple(p.strip() for p in raw_add_dirs.split(",") if p.strip())
+    timeout_seconds = _relay_turn_timeout_seconds()
+    model = resolve_antigravity_model(store, thread_key)
+    prov = AntigravityCliProvider(
+        agy_bin=bin_name,
+        dangerously_skip_permissions=skip_perms,
+        sandbox=sandbox,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        add_dirs=add_dirs,
+    )
+    sid = resume_session_id if resume_session_id is not None else store.get(thread_key, "antigravity")
+    agy_prompt = apply_background_callback_prefix(prompt)
+    if update_context:
+        turn_prompt = ConversationContext(store.db_path).prompt(
+            thread_key, agy_prompt, include_history=not sid, consumer="antigravity"
+        )
+    else:
+        turn_prompt = agy_prompt
+    res = prov.run_turn(
+        workspace=workspace,
+        session_id=sid,
+        prompt=turn_prompt,
+        on_progress=on_progress,
+        thread_key=thread_key,
+        on_handoff=on_handoff,
+    )
+    if persist_session and res.session_id and res.session_id != sid:
+        store.upsert(thread_key, "antigravity", res.session_id, workspace=workspace)
     return res

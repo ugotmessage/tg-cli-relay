@@ -19,6 +19,8 @@ def map_controller_result(kind: str, detail: str = "") -> tuple[str, str]:
         return "worker_done_validation_failed", detail
     if kind == "contract":
         return "blocked_before_worker", detail
+    if kind in {"timeout", "timed_out"}:
+        return "timed_out", detail or "status=timed_out"
     return "failed", detail
 
 

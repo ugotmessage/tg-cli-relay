@@ -27,11 +27,17 @@ from tg_cli_relay.attachments import (
     resolve_outbound_files,
 )
 from tg_cli_relay.background_callback import (
+    CONTINUATION_KIND,
+    CallbackError,
+    accept_handoff_marker,
+    build_continuation_prompt,
     feature_enabled as _callback_feature_enabled,
     find_handoff_markers,
+    frozen_codex_session_id,
+    frozen_backend,
+    continuation_chain_enabled,
     pending_ack_text,
     register_fail_ack_text,
-    register_from_relay_context,
     scan_once as callback_scan_once,
 )
 from tg_cli_relay.relay import effective_model_for_backend, relay_turn
@@ -83,6 +89,8 @@ class QueuedTurn:
     title: str = ""
     kind: str = "parent"
     durable_id: int | None = None
+    event_id: str | None = None
+    resume_session_id: str | None = None
 
 
 _ACTIVE_JOBS: dict[str, RelayJob] = {}
@@ -94,7 +102,7 @@ _QUEUE_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
 _PARENT_TYPING_TASKS: dict[str, asyncio.Task[None]] = {}
 _TASK_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
 _REVIEW_REQUIRED_THREADS: set[str] = set()
-SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
+SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode", "antigravity")
 
 
 class _RestoredChat:
@@ -140,6 +148,7 @@ def _persist_turn(turn: QueuedTurn) -> int:
             chat_id=int(msg.chat_id), message_id=int(msg.message_id),
             topic_id=getattr(msg, "message_thread_id", None),
             task_id=turn.task_id, worker_key=turn.worker_key, title=turn.title,
+            event_id=turn.event_id, resume_session_id=turn.resume_session_id,
         )
     return turn.durable_id
 
@@ -157,6 +166,7 @@ def _turn_from_record(row: QueueRecord, bot) -> QueuedTurn:
         attachment_config=_attachment_config(), route=Route.DIRECT,
         task_id=row.task_id, worker_key=row.worker_key,
         title=row.title, kind=row.kind, durable_id=row.id,
+        event_id=row.event_id, resume_session_id=row.resume_session_id,
     )
 
 
@@ -450,6 +460,9 @@ _PROGRESS_QUERY_RE = re.compile(
     r")[\s?？!！.。]*$",
     re.IGNORECASE,
 )
+# Backends whose providers stream top-level agent messages and can detach on a marker.
+_HANDOFF_BACKENDS = frozenset({"codex", "claude", "antigravity"})
+
 _CONTINUATION_RE = re.compile(
     r"^(?:"
     r"(?:請)?繼續(?:做|下去|吧)?"
@@ -591,7 +604,7 @@ def _enabled_backends() -> tuple[Backend, ...]:
 def _default_backend() -> Backend:
     backend = _parse_backend(os.environ.get("TGR_BACKEND", "cursor"))
     if backend is None:
-        raise RuntimeError("TGR_BACKEND 必須是 cursor、codex、claude 或 opencode")
+        raise RuntimeError("TGR_BACKEND 必須是 cursor、codex、claude、opencode 或 antigravity")
     return backend
 
 
@@ -626,6 +639,10 @@ def _models_for_backend(backend: Backend) -> list[str]:
         from tg_cli_relay.providers.opencode_cli import OPENCODE_MODELS
 
         return OPENCODE_MODELS
+    if backend == "antigravity":
+        from tg_cli_relay.providers.antigravity_cli import ANTIGRAVITY_MODELS
+
+        return ANTIGRAVITY_MODELS
     return []
 
 
@@ -635,6 +652,11 @@ async def _models_for_backend_live(backend: Backend) -> list[str]:
 
         agent_bin = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
         return await asyncio.to_thread(list_cursor_models, agent_bin)
+    if backend == "antigravity":
+        from tg_cli_relay.providers.antigravity_cli import list_antigravity_models
+
+        agy_bin = os.environ.get("TGR_ANTIGRAVITY_BIN", "agy").strip() or "agy"
+        return await asyncio.to_thread(list_antigravity_models, agy_bin)
     return _models_for_backend(backend)
 
 
@@ -1316,6 +1338,11 @@ async def _execute_relay_turn(
     attachment_config: AttachmentConfig,
     show_typing: bool,
     job: RelayJob | None = None,
+    resume_session_id: str | None = None,
+    persist_session: bool = True,
+    update_context: bool = True,
+    workspace: str | None = None,
+    allow_handoff: bool = True,
 ) -> int | None:
     typing_task: asyncio.Task[None] | None = None
     try:
@@ -1337,6 +1364,19 @@ async def _execute_relay_turn(
 
         loop = asyncio.get_running_loop()
         registry = TaskRegistry(store.db_path)
+
+        def _on_handoff(task_id: str, handoff_path: str, session_id: str) -> bool:
+            if not _callback_feature_enabled():
+                return False
+            try:
+                accept_handoff_marker(
+                    task_id, handoff_path, msg=msg, thread_key=key,
+                    session_id=session_id, backend=backend,
+                )
+                return True
+            except Exception:
+                log.exception("background handoff rejected during stream thread=%s", key)
+                return False
 
         def _live_progress(text: str) -> None:
             if job is not None:
@@ -1366,7 +1406,16 @@ async def _execute_relay_turn(
                 backend=backend,
                 prompt=prompt,
                 store=store,
-                on_progress=_live_progress if backend == "codex" else None,
+                workspace=workspace,
+                on_progress=_live_progress if backend in ("codex", "antigravity") else None,
+                on_handoff=(
+                    _on_handoff
+                    if allow_handoff and backend in _HANDOFF_BACKENDS and _callback_feature_enabled()
+                    else None
+                ),
+                resume_session_id=resume_session_id,
+                persist_session=persist_session,
+                update_context=update_context,
             )
         except Exception as exc:
             log.exception("relay_turn 失敗 thread=%s", key)
@@ -1412,7 +1461,7 @@ async def _execute_relay_turn(
                 if registry is not None:
                     registry.update_status(job.job_id, "failed")
 
-        sid = store.get(key, backend)
+        sid = res.session_id if not persist_session and res.session_id else store.get(key, backend)
         model = effective_model_for_backend(store, key, backend)
         send_segments = res.stdout_segments
         pending_ack: str | None = None
@@ -1421,11 +1470,13 @@ async def _execute_relay_turn(
             if len(markers) == 1:
                 task_id, handoff_path = markers[0]
                 try:
-                    register_from_relay_context(
+                    accept_handoff_marker(
                         task_id=task_id,
                         handoff_path=handoff_path,
                         msg=msg,
                         thread_key=key,
+                        session_id=res.session_id,
+                        backend=backend,
                     )
                     pending_ack = pending_ack_text(task_id)
                 except Exception:
@@ -1818,11 +1869,13 @@ def _timeout_recovery_turn(turn: QueuedTurn) -> QueuedTurn:
 
 async def _run_direct_turn(turn: QueuedTurn) -> None:
     # Bind source at execution time even if this turn was previously queued.
-    mid = getattr(turn.msg, "message_id", None)
-    if isinstance(mid, int):
-        TaskRegistry(turn.store_path).bind_parent_message(
-            parent_key=turn.key, message_id=mid, backend=turn.backend
-        )
+    # Continuations must not steal main-session reply routing with a synthetic id.
+    if turn.kind != CONTINUATION_KIND:
+        mid = getattr(turn.msg, "message_id", None)
+        if isinstance(mid, int):
+            TaskRegistry(turn.store_path).bind_parent_message(
+                parent_key=turn.key, message_id=mid, backend=turn.backend
+            )
     _persist_turn(turn)
     if not DurableQueue(turn.store_path).start(turn.durable_id):
         return
@@ -1832,6 +1885,35 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
     _ACTIVE_PARENT_REQUESTS[turn.key] = turn.prompt
     resolved = False
     try:
+        extra: dict = {}
+        if turn.kind == CONTINUATION_KIND:
+            sid = (turn.resume_session_id or "").strip()
+            if not sid:
+                await _reply_text_with_retry(
+                    turn.msg,
+                    "無法續行原 Agent session：登記缺少凍結的 session id。",
+                )
+                resolved = True
+                return
+            extra = {
+                "resume_session_id": sid,
+                "persist_session": False,
+                "update_context": False,
+                # Chained dispatch: a continuation may hand off the next queued task.
+                "allow_handoff": continuation_chain_enabled(),
+            }
+            if turn.task_id:
+                try:
+                    from tg_cli_relay.background_callback import (
+                        find_registration,
+                        resolve_state_root,
+                    )
+                    frozen = find_registration(resolve_state_root(), turn.task_id)
+                    workspace = (frozen or {}).get("relay_workspace")
+                    if isinstance(workspace, str) and workspace.strip():
+                        extra["workspace"] = workspace.strip()
+                except Exception:
+                    pass
         result_code = await _execute_relay_turn(
             msg=turn.msg,
             key=turn.key,
@@ -1840,10 +1922,11 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
             store=SessionStore(turn.store_path),
             attachment_config=turn.attachment_config,
             show_typing=False,  # Parent heartbeat spans original and recovery turns.
+            **extra,
         )
         if (
             result_code == 124
-            and turn.kind != "timeout_recovery"
+            and turn.kind not in {"timeout_recovery", CONTINUATION_KIND}
             and not interrupt_requested(turn.key)
         ):
             # Add the recovery BEFORE releasing the parent slot. Never lose
@@ -1858,8 +1941,9 @@ async def _run_direct_turn(turn: QueuedTurn) -> None:
         resolved = True
     finally:
         _persist_finish(turn, "done" if resolved else "needs_review")
-        if not resolved:
+        if not resolved and turn.kind != CONTINUATION_KIND:
             # A cancellation/exception after dispatch is not proof of success.
+            # Uncertain background continuations stay needs_review without pausing chat.
             _REVIEW_REQUIRED_THREADS.add(turn.key)
         _ACTIVE_RELAY_THREADS.discard(turn.key)
         _ACTIVE_PARENT_BACKENDS.pop(turn.key, None)
@@ -2149,15 +2233,21 @@ _BOT_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _callback_dest_message(bot, registration: dict) -> _RestoredMessage:
+def _already_pending(key: str, durable_id: int | None) -> bool:
+    if durable_id is None:
+        return False
+    return any(turn.durable_id == durable_id for turn in _PENDING_TURNS.get(key, ()))
+
+
+def _callback_dest_message(bot, registration: dict, *, message_id: int = 0, kind: str = "callback") -> _RestoredMessage:
     row = QueueRecord(
         id=0,
         thread_key=str(registration["thread_key"]),
         backend="codex",
         prompt="",
-        kind="callback",
+        kind=kind,
         chat_id=int(registration["chat_id"]),
-        message_id=0,
+        message_id=int(message_id),
         topic_id=(
             int(registration["message_thread_id"])
             if registration.get("message_thread_id") is not None
@@ -2167,6 +2257,8 @@ def _callback_dest_message(bot, registration: dict) -> _RestoredMessage:
         worker_key=None,
         title="",
         status="queued",
+        event_id=None,
+        resume_session_id=None,
     )
     return _RestoredMessage(bot, row)
 
@@ -2178,12 +2270,55 @@ async def _deliver_callback_text(bot, registration: dict, text: str) -> None:
         await _reply_text_with_retry(msg, part, retries=2)
 
 
+async def _schedule_background_continuation(bot, registration: dict, event: dict) -> None:
+    """Enqueue one original-session continuation on the frozen backend; never auto-replay uncertain ones."""
+    store_path = Path(os.environ.get("TGR_SESSION_DB", str(Path("data") / "sessions.sqlite3")))
+    event_id = str(event.get("event_id") or "")
+    if not event_id:
+        raise CallbackError("malformed")
+    resume_session_id = frozen_codex_session_id(registration)
+    thread_key = str(registration["thread_key"])
+    ledger = DurableQueue(store_path)
+    existing = ledger.lookup_event(event_id)
+    if existing is not None and existing.status != "queued":
+        return
+    prompt = build_continuation_prompt(event)
+    msg = _callback_dest_message(
+        bot, registration, message_id=0, kind=CONTINUATION_KIND
+    )
+    turn = QueuedTurn(
+        msg=msg,
+        key=thread_key,
+        backend=frozen_backend(registration),
+        prompt=prompt,
+        store_path=store_path,
+        attachment_config=_attachment_config(),
+        route=Route.DIRECT,
+        task_id=str(event.get("task_id") or registration.get("task_id") or ""),
+        kind=CONTINUATION_KIND,
+        durable_id=None if existing is None else existing.id,
+        event_id=event_id,
+        resume_session_id=resume_session_id,
+    )
+    _persist_turn(turn)
+    record = ledger.get(turn.durable_id) if turn.durable_id is not None else None
+    if record is not None and record.status != "queued":
+        return
+    if _already_pending(thread_key, turn.durable_id):
+        return
+    _PENDING_TURNS.setdefault(thread_key, deque()).append(turn)
+    _schedule_queue_drain(thread_key)
+
+
 async def _callback_inbox_loop(bot) -> None:
     while True:
         try:
             await callback_scan_once(
                 active_thread_keys=_ACTIVE_RELAY_THREADS,
                 deliver=lambda registration, text: _deliver_callback_text(bot, registration, text),
+                schedule_continuation=lambda registration, event: _schedule_background_continuation(
+                    bot, registration, event
+                ),
             )
         except Exception:
             log.exception("background callback inbox scan failed")
