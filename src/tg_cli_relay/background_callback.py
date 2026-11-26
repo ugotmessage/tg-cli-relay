@@ -490,7 +490,7 @@ def load_json(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-HANDOFF_BACKENDS = frozenset({"codex", "claude"})
+HANDOFF_BACKENDS = frozenset({"codex", "claude", "antigravity"})
 
 
 def frozen_backend(registration: Mapping[str, Any]) -> str:

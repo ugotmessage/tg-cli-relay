@@ -101,7 +101,7 @@ _PENDING_TASK_TURNS: dict[str, deque[QueuedTurn]] = {}
 _QUEUE_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
 _TASK_DRAIN_TASKS: dict[str, asyncio.Task[None]] = {}
 _REVIEW_REQUIRED_THREADS: set[str] = set()
-SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode")
+SUPPORTED_BACKENDS: tuple[Backend, ...] = ("cursor", "codex", "claude", "opencode", "antigravity")
 
 
 class _RestoredChat:
@@ -460,7 +460,7 @@ _PROGRESS_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 # Backends whose providers stream top-level agent messages and can detach on a marker.
-_HANDOFF_BACKENDS = frozenset({"codex", "claude"})
+_HANDOFF_BACKENDS = frozenset({"codex", "claude", "antigravity"})
 
 _CONTINUATION_RE = re.compile(
     r"^(?:"
@@ -603,7 +603,7 @@ def _enabled_backends() -> tuple[Backend, ...]:
 def _default_backend() -> Backend:
     backend = _parse_backend(os.environ.get("TGR_BACKEND", "cursor"))
     if backend is None:
-        raise RuntimeError("TGR_BACKEND 必須是 cursor、codex、claude 或 opencode")
+        raise RuntimeError("TGR_BACKEND 必須是 cursor、codex、claude、opencode 或 antigravity")
     return backend
 
 
@@ -638,6 +638,10 @@ def _models_for_backend(backend: Backend) -> list[str]:
         from tg_cli_relay.providers.opencode_cli import OPENCODE_MODELS
 
         return OPENCODE_MODELS
+    if backend == "antigravity":
+        from tg_cli_relay.providers.antigravity_cli import ANTIGRAVITY_MODELS
+
+        return ANTIGRAVITY_MODELS
     return []
 
 
@@ -647,6 +651,11 @@ async def _models_for_backend_live(backend: Backend) -> list[str]:
 
         agent_bin = os.environ.get("TGR_CURSOR_AGENT_BIN", "agent").strip() or "agent"
         return await asyncio.to_thread(list_cursor_models, agent_bin)
+    if backend == "antigravity":
+        from tg_cli_relay.providers.antigravity_cli import list_antigravity_models
+
+        agy_bin = os.environ.get("TGR_ANTIGRAVITY_BIN", "agy").strip() or "agy"
+        return await asyncio.to_thread(list_antigravity_models, agy_bin)
     return _models_for_backend(backend)
 
 
@@ -1397,7 +1406,7 @@ async def _execute_relay_turn(
                 prompt=prompt,
                 store=store,
                 workspace=workspace,
-                on_progress=_live_progress if backend == "codex" else None,
+                on_progress=_live_progress if backend in ("codex", "antigravity") else None,
                 on_handoff=(
                     _on_handoff
                     if allow_handoff and backend in _HANDOFF_BACKENDS and _callback_feature_enabled()

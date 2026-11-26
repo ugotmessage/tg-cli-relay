@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Callable
 
 from tg_cli_relay.conversation_context import ConversationContext
+from tg_cli_relay.providers.antigravity_cli import (
+    ANTIGRAVITY_DEFAULT_MODEL,
+    AntigravityCliProvider,
+)
 from tg_cli_relay.providers.base import RunResult
 from tg_cli_relay.providers.claude_cli import ClaudeCliProvider, parse_claude_output
 from tg_cli_relay.providers.codex_cli import CodexCliProvider
@@ -269,9 +273,21 @@ def resolve_cursor_model(store: SessionStore, thread_key: str) -> str:
     return "auto" if explicit.upper() == "AUTO" else explicit
 
 
+def resolve_antigravity_model(store: SessionStore, thread_key: str) -> str:
+    """Antigravity relay 使用的模型；優先順序為 thread pref → TGR_ANTIGRAVITY_MODEL → 預設值。"""
+    import os
+
+    explicit = store.get_pref(thread_key, _model_pref_key("antigravity"))
+    if not explicit:
+        explicit = os.environ.get("TGR_ANTIGRAVITY_MODEL", "").strip()
+    return explicit or ANTIGRAVITY_DEFAULT_MODEL
+
+
 def effective_model_for_backend(store: SessionStore, thread_key: str, backend: Backend) -> str:
     if backend == "cursor":
         return resolve_cursor_model(store, thread_key)
+    if backend == "antigravity":
+        return resolve_antigravity_model(store, thread_key)
     model = store.get_pref(thread_key, _model_pref_key(backend))
     return model or "(預設)"
 
@@ -279,6 +295,8 @@ def effective_model_for_backend(store: SessionStore, thread_key: str, backend: B
 def _get_model(store: SessionStore, thread_key: str, backend: Backend) -> str | None:
     if backend == "cursor":
         return resolve_cursor_model(store, thread_key)
+    if backend == "antigravity":
+        return resolve_antigravity_model(store, thread_key)
     return store.get_pref(thread_key, _model_pref_key(backend))
 
 
@@ -335,6 +353,13 @@ def relay_turn(
         )
     elif backend == "opencode":
         result = _relay_opencode(st, thread_key, ws, prompt)
+    elif backend == "antigravity":
+        result = _relay_antigravity(
+            st, thread_key, ws, prompt,
+            on_progress=on_progress, on_handoff=on_handoff,
+            resume_session_id=resume_session_id,
+            persist_session=persist_session, update_context=update_context,
+        )
     else:
         raise ValueError(f"未知後端: {backend}")
     if update_context and (result.returncode == 0 or result.handoff_detached):
@@ -533,4 +558,62 @@ def _relay_codex(
     )
     if persist_session and res.session_id and res.session_id != sid:
         store.upsert(thread_key, "codex", res.session_id, workspace=workspace)
+    return res
+
+
+def _relay_antigravity(
+    store: SessionStore,
+    thread_key: str,
+    workspace: str,
+    prompt: str,
+    *,
+    on_progress: Callable[[str], None] | None = None,
+    on_handoff: Callable[[str, str, str], bool] | None = None,
+    resume_session_id: str | None = None,
+    persist_session: bool = True,
+    update_context: bool = True,
+) -> RunResult:
+    import os
+
+    bin_name = os.environ.get("TGR_ANTIGRAVITY_BIN", "agy").strip() or "agy"
+    skip_perms = os.environ.get("TGR_ANTIGRAVITY_SKIP_PERMISSIONS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    sandbox = os.environ.get("TGR_ANTIGRAVITY_SANDBOX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    raw_add_dirs = os.environ.get("TGR_ANTIGRAVITY_ADD_DIRS", "")
+    add_dirs = tuple(p.strip() for p in raw_add_dirs.split(",") if p.strip())
+    timeout_seconds = _relay_turn_timeout_seconds()
+    model = resolve_antigravity_model(store, thread_key)
+    prov = AntigravityCliProvider(
+        agy_bin=bin_name,
+        dangerously_skip_permissions=skip_perms,
+        sandbox=sandbox,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        add_dirs=add_dirs,
+    )
+    sid = resume_session_id if resume_session_id is not None else store.get(thread_key, "antigravity")
+    agy_prompt = apply_background_callback_prefix(prompt)
+    if update_context:
+        turn_prompt = ConversationContext(store.db_path).prompt(
+            thread_key, agy_prompt, include_history=not sid, consumer="antigravity"
+        )
+    else:
+        turn_prompt = agy_prompt
+    res = prov.run_turn(
+        workspace=workspace,
+        session_id=sid,
+        prompt=turn_prompt,
+        on_progress=on_progress,
+        thread_key=thread_key,
+        on_handoff=on_handoff,
+    )
+    if persist_session and res.session_id and res.session_id != sid:
+        store.upsert(thread_key, "antigravity", res.session_id, workspace=workspace)
     return res
