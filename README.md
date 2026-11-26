@@ -2,7 +2,7 @@
 
 透過 **Telegram** 對本機 **CLI 編碼代理**下指令的中繼橋接器。統一處理對話 thread 的定義、各後端的 session 接續，以及常用 bot 指令（重置、切換模型等）。
 
-支援後端：**Cursor `agent`**、**OpenAI `codex`**、**Claude Code `claude`**、**OpenCode `opencode`**
+支援後端：**Cursor `agent`**、**OpenAI `codex`**、**Claude Code `claude`**、**OpenCode `opencode`**、**Google Antigravity `agy`**
 
 ---
 
@@ -39,6 +39,7 @@ SQLite            ← sessions 表（thread_key → session_id）
 | `codex` | `codex` | `codex exec` → `codex exec resume <id>` | `-m` |
 | `claude` | `claude` | `claude --resume <id>` | `--model` |
 | `opencode` | `opencode` | `opencode run -c`（續最後一個，靠 workspace 隔離） | `-m` |
+| `antigravity` | `agy` | `agy --resume <id>` | `--model` |
 
 > **OpenCode 限制**：無法指定 session ID 接續，同一 workspace 下多個 Telegram thread 會共用同一個 session。建議一個 thread 對應一個 workspace。
 
@@ -131,7 +132,7 @@ cp env.example .env
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
-| `TGR_BACKEND` | `cursor` | 使用的後端：`cursor` / `codex` / `claude` / `opencode` |
+| `TGR_BACKEND` | `cursor` | 使用的後端：`cursor` / `codex` / `claude` / `opencode` / `antigravity` |
 | `TGR_ENABLED_BACKENDS` | 全部支援後端 | Telegram 中可切換的 provider 清單，逗號分隔，例如 `claude,codex` |
 | `TGR_SESSION_DB` | `./data/sessions.sqlite3` | SQLite 路徑 |
 | `TGR_DEFAULT_WORKSPACE` | （必填） | 代理操作的 git 工作目錄 |
@@ -145,6 +146,9 @@ cp env.example .env
 | `TGR_CLAUDE_BIN` | `claude` | Claude Code CLI 路徑 |
 | `TGR_CLAUDE_SKIP_PERMISSIONS` | （未設定） | 設為 `1` 啟用 `--dangerously-skip-permissions` |
 | `TGR_OPENCODE_BIN` | `opencode` | OpenCode CLI 路徑 |
+| `TGR_ANTIGRAVITY_BIN` | `agy` | Antigravity CLI 路徑 |
+| `TGR_ANTIGRAVITY_MODEL` | `gemini-4-hydrogen-medium` | 預設模型，可透過 `/model` 覆寫 |
+| `TGR_ANTIGRAVITY_SKIP_PERMISSIONS` | （未設定） | 僅在受隔離環境明確啟用 |
 | `TELEGRAM_BOT_TOKEN` | （必填） | BotFather 取得的 token |
 | `TGR_ALLOWED_TELEGRAM_USER_IDS` | （留空不限制） | 允許使用的 Telegram user ID，逗號分隔 |
 | `TGR_UPLOAD_DIR` | `~/.hermes/tg-relay-uploads` | Telegram 附件下載暫存目錄 |
@@ -189,6 +193,9 @@ cp env.example .env
 
 ### OpenCode
 執行 `opencode` 並依互動式設定完成各 AI provider 的 API key 配置；或直接在環境變數設定對應 provider 的 key（如 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`）。
+
+### Antigravity (AGY)
+先在 Bot 的服務使用者環境安裝 `agy` 並完成 CLI 認證。設定 `TGR_BACKEND=antigravity` 或透過 `/provider antigravity` 切換；若設定了 `TGR_ENABLED_BACKENDS`，需將 `antigravity` 加入清單。`/model` 優先查詢 `agy models`，失敗時使用內建清單。背景交接詳見 `docs/background-callback.md`。
 
 ### Claude
 兩種方式擇一：

@@ -208,3 +208,86 @@ def test_relay_provider_timeout_is_same_for_all_backends(tmp_path: Path, monkeyp
             store=store, workspace=str(tmp_path),
         )
     assert provider.call_args.kwargs["timeout_seconds"] == 600
+
+
+def test_typing_heartbeat_survives_timeout_and_recovery(monkeypatch, tmp_path: Path):
+    """One heartbeat must remain active while original turn yields to recovery."""
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="codex")
+    key = "private:81"
+
+    async def scenario():
+        _reset(bot)
+        bot._ACTIVE_PARENT_BACKENDS.clear()
+        bot._ACTIVE_PARENT_REQUESTS.clear()
+        original = FakeMessage(text="請檢查專案", chat_id=81, message_id=301)
+        recovery_started = asyncio.Event()
+        finish_recovery = asyncio.Event()
+        heartbeat_ids = []
+        show_typing_flags = []
+
+        async def execute(**kwargs):
+            show_typing_flags.append(kwargs["show_typing"])
+            heartbeat = bot._PARENT_TYPING_TASKS[key]
+            heartbeat_ids.append(heartbeat)
+            assert not heartbeat.done()
+            if len(heartbeat_ids) == 1:
+                return 124
+            recovery_started.set()
+            await finish_recovery.wait()
+            assert bot._PARENT_TYPING_TASKS[key] is heartbeat
+            return 0
+
+        try:
+            with patch.object(bot, "_execute_relay_turn", side_effect=execute):
+                await bot._on_message(_update(original, 81), SimpleNamespace())
+                await asyncio.wait_for(recovery_started.wait(), 2)
+                await asyncio.sleep(0)
+                assert original.chat.send_action.call_count >= 1
+                assert heartbeat_ids[0] is heartbeat_ids[1]
+                assert not heartbeat_ids[0].done()
+                finish_recovery.set()
+                while bot._BACKGROUND_TASKS:
+                    await asyncio.gather(*tuple(bot._BACKGROUND_TASKS), return_exceptions=True)
+            assert show_typing_flags == [False, False]
+            assert key not in bot._PARENT_TYPING_TASKS
+            assert heartbeat_ids[0].done()
+        finally:
+            finish_recovery.set()
+            await bot._stop_parent_typing(key)
+            _reset(bot)
+            bot._ACTIVE_PARENT_BACKENDS.clear()
+            bot._ACTIVE_PARENT_REQUESTS.clear()
+
+    asyncio.run(scenario())
+
+
+def test_typing_heartbeat_stops_after_regular_main_turn(monkeypatch, tmp_path: Path):
+    from tg_cli_relay import telegram_bot as bot
+
+    _env(monkeypatch, tmp_path, backend="cursor")
+    key = "private:82"
+
+    async def scenario():
+        _reset(bot)
+        original = FakeMessage(text="短工作", chat_id=82, message_id=302)
+        heartbeat_ids = []
+
+        async def execute(**kwargs):
+            heartbeat_ids.append(bot._PARENT_TYPING_TASKS[key])
+            return 0
+
+        try:
+            with patch.object(bot, "_execute_relay_turn", side_effect=execute):
+                await bot._on_message(_update(original, 82), SimpleNamespace())
+                while bot._BACKGROUND_TASKS:
+                    await asyncio.gather(*tuple(bot._BACKGROUND_TASKS), return_exceptions=True)
+            assert len(heartbeat_ids) == 1
+            assert heartbeat_ids[0].done()
+            assert key not in bot._PARENT_TYPING_TASKS
+        finally:
+            await bot._stop_parent_typing(key)
+            _reset(bot)
+
+    asyncio.run(scenario())

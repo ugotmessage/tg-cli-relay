@@ -1224,7 +1224,7 @@ def _bound_verifier_stdout(text: str) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= MAX_VERIFIER_STDOUT:
         return text
-    return encoded[:MAX_VERIFIER_STDOUT].decode("utf-8", "replace")
+    return encoded[:MAX_VERIFIER_STDOUT].decode("utf-8", "ignore")
 
 
 def _pending_delivery_receipt(

@@ -777,3 +777,18 @@ def test_codex_registration_has_no_backend_field(monkeypatch, tmp_path):
     )
     assert "backend" not in record
     assert frozen_backend(record) == "codex"
+
+
+@pytest.mark.parametrize("text", [
+    "中" * 3000,
+    "a" * 8191 + "中",
+    "a" * 8191 + "😀",
+    "完整訊息",
+])
+def test_bound_verifier_stdout_preserves_utf8_byte_ceiling(text):
+    from tg_cli_relay.background_callback import _bound_verifier_stdout, MAX_VERIFIER_STDOUT
+
+    bounded = _bound_verifier_stdout(text)
+    assert len(bounded.encode("utf-8")) <= MAX_VERIFIER_STDOUT
+    assert "\ufffd" not in bounded
+    assert _bound_verifier_stdout(bounded) == bounded

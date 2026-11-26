@@ -789,3 +789,40 @@ def test_dual_routes_real_cli_boundary_selects_and_continues(monkeypatch, tmp_pa
     assert list((bot_b["state"] / "inbox" / "new").glob("*.json")) == []
     assert secret.read_bytes() == SENTINEL_SECRET
     assert SENTINEL_SECRET.decode() not in json.dumps(sent)
+
+
+@pytest.mark.parametrize("text, limit", [
+    ("中" * 3000, 8192),
+    ("a" * 8191 + "中", 8192),
+    ("a" * 8191 + "😀", 8192),
+    ("完整訊息", 8192),
+    ("😀中文", 0),
+    ("😀中文", 1),
+    ("😀中文", 2),
+    ("😀中文", 3),
+])
+def test_bound_text_never_exceeds_utf8_byte_limit(text, limit):
+    bounded = outbox.bound_text(text, limit)
+    assert len(bounded.encode("utf-8")) <= limit
+    assert "\ufffd" not in bounded
+    assert outbox.bound_text(bounded, limit) == bounded
+
+
+def test_final_event_chinese_stdout_stays_within_receiver_limit():
+    event = outbox.build_final_event(
+        task_id="task-utf8-boundary",
+        controller_result="complete",
+        controller_detail="ok",
+        handoff_path="/private/tmp/handoff.md",
+        handoff_sha256=None,
+        handoff_size=0,
+        handoff_snapshot=None,
+        artifact=None,
+        report_path=None,
+        validation_path=None,
+        verifier={"returncode": 0, "stdout": "中" * 3000, "stderr": ""},
+        secret=SENTINEL_SECRET,
+        occurred_at="2026-10-28T03:54:00Z",
+    )
+    assert len(event["verifier_stdout"].encode("utf-8")) <= outbox.MAX_VERIFIER_STDOUT
+    assert "\ufffd" not in event["verifier_stdout"]

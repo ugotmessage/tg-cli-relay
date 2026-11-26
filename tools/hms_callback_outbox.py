@@ -211,7 +211,7 @@ def bound_text(text: str | None, limit: int) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= limit:
         return text
-    return encoded[:limit].decode("utf-8", "replace")
+    return encoded[:limit].decode("utf-8", "ignore")
 
 
 def redact_secret_material(text: str, secret: bytes | None) -> str:
