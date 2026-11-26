@@ -14,20 +14,10 @@ from typing import Callable
 from tg_cli_relay.providers.base import RunResult
 from tg_cli_relay.providers.process_control import _terminate, interruptible_run, tracked_process
 
-ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-neon-medium"
+ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-hydrogen-medium"
 
-# Curated fallback list; live catalog comes from `agy models`.
+# Curated fallback list matching standalone `agy models`; live catalog comes from `agy models`.
 ANTIGRAVITY_MODELS: list[str] = [
-    "gemini-4-neon-medium",
-    "gemini-4-neon-high",
-    "gemini-4-neon-xhigh",
-    "gemini-4-neon-low",
-    "gemini-4-carbon-medium",
-    "gemini-4-carbon-high",
-    "gemini-4-carbon-low",
-    "gemini-4-argon-medium",
-    "gemini-4-argon-high",
-    "gemini-4-argon-low",
     "gemini-4-hydrogen-medium",
     "gemini-4-hydrogen-high",
     "gemini-4-hydrogen-xhigh",
@@ -35,12 +25,8 @@ ANTIGRAVITY_MODELS: list[str] = [
     "gemini-3.8-flash-high",
     "gemini-3.8-flash-medium",
     "gemini-3.8-flash-low",
-    "claude-sonnet-5-5-medium",
-    "claude-sonnet-5-5-high",
-    "claude-sonnet-5-5-low",
-    "claude-opus-5-5-medium",
-    "claude-opus-5-5-high",
-    "claude-opus-5-5-low",
+    "claude-sonnet-4-6",
+    "claude-opus-4-6-thinking",
     "gpt-oss-120b-medium",
 ]
 

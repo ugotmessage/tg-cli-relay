@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         print("TGR_ANTIGRAVITY_BIN =", os.environ.get("TGR_ANTIGRAVITY_BIN", "agy"))
         print(
             "TGR_ANTIGRAVITY_MODEL =",
-            os.environ.get("TGR_ANTIGRAVITY_MODEL", "").strip() or "gemini-4-neon-medium（relay 預設）",
+            os.environ.get("TGR_ANTIGRAVITY_MODEL", "").strip() or "gemini-4-hydrogen-medium（relay 預設）",
         )
         agy_skip = os.environ.get("TGR_ANTIGRAVITY_SKIP_PERMISSIONS", "").strip().lower() in (
             "1",
